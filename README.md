@@ -4,12 +4,12 @@ Quelle is a Rust service that retrieves web pages for agents. It can answer a qu
 
 | Mode | Endpoint | Returns | Needs a model |
 | --- | --- | --- | --- |
-| Answer | `POST /answer` | An answer with numbered citations and supporting passages | Yes |
-| Content | `POST /content` | Page text in document order for the caller's exact search query or supplied URLs | No |
+| Answer | `POST /api/answer` | An answer with numbered citations and supporting passages | Yes |
+| Content | `POST /api/content` | Page text in document order for the caller's exact search query or supplied URLs | No |
 
 ## Quick start
 
-Copy [.env.example](.env.example) to `.env`. Set `BRAVE_SEARCH_API_KEY` and a separate `QUELLE_TOKEN` of at least 32 characters. You can generate the token with `openssl rand -hex 32`. These two settings enable `/content`. To enable `/answer`, also fill in the three model variables in the same file before starting Quelle.
+Copy [.env.example](.env.example) to `.env`. Set `BRAVE_SEARCH_API_KEY` and a separate `QUELLE_TOKEN` of at least 32 characters. You can generate the token with `openssl rand -hex 32`. These two settings enable `/api/content`. To enable `/api/answer`, also fill in the three model variables in the same file before starting Quelle.
 
 ```sh
 docker run -d --name quelle --env-file .env \
@@ -25,7 +25,7 @@ To run from source, export the configuration in your shell and run `cargo run --
 
 Both endpoints accept JSON and require `Authorization: Bearer $QUELLE_TOKEN`.
 
-### Answer mode · `POST /answer`
+### Answer mode · `POST /api/answer`
 
 Send a question. The model plans searches and ranks results. Quelle selects up to 6,500 characters of relevant passages per page, then the model writes an answer citing those passages. If the model is unconfigured, this endpoint returns HTTP 503 with `model_not_configured` before searching.
 
@@ -40,7 +40,7 @@ Send a question. The model plans searches and ranks results. Quelle selects up t
 | `context` | No | Object for callers that supply the user's original request separately from the research query. See the example below. |
 
 ```sh
-curl -sS http://127.0.0.1:3000/answer \
+curl -sS http://127.0.0.1:3000/api/answer \
   -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
   --data '{"query":"Where does IANA describe example domains?","optimizationMode":"speed"}'
 ```
@@ -64,7 +64,7 @@ With `context`, a non-streaming search returns timing and count diagnostics with
 
 With `"stream": true`, read the JSON object in each server-sent event's `data:` line. A successful stream starts with the sources, sends an empty `response` when writing begins, then sends the complete cited answer in a second `response` followed by `done`. Failures after streaming starts use `{"type":"error","data":"<code>"}`. A basic request with no readable evidence ends with `done`.
 
-### Content mode · `POST /content`
+### Content mode · `POST /api/content`
 
 Supply a finished search query or a list of known URLs. Both forms return page text for the caller to use directly. Sending both fields or an unknown field returns HTTP 400.
 
@@ -77,7 +77,7 @@ Supply a finished search query or a list of known URLs. Both forms return page t
 To fetch known pages directly, pass `urls`. This makes zero Brave or model calls.
 
 ```sh
-curl -sS http://127.0.0.1:3000/content \
+curl -sS http://127.0.0.1:3000/api/content \
   -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
   --data '{"urls":["https://www.rfc-editor.org/rfc/rfc2606.txt"]}'
 ```
@@ -85,7 +85,7 @@ curl -sS http://127.0.0.1:3000/content \
 To discover pages, pass the exact query you want Brave to run.
 
 ```sh
-curl -sS http://127.0.0.1:3000/content \
+curl -sS http://127.0.0.1:3000/api/content \
   -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
   --data '{"query":"site:iana.org \"example domains\"","limit":3}'
 ```
@@ -96,11 +96,11 @@ Read `sources[].content` for the page text and `sources[].metadata.url` for the 
 
 ### Page extraction
 
-- **HTML.** `/content` keeps readable text in document order, including headings, repeated values and footer contacts. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
+- **HTML.** `/api/content` keeps readable text in document order, including headings, repeated values and footer contacts. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
 - **JavaScript.** When static HTML looks like a script shell or an unrendered template, Quelle tries Lightpanda and reads the resulting DOM. If the page needs rendering and the browser is unavailable, its error code is `needs_js`.
 - **Documents.** Plain text retains line breaks. PDFs return their embedded text layer, up to 150 pages. Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files are converted to Markdown with [anydoc](https://github.com/firecrawl/anydoc).
 
-The output limit for `/content` is 2 MiB of UTF-8 text per source. `metadata.truncated` flags a byte or PDF page limit reached during extraction. A site can still require scrolling, pagination or a click to reveal additional content.
+The output limit for `/api/content` is 2 MiB of UTF-8 text per source. `metadata.truncated` flags a byte or PDF page limit reached during extraction. A site can still require scrolling, pagination or a click to reveal additional content.
 
 ### Search privacy and errors
 
@@ -119,7 +119,7 @@ Common HTTP errors include `400 invalid_search_request` for invalid input, `401 
 | `QUELLE_TOKEN` | Bearer token clients send to Quelle. Use at least 32 printable, non-space ASCII characters. |
 | `BRAVE_SEARCH_API_KEY` | Brave Search API key. Required at startup even for deployments that only read supplied URLs. |
 
-### Required only for `/answer`
+### Required only for `/api/answer`
 
 Set all three connection variables together to enable answer generation. Omit all three for content-only use. A partial configuration stops startup. Use separate credentials for Quelle, Brave, and the model provider.
 
@@ -139,11 +139,6 @@ Set all three connection variables together to enable answer generation. Omit al
 | `QUELLE_CONCURRENCY` | `8` | Maximum simultaneous search requests, from 1 to 64. |
 | `QUELLE_USER_AGENT` | Built-in desktop Chrome user agent | User agent for ordinary page fetches. |
 | `QUELLE_LIGHTPANDA` | `lightpanda` on `PATH` | Path to the browser executable for JavaScript rendering. |
-
-## Upgrading clients
-
-- Move answer requests from `/api/search` or `/api/search/answer` to `/answer`. Send structured requests under `context` with `version: "search-v1"`. The endpoint ignores unrecognized top-level fields, so clients using a retired field name receive the basic response.
-- Move extraction requests from `/api/search/content` or `/api/sources` to `/content` and read each page from `sources[].content`.
 
 ## Third-party software in the image
 
