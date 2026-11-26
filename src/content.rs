@@ -15,7 +15,7 @@ use url::Url;
 
 use crate::{
     App, Failure, REQUEST_TIMEOUT, admit,
-    discovery::{Query, RESULTS_PER_QUERY, SearchOptions},
+    discovery::{Language, Query, RESULTS_PER_QUERY, SearchOptions},
     pages, privacy, problem,
     search::query_language,
 };
@@ -30,6 +30,8 @@ enum Input {
     Search {
         query: String,
         limit: Option<usize>,
+        /// Language hint for engines that take one; guessed when absent.
+        language: Option<Language>,
     },
 }
 
@@ -92,7 +94,9 @@ pub async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response
     let limit = input.limit();
     let urls = match input {
         Input::Urls { urls, .. } => urls,
-        Input::Search { query, .. } => {
+        Input::Search {
+            query, language, ..
+        } => {
             let (text, removed) = privacy::scrub_verbatim(&query);
             if !removed.is_empty()
                 && !text
@@ -105,7 +109,7 @@ pub async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response
                 );
             }
             let query = Query {
-                language: query_language(&text),
+                language: language.unwrap_or_else(|| query_language(&text)),
                 text,
             };
             let (hits, failure, _) = app

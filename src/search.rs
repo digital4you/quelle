@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, atomic::AtomicUsize},
     time::Duration,
 };
 
@@ -14,7 +14,7 @@ use url::Url;
 use crate::{
     Failure,
     discovery::{
-        Candidate, DiscoveryError, Language, Query, RESULTS_PER_QUERY, SearchEngine, SearchOptions,
+        Candidate, DiscoveryError, EnginePool, Language, Query, RESULTS_PER_QUERY, SearchOptions,
     },
     model::{Message, Model},
     pages::{self, Source},
@@ -220,7 +220,7 @@ fn millis(started: Instant) -> u64 {
 pub struct Search {
     /// Answer generation needs a model. Content retrieval does not.
     pub model: Option<Model>,
-    pub engines: Vec<Box<dyn SearchEngine>>,
+    pub engines: EnginePool,
     pub page_slots: Arc<Semaphore>,
 }
 
@@ -600,31 +600,24 @@ impl Search {
         queries: &[Query],
         options: SearchOptions,
     ) -> (Vec<Candidate>, Option<Failure>, usize) {
-        let mut jobs = Vec::new();
-        'discovery: for query in queries {
-            for engine in &self.engines {
-                let name = engine.name();
-                let search = engine.search(query, options);
-                jobs.push(async move {
-                    let started = Instant::now();
-                    let result = search.await;
-                    tracing::info!(stage = "search_engine", engine = name,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        candidates = result.as_ref().map_or(0, Vec::len), error = ?result.as_ref().err());
-                    result
-                });
-                if jobs.len() == 6 {
-                    break 'discovery;
-                }
-            }
-        }
+        const MAX_ATTEMPTS: usize = 6;
+        let retries = AtomicUsize::new(MAX_ATTEMPTS.saturating_sub(queries.len()));
+        let jobs = queries
+            .iter()
+            .map(|query| self.engines.lookup(query, options, &retries))
+            .collect::<Vec<_>>();
         let results = stream::iter(jobs).buffered(3).collect::<Vec<_>>().await;
         let failed = results.iter().filter(|result| result.is_err()).count();
         let all_failed = !results.is_empty() && failed == results.len();
         let failure = all_failed.then(|| {
             if results
                 .iter()
-                .all(|result| matches!(result, Err(DiscoveryError::RateLimited)))
+                .all(|r| matches!(r, Err(DiscoveryError::NotConfigured)))
+            {
+                Failure::DiscoveryNotConfigured
+            } else if results
+                .iter()
+                .all(|result| matches!(result, Err(DiscoveryError::RateLimited(_))))
             {
                 Failure::DiscoveryRateLimited
             } else {
@@ -699,7 +692,7 @@ impl Search {
     }
 
     /// Orders discovered pages by how likely they are to answer the request,
-    /// using Brave titles and snippets as discovery data. Requested URLs stay
+    /// using engine titles and snippets as discovery data. Requested URLs stay
     /// first. Any model failure keeps the heuristic order.
     async fn rerank(
         &self,
@@ -930,11 +923,41 @@ pub(crate) fn query_language(text: &str) -> Language {
             ]),
         ),
     ];
-    scores
+    // Without function words, letters and word endings decide.
+    let spelling = [
+        (
+            Language::De,
+            count_parts(
+                &lowered,
+                &["ä", "ö", "ü", "ß", "sch", "ung ", "keit", "heit"],
+            ),
+        ),
+        (
+            Language::Fr,
+            count_parts(&lowered, &["é", "è", "ê", "ç", "à ", "eau", "eux "]),
+        ),
+        (
+            Language::It,
+            count_parts(&lowered, &["zione", "zioni", "ità ", "gli", "cch"]),
+        ),
+        (
+            Language::En,
+            count_parts(&lowered, &["wh", "ing ", "ness ", "ship "]),
+        ),
+    ];
+    [scores, spelling]
         .iter()
-        .max_by_key(|(_, score)| *score)
-        .filter(|(_, score)| *score > 0)
+        .find_map(|scores| {
+            scores
+                .iter()
+                .max_by_key(|(_, score)| *score)
+                .filter(|(_, score)| *score > 0)
+        })
         .map_or(Language::De, |(language, _)| *language)
+}
+
+fn count_parts(text: &str, parts: &[&str]) -> usize {
+    parts.iter().filter(|part| text.contains(*part)).count()
 }
 
 #[derive(Serialize)]

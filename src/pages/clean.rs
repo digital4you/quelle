@@ -6,7 +6,9 @@ use scraper::{ElementRef, Selector};
 
 /// Collect visible body text once, including short labels, mixed inline/block
 /// content, contact links and the footer. Preserve line breaks in code samples.
-pub(super) fn page_text(root: ElementRef<'_>) -> String {
+/// Without `keep_chrome`, site navigation, search forms, the site banner and
+/// skip links are left out.
+pub(super) fn page_text(root: ElementRef<'_>, keep_chrome: bool) -> String {
     let helpers = contact_helpers(root);
     let mut text = String::new();
     let mut skip = None;
@@ -32,6 +34,7 @@ pub(super) fn page_text(root: ElementRef<'_>) -> String {
                 ) || el.attr("hidden").is_some()
                     || el.attr("aria-hidden") == Some("true")
                     || el.attr("style").is_some_and(hidden_style)
+                    || (!keep_chrome && chrome(el))
                 {
                     skip = Some(node.id());
                     continue;
@@ -89,6 +92,43 @@ pub(super) fn page_text(root: ElementRef<'_>) -> String {
         }
     }
     text
+}
+
+/// Page chrome: navigation, search, the site banner, language switchers and
+/// skip links. Headers inside the main content or holding the page heading
+/// stay, and so do footers, which carry addresses and contact details.
+fn chrome(el: ElementRef<'_>) -> bool {
+    static SKIP_LINK: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"(?i)^(?:skip|jump)(?: directly)? to (?:the )?(?:main )?(?:content|navigation|search)",
+            r"|^(?:direkt )?zu[mr]? (?:haupt)?(?:inhalt|navigation|suche)",
+            r"|^(?:aller|passer|accéder) (?:directement )?(?:au|à la) (?:contenu|navigation|recherche)",
+            r"|^(?:vai|salta|passa) (?:direttamente )?(?:al|alla) (?:contenuto|navigazione|ricerca)",
+        ))
+        .expect("skip link pattern")
+    });
+    static HEADING: LazyLock<Selector> = LazyLock::new(|| Selector::parse("h1").unwrap());
+    if matches!(el.attr("role"), Some("navigation" | "search" | "banner")) {
+        return true;
+    }
+    match el.value().name() {
+        "nav" => true,
+        "header" => {
+            !el.ancestors().filter_map(ElementRef::wrap).any(|parent| {
+                matches!(parent.value().name(), "main" | "article")
+                    || parent.attr("role") == Some("main")
+            }) && el.select(&HEADING).next().is_none()
+        }
+        // Language switchers mark their links with hreflang.
+        "a" if el.attr("hreflang").is_some() => true,
+        "a" => {
+            el.attr("href").is_some_and(|href| href.starts_with('#')) && {
+                let label = el.text().collect::<String>();
+                label.len() < 80 && SKIP_LINK.is_match(label.trim())
+            }
+        }
+        _ => false,
+    }
 }
 
 fn hidden_style(style: &str) -> bool {

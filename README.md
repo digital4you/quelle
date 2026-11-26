@@ -9,10 +9,11 @@ Quelle is a Rust service that retrieves web pages for agents. It can answer a qu
 
 ## Quick start
 
-Copy [.env.example](.env.example) to `.env`. Set `BRAVE_SEARCH_API_KEY` and a separate `QUELLE_TOKEN` of at least 32 characters. You can generate the token with `openssl rand -hex 32`. These two settings enable `/api/content`. To enable `/api/answer`, also fill in the three model variables in the same file before starting Quelle.
+Copy [.env.example](.env.example) to `.env` and set `QUELLE_TOKEN` to a token of at least 32 characters. You can generate one with `openssl rand -hex 32`. This enables `/api/content` with keyless search through Mwmbl. Set `QUELLE_SEARCH_ENGINES` to choose other engines. To enable `/api/answer`, also fill in the three model variables before starting Quelle.
 
 ```sh
 docker run -d --name quelle --env-file .env \
+  --read-only --cap-drop ALL --security-opt no-new-privileges \
   -p 127.0.0.1:3000:3000 ghcr.io/digital4you/quelle:master
 curl -sS http://127.0.0.1:3000/healthz
 ```
@@ -70,11 +71,12 @@ Supply a finished search query or a list of known URLs. Both forms return page t
 
 | Request field | Required | Type and behavior |
 | --- | --- | --- |
-| `query` | One of `query` or `urls` | Nonblank string containing the finished Brave search query, up to 600 characters and 75 words. |
+| `query` | One of `query` or `urls` | Nonblank string containing the finished search query, up to 600 characters and 75 words. |
 | `urls` | One of `query` or `urls` | Array of 1–20 public HTTP(S) URL strings on standard ports to read directly. |
-| `limit` | No | Integer from 1 to 20, default 20. Caps the results requested from Brave or the distinct supplied URLs to read. |
+| `limit` | No | Integer from 1 to 20, default 20. Caps the number of distinct search results or supplied URLs to read. |
+| `language` | No | With `query` only: `de`, `fr`, `it` or `en`. The language hint for engines that take one, such as Brave or Wikipedia. Without it, Quelle guesses from common words and spelling and falls back to `de`. |
 
-To fetch known pages directly, pass `urls`. This makes zero Brave or model calls.
+To fetch known pages directly, pass `urls`. This makes zero search or model calls.
 
 ```sh
 curl -sS http://127.0.0.1:3000/api/content \
@@ -82,7 +84,7 @@ curl -sS http://127.0.0.1:3000/api/content \
   --data '{"urls":["https://www.rfc-editor.org/rfc/rfc2606.txt"]}'
 ```
 
-To discover pages, pass the exact query you want Brave to run.
+To discover pages, pass the exact query you want the search engine to run.
 
 ```sh
 curl -sS http://127.0.0.1:3000/api/content \
@@ -90,13 +92,13 @@ curl -sS http://127.0.0.1:3000/api/content \
   --data '{"query":"site:iana.org \"example domains\"","limit":3}'
 ```
 
-Quelle disables spellcheck and preserves case, whitespace, quoted phrases and search operators outside privacy redactions. Each cache miss uses one Brave lookup. Quelle reads distinct public URLs in result order, up to four at a time.
+Quelle preserves case, whitespace, quoted phrases and search operators outside privacy redactions. Each engine interprets its own query syntax. For Brave, Quelle also disables spellcheck. Quelle reads distinct public URLs in the successful engine's result order, up to four at a time.
 
 Read `sources[].content` for the page text and `sources[].metadata.url` for the final URL. Each source also has `metadata.title` and `metadata.truncated`. When the final URL differs, `requestedUrl` records the original. Successful sources follow input or search-result order. Individual failures appear in `errors` as objects with `url` and `error`. Partial success returns HTTP 200. If every read fails or discovery finds nothing, HTTP 422 includes `error: "no_readable_sources"` alongside both arrays.
 
 ### Page extraction
 
-- **HTML.** `/api/content` keeps readable text in document order, including headings, repeated values and footer contacts. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
+- **HTML.** `/api/content` keeps readable text in document order, including headings, repeated values and footer contacts. It leaves out site navigation, search forms, the site banner, language switchers and skip links. A page that consists only of navigation keeps it. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
 - **JavaScript.** When static HTML looks like a script shell or an unrendered template, Quelle tries Lightpanda and reads the resulting DOM. If the page needs rendering and the browser is unavailable, its error code is `needs_js`.
 - **Documents.** Plain text retains line breaks. PDFs return their embedded text layer, up to 150 pages. Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files are converted to Markdown with [anydoc](https://github.com/firecrawl/anydoc).
 
@@ -104,11 +106,11 @@ The output limit for `/api/content` is 2 MiB of UTF-8 text per source. `metadata
 
 ### Search privacy and errors
 
-Before sending a query to Brave, Quelle filters identifiers such as email addresses, phone numbers, IBANs and credentials. A query reduced to fragments can return `422 query_withheld`. Searches use the Swiss country setting and strict Safe Search. Successful nonempty results are cached in memory for 15 minutes. In answer mode the configured model receives the question and supplied conversation context.
+Before sending a query to any engine, Quelle filters identifiers such as email addresses, phone numbers, IBANs and credentials. A query reduced to fragments can return `422 query_withheld`. The same filtered query goes to each fallback. Region and safe-search controls depend on the engine. In answer mode the configured model receives the question and supplied conversation context.
 
-Quelle checks page destinations on every redirect and restricts browser requests to public addresses. Diagnostics contain stage timings and counts. Rendering logs include the host name of the page.
+Quelle checks page destinations on every redirect and restricts page and browser requests to public addresses: private, loopback, link-local, shared (CGNAT), documentation, multicast and other reserved IPv4 and IPv6 ranges are refused. Host names are resolved as absolute names, so resolver search domains such as Kubernetes' `<namespace>.svc.cluster.local` do not apply, and the checked addresses are the ones connected to. Diagnostics contain stage timings and counts. Rendering logs include the host name of the page.
 
-Common HTTP errors include `400 invalid_search_request` for invalid input, `401 backend_authentication_required` for a missing or incorrect bearer token, `503 search_capacity` when all request slots are busy, and `503 discovery_rate_limited` when Brave rate-limits discovery. The JSON response includes a machine-readable `error` field.
+Common HTTP errors include `400 invalid_search_request` for invalid input, `401 backend_authentication_required` for a missing or incorrect bearer token, `503 search_capacity` when all request slots are busy, and `503 discovery_rate_limited` when every attempted engine is rate-limited or cooling down. Upstream outages can return `502 discovery_unavailable`. The JSON response includes a machine-readable `error` field.
 
 ## Configuration
 
@@ -117,11 +119,27 @@ Common HTTP errors include `400 invalid_search_request` for invalid input, `401 
 | Variable | Purpose |
 | --- | --- |
 | `QUELLE_TOKEN` | Bearer token clients send to Quelle. Use at least 32 printable, non-space ASCII characters. |
-| `BRAVE_SEARCH_API_KEY` | Brave Search API key. Required at startup even for deployments that only read supplied URLs. |
+
+### Search engines
+
+Set `QUELLE_SEARCH_ENGINES` to an ordered, comma-separated list. For example, `QUELLE_SEARCH_ENGINES=mwmbl,wikipedia,brave` enables two keyless providers and Brave. With the variable unset, Quelle uses `brave` alone when a Brave key is present and `mwmbl` otherwise. Anonymous Mwmbl access allows about one search per second, so add a keyed engine for more traffic. Use `none` to disable discovery and read supplied URLs directly. Requests requiring discovery then return `503 discovery_not_configured`.
+
+| Engine | What it searches | Credential |
+| --- | --- | --- |
+| `brave` | Brave Web Search API | `BRAVE_SEARCH_API_KEY` required |
+| `bing` | Bing web results, parsed from the result page. Not enabled by default; check Bing's terms of use before enabling it. | None |
+| `mwmbl` | Mwmbl web index (JSON API) | Anonymous or optional `MWMBL_API_KEY` |
+| `mojeek` | Mojeek web index (JSON API) | `MOJEEK_API_KEY` required |
+| `duckduckgo` | DuckDuckGo HTML web results | None |
+| `wikipedia` | Wikipedia articles in the query language (German, French, Italian or English), from the planner or the `language` field, or detected | None |
+
+On each uncached query, Quelle rotates the starting engine by one position. It tries the next configured engine on an empty result, timeout, rate limit, challenge, or upstream error, and stops at the first usable result list. For example, with `mwmbl,wikipedia,brave`, a query starting at Wikipedia can fall back to Brave, then Mwmbl. Every listed engine can take a turn as the first choice. Nonempty results are cached for 15 minutes. Page fetch failures are reported separately.
+
+Discovery allows up to six upstream attempts per API request, shared across the planned queries in answer mode. Rate-limited engines enter a cooldown. Mwmbl requests are also spaced to match its anonymous or keyed rate. Invalid engine names, duplicate entries, and missing keys for enabled engines stop startup.
 
 ### Required only for `/api/answer`
 
-Set all three connection variables together to enable answer generation. Omit all three for content-only use. A partial configuration stops startup. Use separate credentials for Quelle, Brave, and the model provider.
+Set all three connection variables together to enable answer generation. Omit all three for content-only use. A partial configuration stops startup. Use separate credentials for Quelle, each search provider, and the model provider.
 
 | Variable | Purpose |
 | --- | --- |
@@ -135,10 +153,27 @@ Set all three connection variables together to enable answer generation. Omit al
 | --- | --- | --- |
 | `QUELLE_MODEL_CONTEXT_TOKENS` | `64000` | Context ceiling for answer mode, from 2,048 to 64,000 tokens. |
 | `BRAVE_SEARCH_URL` | `https://api.search.brave.com/res/v1/web/search` | Override the Brave-compatible web search endpoint. Plain HTTP is accepted on loopback. |
+| `MOJEEK_SEARCH_URL` | `https://api.mojeek.com/search` | Override the Mojeek-compatible endpoint. Plain HTTP is accepted on loopback. |
 | `QUELLE_LISTEN` | `127.0.0.1:3000` natively, `0.0.0.0:3000` in Docker | Address and port Quelle binds to. |
 | `QUELLE_CONCURRENCY` | `8` | Maximum simultaneous search requests, from 1 to 64. |
 | `QUELLE_USER_AGENT` | Built-in desktop Chrome user agent | User agent for ordinary page fetches. |
 | `QUELLE_LIGHTPANDA` | `lightpanda` on `PATH` | Path to the browser executable for JavaScript rendering. |
+| `QUELLE_BLOCKED_NETWORKS` | None | Comma-separated CIDR ranges or addresses, such as `34.118.224.0/20,2600:1f14::/56`, that page fetches and the browser must not reach, in addition to the built-in reserved ranges. Invalid entries stop startup. |
+
+## Deployment hardening
+
+Quelle needs no writable file system, no Linux capabilities and no privilege escalation. The Docker example above sets these restrictions. In Kubernetes, use the equivalent container `securityContext`:
+
+```yaml
+securityContext:
+  runAsNonRoot: true
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+```
+
+Quelle fetches URLs chosen by callers and search results, so treat its network position as part of its security. Private ranges such as `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `100.64.0.0/10` and IPv6 unique local addresses are always refused. If a cluster's pod, service or internal load-balancer ranges use other addresses, for example publicly routable IPv6 pod networks or reused public IPv4 ranges, list them in `QUELLE_BLOCKED_NETWORKS`. As a second layer, give the pod an egress NetworkPolicy that allows DNS, the model endpoint and the internet but excludes the cluster's own ranges.
 
 ## Third-party software in the image
 

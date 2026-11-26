@@ -56,6 +56,8 @@ const THIN_PAGE: usize = 800;
 /// Each render is a separate browser process of roughly 100 MB.
 static RENDER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 static RENDERER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+/// Office and CSV conversions running at once. Each is CPU-bound.
+static DOCUMENT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
 /// Reserved ranges blocked in addition to Lightpanda's private networks.
 const BLOCKED_RANGES: &[&str] = &[
     "0.0.0.0/8",
@@ -335,7 +337,82 @@ pub fn public_url(mut url: Url) -> Result<Url, PageError> {
     Ok(url)
 }
 
+/// An operator-supplied network that neither Quelle nor Lightpanda may
+/// reach, for clusters whose pod, service or internal load-balancer ranges
+/// are not private addresses.
+#[derive(Clone, Copy)]
+pub struct Network {
+    address: IpAddr,
+    prefix: u8,
+}
+
+impl Network {
+    /// Parses `address/prefix` or a single address. Host bits are cleared.
+    pub fn parse(text: &str) -> Option<Self> {
+        let (address, prefix) = match text.split_once('/') {
+            Some((address, prefix)) => (address.parse().ok()?, Some(prefix.parse().ok()?)),
+            None => (text.parse().ok()?, None),
+        };
+        let max = if matches!(address, IpAddr::V4(_)) {
+            32
+        } else {
+            128
+        };
+        let prefix = prefix.unwrap_or(max);
+        if prefix > max {
+            return None;
+        }
+        let network = Self { address, prefix };
+        Some(Self {
+            address: network.masked(address)?,
+            prefix,
+        })
+    }
+
+    /// The address with its host bits cleared, or `None` for another family.
+    fn masked(self, address: IpAddr) -> Option<IpAddr> {
+        let bits = u32::from(self.prefix);
+        match (self.address, address) {
+            (IpAddr::V4(_), IpAddr::V4(ip)) => {
+                let mask = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+                Some(IpAddr::V4((u32::from(ip) & mask).into()))
+            }
+            (IpAddr::V6(_), IpAddr::V6(ip)) => {
+                let mask = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+                Some(IpAddr::V6((u128::from(ip) & mask).into()))
+            }
+            _ => None,
+        }
+    }
+
+    fn contains(self, address: IpAddr) -> bool {
+        self.masked(address) == Some(self.address)
+    }
+}
+
+impl std::fmt::Display for Network {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.address, self.prefix)
+    }
+}
+
+static BLOCKED_NETWORKS: OnceLock<Vec<Network>> = OnceLock::new();
+
+pub fn set_blocked_networks(networks: Vec<Network>) {
+    let _ = BLOCKED_NETWORKS.set(networks);
+}
+
+fn blocked_networks() -> &'static [Network] {
+    BLOCKED_NETWORKS.get().map_or(&[], Vec::as_slice)
+}
+
 fn public_address(address: IpAddr) -> bool {
+    globally_routable(address) && !blocked_networks().iter().any(|n| n.contains(address))
+}
+
+/// False for private, loopback, link-local, shared, documentation,
+/// benchmarking, multicast and other reserved addresses.
+fn globally_routable(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(ip) => !matches!(
             ip.octets(),
@@ -405,7 +482,11 @@ async fn download(mut url: Url) -> Result<(Url, Vec<u8>, Option<String>, Kind, b
         let mut client = client_builder();
         if let Some(Host::Domain(host)) = url.host() {
             let port = url.port_or_known_default().ok_or(PageError::Target)?;
-            let addresses: Vec<SocketAddr> = lookup_host((host, port))
+            // The trailing dot makes the name absolute, so resolver search
+            // domains (Kubernetes adds `<namespace>.svc.cluster.local` and
+            // others) cannot turn a public-looking name into a cluster one.
+            let absolute = format!("{}.", host.trim_end_matches('.'));
+            let addresses: Vec<SocketAddr> = lookup_host((absolute.as_str(), port))
                 .await
                 .map_err(|_| PageError::Transport)?
                 .collect();
@@ -677,6 +758,11 @@ async fn render(url: &Url, threshold: usize) -> Result<(Vec<u8>, bool), PageErro
     for range in BLOCKED_RANGES {
         command.args(["--block-cidrs", range]);
     }
+    // Parsed addresses never start with '-', which Lightpanda reads as an
+    // exemption.
+    for network in blocked_networks() {
+        command.args(["--block-cidrs", &network.to_string()]);
+    }
     let output = command
         .args(["--dump-max-bytes", &PAGE_BYTES.to_string(), url.as_str()])
         .stdin(Stdio::null())
@@ -741,7 +827,9 @@ fn document_media(media: &str) -> bool {
 /// Converts an office document with anydoc, which enforces its own limits on
 /// archive entries, XML depth and table expansion. It runs off the async
 /// threads, a parser panic is contained, and the result goes through the
-/// same passage ranking as HTML and PDF.
+/// same passage ranking as HTML and PDF. A blocking thread cannot be
+/// cancelled, so a conversion that outlives its timeout keeps its slot until
+/// it finishes; crafted documents cannot pile up converter threads.
 async fn document(
     url: Url,
     bytes: Vec<u8>,
@@ -749,30 +837,45 @@ async fn document(
     relevance: Option<&Relevance>,
 ) -> Result<Source, PageError> {
     let relevance = relevance.cloned();
-    let task = tokio::task::spawn_blocking(move || {
-        let markdown = std::panic::catch_unwind(|| anydoc::to_markdown_bytes(&bytes, format))
-            .map_err(|_| PageError::Unreadable)?
+    let task = async {
+        let slot = DOCUMENT_SLOTS
+            .acquire()
+            .await
             .map_err(|_| PageError::Unreadable)?;
-        let Some(relevance) = relevance else {
-            let title = pdf_name(&url);
-            let mut source = Source::full(url, title, &markdown)?;
-            source.metadata.retrieval = Some("document");
-            return Ok(source);
-        };
-        let passages = markdown_passages(&markdown);
-        let title = passages
-            .iter()
-            .take(8)
-            .find(|p| p.split_whitespace().count() >= 3 && p.chars().count() >= 16)
-            .map_or_else(|| pdf_name(&url), |p| shorten(p, 160));
-        let mut source = source(url, title, passages.into_iter(), &relevance)?;
-        source.metadata.retrieval = Some("document");
-        Ok(source)
-    });
+        tokio::task::spawn_blocking(move || convert(url, &bytes, format, relevance, slot))
+            .await
+            .map_err(|_| PageError::Unreadable)?
+    };
     tokio::time::timeout(PDF_EXTRACT_TIMEOUT, task)
         .await
         .map_err(|_| PageError::Timeout)?
+}
+
+fn convert(
+    url: Url,
+    bytes: &[u8],
+    format: Option<anydoc::Format>,
+    relevance: Option<Relevance>,
+    _slot: tokio::sync::SemaphorePermit<'static>,
+) -> Result<Source, PageError> {
+    let markdown = std::panic::catch_unwind(|| anydoc::to_markdown_bytes(bytes, format))
         .map_err(|_| PageError::Unreadable)?
+        .map_err(|_| PageError::Unreadable)?;
+    let Some(relevance) = relevance else {
+        let title = pdf_name(&url);
+        let mut source = Source::full(url, title, &markdown)?;
+        source.metadata.retrieval = Some("document");
+        return Ok(source);
+    };
+    let passages = markdown_passages(&markdown);
+    let title = passages
+        .iter()
+        .take(8)
+        .find(|p| p.split_whitespace().count() >= 3 && p.chars().count() >= 16)
+        .map_or_else(|| pdf_name(&url), |p| shorten(p, 160));
+    let mut source = source(url, title, passages.into_iter(), &relevance)?;
+    source.metadata.retrieval = Some("document");
+    Ok(source)
 }
 
 /// Splits anydoc Markdown into passages: paragraphs and list items as they
@@ -1156,7 +1259,11 @@ fn extract(
     }
 
     let Some(relevance) = relevance else {
-        let text = clean::page_text(document.root_element());
+        let mut text = clean::page_text(document.root_element(), false);
+        // A page made only of navigation, such as a sitemap, keeps it.
+        if text.trim().is_empty() {
+            text = clean::page_text(document.root_element(), true);
+        }
         let body = std::slice::from_ref(&text);
         if needs_script(&document, body, text.len(), rendered)
             || (!rendered && client_template(&document, body))

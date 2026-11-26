@@ -28,7 +28,7 @@ use tokio::{net::TcpListener, sync::Semaphore, time::Instant};
 use url::Url;
 
 use crate::{
-    discovery::Brave,
+    discovery::configure_engines,
     model::Model,
     pages::Source,
     search::{Diagnostics, Search},
@@ -42,6 +42,7 @@ enum Failure {
     InvalidPlan,
     QueryWithheld,
     ModelNotConfigured,
+    DiscoveryNotConfigured,
     UnresolvedContext,
     DiscoveryRateLimited,
     DiscoveryUnavailable,
@@ -59,6 +60,7 @@ impl Failure {
             Self::InvalidPlan => "invalid_plan",
             Self::QueryWithheld => "query_withheld",
             Self::ModelNotConfigured => "model_not_configured",
+            Self::DiscoveryNotConfigured => "discovery_not_configured",
             Self::UnresolvedContext => "context_resolution_unavailable",
             Self::DiscoveryRateLimited => "discovery_rate_limited",
             Self::DiscoveryUnavailable => "discovery_unavailable",
@@ -77,9 +79,9 @@ impl Failure {
             | Self::UnresolvedContext
             | Self::ContextTooLarge
             | Self::QueryWithheld => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::DiscoveryRateLimited | Self::ModelNotConfigured => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::DiscoveryRateLimited
+            | Self::ModelNotConfigured
+            | Self::DiscoveryNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
             Self::Deadline => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::BAD_GATEWAY,
         }
@@ -349,11 +351,7 @@ fn positive_env(
 /// The answer model is optional: with none of `QUELLE_MODEL_BASE_URL`,
 /// `QUELLE_MODEL_API_KEY` and `QUELLE_MODEL_NAME` set, Quelle runs without
 /// one. Setting only some of them is a configuration error.
-fn configure_model(
-    client: &reqwest::Client,
-    token: &str,
-    brave_token: &HeaderValue,
-) -> Result<Option<Model>, &'static str> {
+fn configure_model(client: &reqwest::Client, token: &str) -> Result<Option<Model>, &'static str> {
     let names = [
         "QUELLE_MODEL_BASE_URL",
         "QUELLE_MODEL_API_KEY",
@@ -373,7 +371,7 @@ fn configure_model(
     }
     let provider_key = env_text("QUELLE_MODEL_API_KEY")?;
     let provider_auth = secret_header(format!("Bearer {provider_key}"), "QUELLE_MODEL_API_KEY")?;
-    if brave_token.as_bytes() == provider_key.as_bytes() || provider_key == token {
+    if provider_key == token {
         return Err("service, model and search credentials must be distinct");
     }
     let base = endpoint(&env_text("QUELLE_MODEL_BASE_URL")?, "QUELLE_MODEL_BASE_URL")?;
@@ -408,30 +406,32 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
         return Err("QUELLE_TOKEN");
     }
     let authorization = secret_header(format!("Bearer {token}"), "QUELLE_TOKEN")?;
-    let brave_token = secret_header(env_text("BRAVE_SEARCH_API_KEY")?, "BRAVE_SEARCH_API_KEY")?;
-    if brave_token.as_bytes() == token.as_bytes() {
-        return Err("service, model and search credentials must be distinct");
-    }
     let client = client_builder().build().map_err(|_| "HTTP client")?;
-    let model = configure_model(&client, &token, &brave_token)?;
-    let br = env::var("BRAVE_SEARCH_URL")
-        .unwrap_or_else(|_| "https://api.search.brave.com/res/v1/web/search".to_owned());
+    let model = configure_model(&client, &token)?;
+    let engines = configure_engines(&client, &token)?;
     let user_agent = env::var("QUELLE_USER_AGENT")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| pages::DEFAULT_USER_AGENT.to_owned());
     pages::set_user_agent(HeaderValue::try_from(user_agent).map_err(|_| "QUELLE_USER_AGENT")?);
+    let blocked = match env::var("QUELLE_BLOCKED_NETWORKS") {
+        Ok(list) => list
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| pages::Network::parse(entry).ok_or("QUELLE_BLOCKED_NETWORKS"))
+            .collect::<Result<Vec<_>, _>>()?,
+        Err(env::VarError::NotPresent) => vec![],
+        Err(_) => return Err("QUELLE_BLOCKED_NETWORKS"),
+    };
+    pages::set_blocked_networks(blocked);
     let concurrent = positive_env("QUELLE_CONCURRENCY", 8, 1, 64)?;
     let app = App {
         authorization,
         slots: Arc::new(Semaphore::new(concurrent)),
         search: Search {
             model,
-            engines: vec![Box::new(Brave::new(
-                client,
-                endpoint(&br, "BRAVE_SEARCH_URL")?,
-                brave_token,
-            ))],
+            engines,
             page_slots: Arc::new(Semaphore::new(concurrent * 4)),
         },
     };

@@ -2,17 +2,21 @@ use std::{
     collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
-use crate::{read_json, truncate};
+mod providers;
+pub use providers::configure_engines;
+#[cfg(test)]
+use providers::{HtmlEngine as Kind, parse_search_html};
 
-/// Brave bills per request and returns up to 20 results for the same price.
 pub const RESULTS_PER_QUERY: usize = 20;
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const CACHE_ENTRIES: usize = 512;
@@ -40,10 +44,11 @@ pub struct Query {
     pub language: Language,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub enum DiscoveryError {
-    RateLimited,
+    RateLimited(Duration),
     Unavailable,
+    NotConfigured,
 }
 
 pub type DiscoveryFuture<'a> =
@@ -57,24 +62,71 @@ pub struct SearchOptions {
 
 pub trait SearchEngine: Send + Sync {
     fn name(&self) -> &'static str;
+    fn spacing(&self) -> Duration {
+        Duration::ZERO
+    }
     fn search<'a>(&'a self, query: &'a Query, options: SearchOptions) -> DiscoveryFuture<'a>;
 }
 
 type CacheKey = (String, Language, SearchOptions);
 
-pub struct Brave {
-    pub client: Client,
-    pub endpoint: Url,
-    pub token: header::HeaderValue,
-    pub cache: Mutex<HashMap<CacheKey, (Instant, Vec<Candidate>)>>,
+struct Slot {
+    engine: Box<dyn SearchEngine>,
+    cooldown: Mutex<Option<Instant>>,
+    next_request: tokio::sync::Mutex<tokio::time::Instant>,
 }
 
-impl Brave {
-    pub fn new(client: Client, endpoint: Url, token: header::HeaderValue) -> Self {
+impl Slot {
+    fn check_cooldown(&self) -> Result<(), DiscoveryError> {
+        match self
+            .cooldown
+            .lock()
+            .expect("engine cooldown")
+            .and_then(|until| until.checked_duration_since(Instant::now()))
+        {
+            Some(wait) => Err(DiscoveryError::RateLimited(wait)),
+            None => Ok(()),
+        }
+    }
+
+    async fn ready(&self) -> Result<(), DiscoveryError> {
+        self.check_cooldown()?;
+        let spacing = self.engine.spacing();
+        if spacing.is_zero() {
+            return Ok(());
+        }
+        // A short queue allows one planner's queries to share a paced engine.
+        // Recheck after waiting: an earlier request may have received a 429.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut next = self.next_request.lock().await;
+            tokio::time::sleep_until(*next).await;
+            self.check_cooldown()?;
+            *next = tokio::time::Instant::now() + spacing;
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(DiscoveryError::Unavailable))
+    }
+}
+
+pub struct EnginePool {
+    slots: Vec<Slot>,
+    next: AtomicUsize,
+    cache: Mutex<HashMap<CacheKey, (Instant, Vec<Candidate>)>>,
+}
+
+impl EnginePool {
+    fn new(engines: Vec<Box<dyn SearchEngine>>) -> Self {
         Self {
-            client,
-            endpoint,
-            token,
+            slots: engines
+                .into_iter()
+                .map(|engine| Slot {
+                    engine,
+                    cooldown: Mutex::new(None),
+                    next_request: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+                })
+                .collect(),
+            next: AtomicUsize::new(0),
             cache: Mutex::new(HashMap::new()),
         }
     }
@@ -102,103 +154,71 @@ impl Brave {
         }
         cache.insert(key, (Instant::now(), candidates.to_vec()));
     }
-}
 
-#[derive(Deserialize)]
-struct BraveResponse {
-    web: Option<BraveWeb>,
-}
-
-#[derive(Deserialize)]
-struct BraveWeb {
-    results: Vec<BraveResult>,
-}
-
-#[derive(Deserialize)]
-struct BraveResult {
-    url: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    description: String,
-}
-
-impl SearchEngine for Brave {
-    fn name(&self) -> &'static str {
-        "brave"
-    }
-
-    fn search<'a>(&'a self, query: &'a Query, options: SearchOptions) -> DiscoveryFuture<'a> {
-        Box::pin(async move {
-            let key = (query.text.clone(), query.language, options);
-            if let Some(candidates) = self.cached(&key) {
-                tracing::info!(stage = "brave_cache", hit = true);
-                return Ok(candidates);
+    /// One initial attempt per query; extra attempts share the request's retry budget.
+    pub async fn lookup(
+        &self,
+        query: &Query,
+        options: SearchOptions,
+        retries: &AtomicUsize,
+    ) -> Result<Vec<Candidate>, DiscoveryError> {
+        let key = (query.text.clone(), query.language, options);
+        if let Some(hits) = self.cached(&key) {
+            tracing::info!(stage = "discovery_cache", hit = true);
+            return Ok(hits);
+        }
+        if self.slots.is_empty() {
+            return Err(DiscoveryError::NotConfigured);
+        }
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.slots.len();
+        let mut attempted = false;
+        let mut empty = false;
+        let mut unavailable = false;
+        let mut limited = Duration::ZERO;
+        for slot in self.slots[start..].iter().chain(&self.slots[..start]) {
+            if let Err(error) = slot.ready().await {
+                match error {
+                    DiscoveryError::RateLimited(wait) => limited = limited.max(wait),
+                    _ => unavailable = true,
+                }
+                continue;
             }
-            let (language, locale) = match query.language {
-                Language::De => ("de", "de-CH"),
-                Language::Fr => ("fr", "fr-CH"),
-                Language::It => ("it", "de-CH"),
-                Language::En => ("en", "de-CH"),
-            };
-            let count = options.count.to_string();
-            let response = self
-                .client
-                .get(self.endpoint.clone())
-                .timeout(Duration::from_secs(5))
-                .header(header::ACCEPT, "application/json")
-                .header(header::CACHE_CONTROL, "no-cache")
-                .header("X-Loc-Country", "CH")
-                .header("X-Subscription-Token", self.token.clone())
-                .query(&[
-                    ("q", query.text.as_str()),
-                    ("country", "CH"),
-                    ("search_lang", language),
-                    ("ui_lang", locale),
-                    ("count", count.as_str()),
-                    (
-                        "spellcheck",
-                        if options.spellcheck { "true" } else { "false" },
-                    ),
-                    ("safesearch", "strict"),
-                    ("result_filter", "web"),
-                    ("text_decorations", "false"),
-                ])
-                .send()
-                .await
-                .map_err(|_| DiscoveryError::Unavailable)?;
-            tracing::info!(
-                stage = "brave_cache",
-                hit = false,
-                status = response.status().as_u16()
-            );
-            if response.status() == StatusCode::TOO_MANY_REQUESTS {
-                return Err(DiscoveryError::RateLimited);
+            if attempted
+                && retries
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                    .is_err()
+            {
+                break;
             }
-            if !response.status().is_success() {
-                return Err(DiscoveryError::Unavailable);
+            attempted = true;
+            let now = Instant::now();
+            let result = slot.engine.search(query, options).await;
+            tracing::info!(stage = "search_engine", engine = slot.engine.name(), elapsed_ms = now.elapsed().as_millis() as u64,
+                candidates = result.as_ref().map_or(0, Vec::len), error = ?result.as_ref().err());
+            match result {
+                Ok(hits) if hits.is_empty() => empty = true,
+                Ok(hits) => {
+                    self.store(key, &hits);
+                    return Ok(hits);
+                }
+                Err(DiscoveryError::RateLimited(wait)) => {
+                    let mut cooldown = slot.cooldown.lock().expect("engine cooldown");
+                    let until = Instant::now() + wait;
+                    *cooldown = Some(cooldown.map_or(until, |prior| prior.max(until)));
+                    limited = limited.max(wait);
+                }
+                Err(_) => unavailable = true,
             }
-            let body: BraveResponse = read_json(response, 2 * 1024 * 1024)
-                .await
-                .map_err(|_| DiscoveryError::Unavailable)?;
-            let candidates = body
-                .web
-                .into_iter()
-                .flat_map(|web| web.results)
-                .filter_map(|result| {
-                    Some(Candidate {
-                        url: Url::parse(&result.url).ok()?,
-                        title: truncate(result.title.trim(), 200),
-                        description: truncate(result.description.trim(), 400),
-                    })
-                })
-                .take(options.count)
-                .collect::<Vec<_>>();
-            // Only successful, non-empty answers are cached so outages retry.
-            if !candidates.is_empty() {
-                self.store(key, &candidates);
-            }
-            Ok(candidates)
-        })
+        }
+        if empty {
+            Ok(vec![])
+        } else if unavailable {
+            Err(DiscoveryError::Unavailable)
+        } else {
+            Err(DiscoveryError::RateLimited(limited))
+        }
     }
 }
+
+#[cfg(test)]
+mod tests;
