@@ -40,6 +40,7 @@ const MAX_REQUEST_BODY: usize = 256 * 1024;
 enum Failure {
     InvalidPlan,
     QueryWithheld,
+    ModelNotConfigured,
     UnresolvedContext,
     DiscoveryRateLimited,
     DiscoveryUnavailable,
@@ -56,6 +57,7 @@ impl Failure {
         match self {
             Self::InvalidPlan => "invalid_plan",
             Self::QueryWithheld => "query_withheld",
+            Self::ModelNotConfigured => "model_not_configured",
             Self::UnresolvedContext => "context_resolution_unavailable",
             Self::DiscoveryRateLimited => "discovery_rate_limited",
             Self::DiscoveryUnavailable => "discovery_unavailable",
@@ -74,7 +76,9 @@ impl Failure {
             | Self::UnresolvedContext
             | Self::ContextTooLarge
             | Self::QueryWithheld => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::DiscoveryRateLimited => StatusCode::SERVICE_UNAVAILABLE,
+            Self::DiscoveryRateLimited | Self::ModelNotConfigured => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             Self::Deadline => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::BAD_GATEWAY,
         }
@@ -144,19 +148,25 @@ fn problem(status: StatusCode, code: &'static str) -> Response {
     (status, Json(json!({"error": code}))).into_response()
 }
 
-async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
-    let started = Instant::now();
-    let deadline = started + REQUEST_TIMEOUT;
+/// Authenticates, takes a search slot and parses the request body. Shared by
+/// both endpoints; the permit is held until the response is complete.
+async fn admit(
+    app: &App,
+    req: Request<Body>,
+) -> Result<(tokio::sync::OwnedSemaphorePermit, search::Request), Response> {
     let expected = app.authorization.as_bytes();
     if !req
         .headers()
         .get(header::AUTHORIZATION)
         .is_some_and(|value| bool::from(value.as_bytes().ct_eq(expected)))
     {
-        return problem(StatusCode::UNAUTHORIZED, "backend_authentication_required");
+        return Err(problem(
+            StatusCode::UNAUTHORIZED,
+            "backend_authentication_required",
+        ));
     }
     let Ok(permit) = app.slots.clone().try_acquire_owned() else {
-        return problem(StatusCode::SERVICE_UNAVAILABLE, "search_capacity");
+        return Err(problem(StatusCode::SERVICE_UNAVAILABLE, "search_capacity"));
     };
     let body = match tokio::time::timeout(
         Duration::from_secs(10),
@@ -169,16 +179,89 @@ async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
             if std::error::Error::source(&error)
                 .is_some_and(|source| source.is::<http_body_util::LengthLimitError>()) =>
         {
-            return problem(StatusCode::PAYLOAD_TOO_LARGE, "request_body_too_large");
+            return Err(problem(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_body_too_large",
+            ));
         }
-        Ok(Err(_)) => return problem(StatusCode::BAD_REQUEST, "invalid_search_request"),
-        Err(_) => return problem(StatusCode::REQUEST_TIMEOUT, "request_body_timeout"),
+        Ok(Err(_)) => return Err(problem(StatusCode::BAD_REQUEST, "invalid_search_request")),
+        Err(_) => return Err(problem(StatusCode::REQUEST_TIMEOUT, "request_body_timeout")),
     };
     let Ok(request) = serde_json::from_slice::<search::Request>(&body) else {
-        return problem(StatusCode::BAD_REQUEST, "invalid_search_request");
+        return Err(problem(StatusCode::BAD_REQUEST, "invalid_search_request"));
     };
     if !request.validate() {
-        return problem(StatusCode::BAD_REQUEST, "invalid_search_request");
+        return Err(problem(StatusCode::BAD_REQUEST, "invalid_search_request"));
+    }
+    Ok((permit, request))
+}
+
+#[derive(Serialize)]
+struct Results {
+    queries: Vec<String>,
+    sources: Vec<Source>,
+    hits: Vec<search::Hit>,
+    diagnostics: Diagnostics,
+}
+
+/// Results without an answer: every page that was read, with its selected
+/// passages, and every other search hit with the engine's title and
+/// snippet. Same request body as /api/search; `stream` is ignored.
+async fn sources(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
+    let started = Instant::now();
+    let (permit, request) = match admit(&app, req).await {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    let _permit = permit;
+    let mut diagnostics = Diagnostics::default();
+    let result = tokio::time::timeout_at(
+        started + REQUEST_TIMEOUT,
+        app.search.gather(&request, &mut diagnostics),
+    )
+    .await
+    .unwrap_or(Err(Failure::Deadline));
+    // An empty read set with hits is still a useful result.
+    let result = match result {
+        Ok(gathered) if gathered.sources.is_empty() && gathered.hits.is_empty() => {
+            Err(gathered.failure.unwrap_or(Failure::NoReadableSources))
+        }
+        other => other,
+    };
+    record(started, &result);
+    diagnostics.total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    diagnostics.error = result.as_ref().err().map(|failure| failure.code());
+    match result {
+        Ok(gathered) => Json(Results {
+            queries: gathered.queries,
+            sources: gathered.sources,
+            hits: gathered.hits,
+            diagnostics,
+        })
+        .into_response(),
+        Err(failure) => (
+            failure.status(),
+            Json(json!({"error": failure.code(), "diagnostics": diagnostics})),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
+    let started = Instant::now();
+    let deadline = started + REQUEST_TIMEOUT;
+    let (permit, request) = match admit(&app, req).await {
+        Ok(admitted) => admitted,
+        Err(response) => return response,
+    };
+    // Answers need the model; refuse after authentication and before any
+    // search call.
+    if app.search.model.is_none() {
+        drop(permit);
+        return problem(
+            Failure::ModelNotConfigured.status(),
+            Failure::ModelNotConfigured.code(),
+        );
     }
     let legacy = request.legacy();
     if request.stream {
@@ -313,23 +396,34 @@ fn positive_env(
     }
 }
 
-fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
-    let listen = env::var("QUELLE_LISTEN")
-        .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
-        .parse()
-        .map_err(|_| "QUELLE_LISTEN")?;
-    let token = env_text("QUELLE_TOKEN")?;
-    if token.len() < 32 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
-        return Err("QUELLE_TOKEN");
+/// The answer model is optional: with none of `QUELLE_MODEL_BASE_URL`,
+/// `QUELLE_MODEL_API_KEY` and `QUELLE_MODEL_NAME` set, Quelle runs without
+/// one. Setting only some of them is a configuration error.
+fn configure_model(
+    client: &reqwest::Client,
+    token: &str,
+    brave_token: &HeaderValue,
+) -> Result<Option<Model>, &'static str> {
+    let names = [
+        "QUELLE_MODEL_BASE_URL",
+        "QUELLE_MODEL_API_KEY",
+        "QUELLE_MODEL_NAME",
+    ];
+    let present = names
+        .iter()
+        .filter(|name| env::var_os(name).is_some_and(|value| !value.is_empty()))
+        .count();
+    if present == 0 {
+        return Ok(None);
     }
-    let authorization = secret_header(format!("Bearer {token}"), "QUELLE_TOKEN")?;
-    let brave_token = secret_header(env_text("BRAVE_SEARCH_API_KEY")?, "BRAVE_SEARCH_API_KEY")?;
+    if present < names.len() {
+        return Err(
+            "QUELLE_MODEL_BASE_URL, QUELLE_MODEL_API_KEY and QUELLE_MODEL_NAME must be set together",
+        );
+    }
     let provider_key = env_text("QUELLE_MODEL_API_KEY")?;
     let provider_auth = secret_header(format!("Bearer {provider_key}"), "QUELLE_MODEL_API_KEY")?;
-    if brave_token.as_bytes() == provider_key.as_bytes()
-        || brave_token.as_bytes() == token.as_bytes()
-        || provider_key == token
-    {
+    if brave_token.as_bytes() == provider_key.as_bytes() || provider_key == token {
         return Err("service, model and search credentials must be distinct");
     }
     let base = endpoint(&env_text("QUELLE_MODEL_BASE_URL")?, "QUELLE_MODEL_BASE_URL")?;
@@ -344,9 +438,34 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
         "{}/tokenize",
         root.strip_suffix("/v1").unwrap_or(root)
     ));
+    Ok(Some(Model {
+        client: client.clone(),
+        completions,
+        tokenize,
+        name: env_text("QUELLE_MODEL_NAME")?,
+        authorization: provider_auth,
+        context_limit: positive_env("QUELLE_MODEL_CONTEXT_TOKENS", 64_000, 2048, 64_000)?,
+    }))
+}
+
+fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
+    let listen = env::var("QUELLE_LISTEN")
+        .unwrap_or_else(|_| "127.0.0.1:3000".to_owned())
+        .parse()
+        .map_err(|_| "QUELLE_LISTEN")?;
+    let token = env_text("QUELLE_TOKEN")?;
+    if token.len() < 32 || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err("QUELLE_TOKEN");
+    }
+    let authorization = secret_header(format!("Bearer {token}"), "QUELLE_TOKEN")?;
+    let brave_token = secret_header(env_text("BRAVE_SEARCH_API_KEY")?, "BRAVE_SEARCH_API_KEY")?;
+    if brave_token.as_bytes() == token.as_bytes() {
+        return Err("service, model and search credentials must be distinct");
+    }
+    let client = client_builder().build().map_err(|_| "HTTP client")?;
+    let model = configure_model(&client, &token, &brave_token)?;
     let br = env::var("BRAVE_SEARCH_URL")
         .unwrap_or_else(|_| "https://api.search.brave.com/res/v1/web/search".to_owned());
-    let client = client_builder().build().map_err(|_| "HTTP client")?;
     let user_agent = env::var("QUELLE_USER_AGENT")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -357,14 +476,7 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
         authorization,
         slots: Arc::new(Semaphore::new(concurrent)),
         search: Search {
-            model: Model {
-                client: client.clone(),
-                completions,
-                tokenize,
-                name: env_text("QUELLE_MODEL_NAME")?,
-                authorization: provider_auth,
-                context_limit: positive_env("QUELLE_MODEL_CONTEXT_TOKENS", 64_000, 2048, 64_000)?,
-            },
+            model,
             engines: vec![Box::new(Brave::new(
                 client,
                 endpoint(&br, "BRAVE_SEARCH_URL")?,
@@ -410,6 +522,11 @@ async fn main() -> ExitCode {
     } else {
         tracing::warn!("pdftotext not found; PDF sources are skipped");
     }
+    if app.search.model.is_none() {
+        tracing::warn!(
+            "no answer model configured; /api/search answers 503, /api/sources searches the request text directly"
+        );
+    }
     if pages::detect_renderer() {
         tracing::info!("Lightpanda rendering enabled for script-only pages");
     } else {
@@ -417,6 +534,7 @@ async fn main() -> ExitCode {
     }
     let router = Router::new()
         .route("/api/search", post(handle))
+        .route("/api/sources", post(sources))
         .route("/healthz", get(health))
         .route("/api/providers", get(health))
         .with_state(app)

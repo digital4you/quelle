@@ -203,7 +203,13 @@ pub struct Relevance {
 }
 
 impl Relevance {
-    pub fn new<'a>(request: &str, queries: impl Iterator<Item = &'a str>) -> Self {
+    /// Keywords from the request and the search queries first, then the
+    /// planner's evidence terms (synonyms and word forms the page may use).
+    pub fn new<'a>(
+        request: &str,
+        queries: impl Iterator<Item = &'a str>,
+        evidence: impl Iterator<Item = &'a str>,
+    ) -> Self {
         static NUMERIC: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(concat!(
                 r"(?i)\b(wann|seit wann|wie ?viele?|wie hoch|wie gross|wie groß|wie lang|wie alt|welche[mns]? jahr",
@@ -216,8 +222,9 @@ impl Relevance {
         let mut seen = HashSet::new();
         let keywords = words(request)
             .chain(queries.flat_map(words))
+            .chain(evidence.take(12).flat_map(words))
             .filter(|word| seen.insert(word.clone()))
-            .take(64)
+            .take(80)
             .collect();
         Self {
             keywords,
@@ -502,6 +509,10 @@ pub async fn fetch(
             Err(PageError::NeedsJs | PageError::Unreadable) if render_enabled() => {
                 rendered(url).await
             }
+            Err(PageError::NeedsJs) => {
+                tracing::info!(stage = "needs_js", host = url.host_str());
+                Err(PageError::NeedsJs)
+            }
             Ok(source) if render_enabled() && source.content.chars().count() < THIN_PAGE => {
                 match rendered(url).await {
                     Ok(better)
@@ -594,15 +605,31 @@ async fn render(url: &Url) -> Result<Vec<u8>, PageError> {
         // what was rendered by then is used.
         Ok(Ok(output)) if !output.stdout.is_empty() => output,
         Ok(_) => {
-            tracing::info!(stage = "render", elapsed_ms, ok = false);
+            tracing::info!(
+                stage = "render",
+                host = url.host_str(),
+                elapsed_ms,
+                ok = false
+            );
             return Err(PageError::NeedsJs);
         }
         Err(_) => {
-            tracing::info!(stage = "render", elapsed_ms, ok = false, timeout = true);
+            tracing::info!(
+                stage = "render",
+                host = url.host_str(),
+                elapsed_ms,
+                ok = false,
+                timeout = true
+            );
             return Err(PageError::Timeout);
         }
     };
-    tracing::info!(stage = "render", elapsed_ms, ok = true);
+    tracing::info!(
+        stage = "render",
+        host = url.host_str(),
+        elapsed_ms,
+        ok = true
+    );
     let mut html = output.stdout;
     html.truncate(PAGE_BYTES);
     Ok(html)
