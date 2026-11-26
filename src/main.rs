@@ -474,9 +474,7 @@ async fn main() -> ExitCode {
         tracing::warn!("pdftotext not found; PDF sources are skipped");
     }
     if app.search.model.is_none() {
-        tracing::warn!(
-            "no answer model configured; /api/search/answer returns 503, /api/search/content is available"
-        );
+        tracing::warn!("no answer model configured; /answer returns 503, /content is available");
     }
     if pages::detect_renderer() {
         tracing::info!("Lightpanda rendering enabled for script-only pages");
@@ -484,8 +482,8 @@ async fn main() -> ExitCode {
         tracing::warn!("Lightpanda not found; script-only pages are skipped");
     }
     let router = Router::new()
-        .route("/api/search/answer", post(answer))
-        .route("/api/search/content", post(content::handle))
+        .route("/answer", post(answer))
+        .route("/content", post(content::handle))
         .route("/healthz", get(health))
         .route("/api/providers", get(health))
         .with_state(app)
