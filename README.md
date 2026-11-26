@@ -1,33 +1,25 @@
 # Quelle
 
-Quelle is a web search service written in Rust. Choose the endpoint by the output your caller needs.
+Quelle is a Rust service that retrieves web pages for agents. It can answer a question with citations or return readable page text for your own model.
 
 | Mode | Endpoint | Returns | Needs a model |
 | --- | --- | --- | --- |
 | Answer | `POST /answer` | An answer with numbered citations and supporting passages | Yes |
 | Content | `POST /content` | Page text in document order for the caller's exact search query or supplied URLs | No |
 
-Configure a Brave Search API key at startup. Answer mode also needs a model with chat completions and a vLLM-compatible tokenizer. Without a model, content retrieval works and answer requests return `503 model_not_configured` before making a search call.
+## Quick start
 
-When upgrading, move calls from `/api/search/answer` (formerly `/api/search`) to `/answer`, and from `/api/search/content` to `/content`. Clients migrating from the older `/api/sources` route should send a finished query to `/content` and read page text from `sources[].content`.
+Copy [.env.example](.env.example) to `.env`. Set `BRAVE_SEARCH_API_KEY` and a separate `QUELLE_TOKEN` of at least 32 characters. You can generate the token with `openssl rand -hex 32`. These two settings enable `/content`. To enable `/answer`, also fill in the three model variables in the same file before starting Quelle.
 
-## How it works
+```sh
+docker run -d --name quelle --env-file .env \
+  -p 127.0.0.1:3000:3000 ghcr.io/digital4you/quelle:master
+curl -sS http://127.0.0.1:3000/healthz
+```
 
-Answer mode runs the following six steps. Content mode uses the same search provider, fetch protections and document readers. Its request and output are described below.
+The health check returns `{"ok":true}`. For the API examples below, set `QUELLE_TOKEN` in your client shell to the same value you put in `.env`.
 
-1. **Plan.** The model turns the request into one to three short search queries in the likely source language (de, fr, it or en), plus evidence terms such as "Erstbesteigung" for "erstmals bestiegen". These terms help rank passages within a page. Conversation history resolves references.
-2. **Filter.** Before Quelle sends a query to Brave, a privacy filter removes email addresses, phone numbers, AHV numbers, IBANs, card numbers, API keys, tokens and passwords. A query reduced to fragments is dropped.
-3. **Discover.** Each query goes to Brave once (Swiss locale, strict safe search, 20 results). Brave bills per request, so results are cached in memory for 15 minutes.
-4. **Rank.** The model orders the results by title and snippet so the page budget goes to likely primary sources. If reranking fails, Quelle uses a host-diverse order. The writer receives passages from the fetched pages.
-5. **Read.** Pages are fetched with SSRF protection (public addresses only, checked on every redirect), size and time limits, and a desktop browser user agent (Wikimedia sites get an honest one, as their policy asks).
-   - HTML is reduced to its largest content region, or the whole page when that region is only a sidebar or teaser list; cookie and JavaScript notices are dropped.
-   - PDFs are read through their text layer with `pdftotext` (first 150 pages), which covers born-digital documents and OCR'd scans.
-   - Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files are converted with [anydoc](https://github.com/firecrawl/anydoc) (MIT), which limits archive entries, XML depth and table expansion. Table rows are labelled with their column headers and the nearest heading, so a figure keeps its meaning ("2020 — Kanton: Zürich; Bevölkerungsstand am 31. Dezember: 1 129 722").
-   - Pages that only render with JavaScript (script shells, "JavaScript required" notices, unrendered AngularJS or Vue templates, or almost no readable text) are rendered with [Lightpanda](https://github.com/lightpanda-io/browser) and read the same way. Lightpanda runs as a separate process per page, at most two at a time, with private and reserved networks blocked for every request the page makes, telemetry off, and memory, size and time limits. It identifies itself honestly as Lightpanda with a Quelle suffix. Without Lightpanda such pages are reported as `needs_js` and skipped.
-   - Passages are ranked by query and evidence terms weighted by rarity on the page, with a boost for figures and dates when the question asks for one. The best ones are kept up to 6,500 characters per page.
-6. **Write** (answer mode). The model answers from the passages with numbered citations. Citations that point at no source are removed, and an answer without a valid citation is rejected. Planner and writer each get one corrected retry, since model calls are cheap compared with search calls.
-
-Logs and diagnostics hold timings and counts, never query text, answers or URLs. The one exception is the host name (no path) of pages that needed JavaScript rendering, logged as `stage="render"` or `stage="needs_js"`, so it is visible which sites would profit from a site adapter.
+To run from source, export the configuration in your shell and run `cargo run --locked --release` with Rust 1.95 or later. Install `pdftotext` (from `poppler-utils`) for PDFs and `lightpanda` for JavaScript rendering. The Docker image includes both.
 
 ## API
 
@@ -35,15 +27,17 @@ Both endpoints accept JSON and require `Authorization: Bearer $QUELLE_TOKEN`.
 
 ### Answer mode · `POST /answer`
 
+Send a question. The model plans searches and ranks results. Quelle selects up to 6,500 characters of relevant passages per page, then the model writes an answer citing those passages. If the model is unconfigured, this endpoint returns HTTP 503 with `model_not_configured` before searching.
+
 | Request field | Required | Type and behavior |
 | --- | --- | --- |
 | `query` | Yes | Nonblank string, up to 12,000 characters. The question or research request. |
 | `history` | No | Array of up to 10 `[role, text]` pairs. Roles are `user` (alias `human`) and `assistant`. Limit of 4,000 characters per turn and 12,000 across all turns. |
 | `optimizationMode` | No | String. Choose `speed` (default), `balanced`, or `quality` to set the search and answer budgets. |
 | `sources` | No | Array of up to three search focuses drawn from `web`, `academic`, and `discussions`. |
-| `systemInstructions` | No | String, up to 64,000 characters. Supplies writer instructions when `mateContext` is absent. |
+| `systemInstructions` | No | String, up to 64,000 characters. Supplies writer instructions when `context` is absent. |
 | `stream` | No | Boolean, default `false`. Set to `true` for server-sent events. |
-| `mateContext` | No | Object from Mate's backend. Requires `version` set to `"mate-search-v1"` and a nonblank `originalRequest`. Optional fields are `serverInstructions`, `clientInstructions`, `answerLanguage`, `publicAffairs`, `contextual`, and `identity`. |
+| `context` | No | Object for callers that supply the user's original request separately from the research query. See the example below. |
 
 ```sh
 curl -sS http://127.0.0.1:3000/answer \
@@ -51,17 +45,44 @@ curl -sS http://127.0.0.1:3000/answer \
   --data '{"query":"Where does IANA describe example domains?","optimizationMode":"speed"}'
 ```
 
-The response holds `message` and `sources` (each with `content` and `metadata.title`, `metadata.url`, and `metadata.retrieval` for `pdf`, `document` or `rendered` pages). With `"stream": true` the same arrives as server-sent `sources`, `response` and `done` or `error` events. Non-streaming requests with `mateContext` also receive `diagnostics`.
+The JSON response contains `message` and `sources`. A citation such as `[1]` refers to the first source, with its supporting passages in `content` and its title and URL in `metadata`. If Quelle finds no readable evidence and the request omitted `context`, it returns HTTP 200 with `{"message":"","sources":[]}`.
+
+A caller can pass structured context with the question. The object requires `version` and a nonblank `originalRequest`. Optional fields are `serverInstructions`, `clientInstructions`, `answerLanguage`, `publicAffairs`, `contextual`, and `identity`.
+
+```json
+{
+  "query": "IANA policy on registering example.org",
+  "context": {
+    "version": "search-v1",
+    "originalRequest": "Can I register example.org for my business?",
+    "answerLanguage": "en"
+  }
+}
+```
+
+With `context`, a non-streaming search returns timing and count diagnostics with `diagnostics.version` set to `"evidence-v1"`. Missing evidence returns HTTP 422 with `no_readable_sources`.
+
+With `"stream": true`, read the JSON object in each server-sent event's `data:` line. A successful stream starts with the sources, sends an empty `response` when writing begins, then sends the complete cited answer in a second `response` followed by `done`. Failures after streaming starts use `{"type":"error","data":"<code>"}`. A basic request with no readable evidence ends with `done`.
 
 ### Content mode · `POST /content`
 
-Supply exactly one of `query` and `urls`. The endpoint rejects unknown request fields with HTTP 400.
+Supply a finished search query or a list of known URLs. Both forms return page text for the caller to use directly. Sending both fields or an unknown field returns HTTP 400.
 
 | Request field | Required | Type and behavior |
 | --- | --- | --- |
 | `query` | One of `query` or `urls` | Nonblank string containing the finished Brave search query, up to 600 characters and 75 words. |
-| `urls` | One of `query` or `urls` | Array of 1–20 public HTTP(S) URL strings to read directly. |
+| `urls` | One of `query` or `urls` | Array of 1–20 public HTTP(S) URL strings on standard ports to read directly. |
 | `limit` | No | Integer from 1 to 20, default 20. Caps the results requested from Brave or the distinct supplied URLs to read. |
+
+To fetch known pages directly, pass `urls`. This makes zero Brave or model calls.
+
+```sh
+curl -sS http://127.0.0.1:3000/content \
+  -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
+  --data '{"urls":["https://www.rfc-editor.org/rfc/rfc2606.txt"]}'
+```
+
+To discover pages, pass the exact query you want Brave to run.
 
 ```sh
 curl -sS http://127.0.0.1:3000/content \
@@ -69,29 +90,34 @@ curl -sS http://127.0.0.1:3000/content \
   --data '{"query":"site:iana.org \"example domains\"","limit":3}'
 ```
 
-Quelle sends the supplied query to Brave with spellcheck disabled, preserving case, whitespace, quoted phrases and search operators outside privacy redactions. Each cache miss uses one lookup. Quelle attempts the distinct public URLs in Brave's result order. With `{"urls":["https://www.rfc-editor.org/rfc/rfc2606.txt"]}`, it reads the supplied URLs directly and spends zero Brave requests. Both forms work without a model. Reads run four at a time.
+Quelle disables spellcheck and preserves case, whitespace, quoted phrases and search operators outside privacy redactions. Each cache miss uses one Brave lookup. Quelle reads distinct public URLs in result order, up to four at a time.
 
-The response contains `sources` and `errors`. Each source has `content`, `metadata.url`, `metadata.title`, and `metadata.truncated`. Redirected or exported sources also carry the original `requestedUrl`. Sources follow input or search-result order. Errors identify the individual URL and reason. Partial success returns HTTP 200. If every read fails or discovery finds nothing, the endpoint returns HTTP 422 with `no_readable_sources`. An upstream search outage or rate limit returns the corresponding discovery error.
+Read `sources[].content` for the page text and `sources[].metadata.url` for the final URL. Each source also has `metadata.title` and `metadata.truncated`. When the final URL differs, `requestedUrl` records the original. Successful sources follow input or search-result order. Individual failures appear in `errors` as objects with `url` and `error`. Partial success returns HTTP 200. If every read fails or discovery finds nothing, HTTP 422 includes `error: "no_readable_sources"` alongside both arrays.
 
-HTML becomes document-order text, including short headings, repeated values and footer contact details. Direct `mailto:` and `tel:` targets, literal concatenations in navigation handlers, simple page-defined contact functions and contact links present in a rendered DOM can be recovered. A handler that depends on a click, an API request or arbitrary application state may yield only its visible label. Plain text retains line breaks, PDFs return their text layer, and office documents return the converter's Markdown.
+### Page extraction
 
-The output limit is 2 MiB of UTF-8 text per source, matching the HTML download limit. `metadata.truncated` indicates when Quelle cuts text, input HTML or plain text, a rendered DOM, or a PDF at its byte or 150-page limit. It describes Quelle's limits. A site can still require scrolling, pagination, a click or more loading time to reveal additional content.
+- **HTML.** `/content` keeps readable text in document order, including headings, repeated values and footer contacts. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
+- **JavaScript.** When static HTML looks like a script shell or an unrendered template, Quelle tries Lightpanda and reads the resulting DOM. If the page needs rendering and the browser is unavailable, its error code is `needs_js`.
+- **Documents.** Plain text retains line breaks. PDFs return their embedded text layer, up to 150 pages. Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files are converted to Markdown with [anydoc](https://github.com/firecrawl/anydoc).
 
-### Health and errors
+The output limit for `/content` is 2 MiB of UTF-8 text per source. `metadata.truncated` flags a byte or PDF page limit reached during extraction. A site can still require scrolling, pagination or a click to reveal additional content.
 
-- `GET /healthz` returns `{"ok":true}` without spending search or model quota.
-- Errors are JSON `{"error": "<code>"}` (plus `diagnostics` where available), for example `401 backend_authentication_required`, `503 search_capacity`, `503 model_not_configured`, `503 discovery_rate_limited`, `422 no_readable_sources`, `422 query_withheld` (the request consisted only of personal identifiers or secrets) and `504 deadline_exceeded`.
+### Search privacy and errors
+
+Before sending a query to Brave, Quelle filters identifiers such as email addresses, phone numbers, IBANs and credentials. A query reduced to fragments can return `422 query_withheld`. Searches use the Swiss country setting and strict Safe Search. Successful nonempty results are cached in memory for 15 minutes. In answer mode the configured model receives the question and supplied conversation context.
+
+Quelle checks page destinations on every redirect and restricts browser requests to public addresses. Diagnostics contain stage timings and counts. Rendering logs include the host name of the page.
+
+Common HTTP errors include `400 invalid_search_request` for invalid input, `401 backend_authentication_required` for a missing or incorrect bearer token, `503 search_capacity` when all request slots are busy, and `503 discovery_rate_limited` when Brave rate-limits discovery. The JSON response includes a machine-readable `error` field.
 
 ## Configuration
-
-For a content-only deployment, set `QUELLE_TOKEN` and `BRAVE_SEARCH_API_KEY`. To use Docker's `--env-file .env`, copy [.env.example](.env.example) to `.env` and fill in those two values. For a native process, export the variables in its environment.
 
 ### Required at startup
 
 | Variable | Purpose |
 | --- | --- |
 | `QUELLE_TOKEN` | Bearer token clients send to Quelle. Use at least 32 printable, non-space ASCII characters. |
-| `BRAVE_SEARCH_API_KEY` | Key Quelle sends to the Brave Search API. |
+| `BRAVE_SEARCH_API_KEY` | Brave Search API key. Required at startup even for deployments that only read supplied URLs. |
 
 ### Required only for `/answer`
 
@@ -99,7 +125,7 @@ Set all three connection variables together to enable answer generation. Omit al
 
 | Variable | Purpose |
 | --- | --- |
-| `QUELLE_MODEL_BASE_URL` | OpenAI-compatible model API base URL, such as `https://model.example.org/v1`. The server must support chat completions and a vLLM-compatible tokenizer. Plain HTTP is accepted on loopback. |
+| `QUELLE_MODEL_BASE_URL` | OpenAI-compatible model API base URL, such as `https://model.example.org/v1`. For that base path, the server must support `POST /v1/chat/completions` and vLLM-compatible `POST /tokenize`. Plain HTTP is accepted on loopback. |
 | `QUELLE_MODEL_API_KEY` | Bearer key for the model provider. |
 | `QUELLE_MODEL_NAME` | Model ID served by that endpoint. |
 
@@ -114,14 +140,10 @@ Set all three connection variables together to enable answer generation. Omit al
 | `QUELLE_USER_AGENT` | Built-in desktop Chrome user agent | User agent for ordinary page fetches. |
 | `QUELLE_LIGHTPANDA` | `lightpanda` on `PATH` | Path to the browser executable for JavaScript rendering. |
 
-## Run
+## Upgrading clients
 
-```sh
-cargo run --release      # pdftotext (poppler-utils) for PDFs, lightpanda for script-only pages
-docker run -p 3000:3000 --env-file .env ghcr.io/digital4you/quelle:master
-```
-
-The image is built by GitHub Actions on every push to `master` and on `v*` tags. It is a static musl binary on Debian slim with `pdftotext` and Lightpanda.
+- Move answer requests from `/api/search` or `/api/search/answer` to `/answer`. Send structured requests under `context` with `version: "search-v1"`. The endpoint ignores unrecognized top-level fields, so clients using a retired field name receive the basic response.
+- Move extraction requests from `/api/search/content` or `/api/sources` to `/content` and read each page from `sources[].content`.
 
 ## Third-party software in the image
 

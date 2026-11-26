@@ -225,8 +225,7 @@ async fn answer(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
             let outcome = match ready {
                 Ok(ready) => {
                     yield event(json!({"type": "sources", "data": ready.sources}));
-                    // Mate's legacy parser marks the first response event as the
-                    // start of writing. No answer text is sent until validation.
+                    // An empty response marks the start of writing for streaming clients.
                     yield event(json!({"type": "response", "data": ""}));
                     tokio::time::timeout_at(deadline, app.search.write(&ready, &mut diagnostics)).await.unwrap_or(Err(Failure::Deadline))
                 }
@@ -267,7 +266,7 @@ async fn answer(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
             diagnostics,
         })
         .into_response(),
-        // The Go legacy adapter maps an empty answer to its public no-sources error.
+        // Clients using the basic response shape receive an empty answer.
         Err(Failure::NoReadableSources) if legacy => Json(Answer {
             message: String::new(),
             sources: vec![],
