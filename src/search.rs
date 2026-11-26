@@ -13,9 +13,11 @@ use url::Url;
 
 use crate::{
     Failure,
-    discovery::{Candidate, DiscoveryError, Language, Query, RESULTS_PER_QUERY, SearchEngine},
+    discovery::{
+        Candidate, DiscoveryError, Language, Query, RESULTS_PER_QUERY, SearchEngine, SearchOptions,
+    },
     model::{Message, Model},
-    pages::{self, PageError, Source},
+    pages::{self, Source},
     privacy, truncate,
 };
 
@@ -216,30 +218,17 @@ fn millis(started: Instant) -> u64 {
 }
 
 pub struct Search {
-    /// Optional: without it, answers are refused and results come from the
-    /// request text searched directly.
+    /// Answer generation needs a model. Content retrieval does not.
     pub model: Option<Model>,
     pub engines: Vec<Box<dyn SearchEngine>>,
     pub page_slots: Arc<Semaphore>,
 }
 
-/// A search hit as the engine returned it, not read by Quelle.
-#[derive(Serialize)]
-pub struct Hit {
-    pub title: String,
-    pub url: Url,
-    pub snippet: String,
-}
-
-pub struct Gathered {
-    pub sources: Vec<Source>,
-    pub hits: Vec<Hit>,
-    pub queries: Vec<String>,
+struct Gathered {
+    sources: Vec<Source>,
     latest: String,
     resolved_question: Option<String>,
     writer_tokens: usize,
-    /// Discovery outage or rate limit, reported when nothing was read.
-    pub failure: Option<Failure>,
 }
 
 pub struct Prepared {
@@ -249,10 +238,8 @@ pub struct Prepared {
 }
 
 impl Search {
-    /// Plans, searches, ranks and reads pages: everything except writing.
-    /// Returns the read sources, every other search hit, and what the
-    /// writer needs.
-    pub async fn gather(
+    /// Selects the passages and request context for the answer writer.
+    async fn gather(
         &self,
         request: &Request,
         diagnostics: &mut Diagnostics,
@@ -364,7 +351,15 @@ impl Search {
         );
 
         let discovery_started = Instant::now();
-        let (discovered, discovery_failure, failed_queries) = self.discover(&plan.queries).await;
+        let (discovered, discovery_failure, failed_queries) = self
+            .discover(
+                &plan.queries,
+                SearchOptions {
+                    count: RESULTS_PER_QUERY,
+                    spellcheck: true,
+                },
+            )
+            .await;
         diagnostics.search_ms = millis(discovery_started);
         diagnostics.failed_queries = failed_queries;
         diagnostics.candidates = discovered.len();
@@ -406,8 +401,7 @@ impl Search {
         diagnostics.rerank_ms = millis(rerank_started);
 
         let started_fetch = Instant::now();
-        let order = candidates.clone();
-        let (sources, attempts, read) = self.acquire(candidates, &relevance, &budget).await;
+        let (sources, attempts) = self.acquire(candidates, &relevance, &budget).await;
         diagnostics.fetch_ms = millis(started_fetch);
         diagnostics.fetch_attempts = attempts;
         diagnostics.pages = sources.len();
@@ -416,33 +410,14 @@ impl Search {
             elapsed_ms = diagnostics.fetch_ms,
             pages = sources.len()
         );
-        // Hits that were not read, in ranked order; their titles and
-        // snippets come from the search engine and are untrusted.
-        let hits = order
-            .into_iter()
-            .enumerate()
-            .filter(|(index, _)| !read.contains(index))
-            .map(|(_, url)| {
-                let candidate = details.get(&url);
-                Hit {
-                    title: candidate.map(|c| c.title.clone()).unwrap_or_default(),
-                    snippet: candidate.map(|c| c.description.clone()).unwrap_or_default(),
-                    url,
-                }
-            })
-            .collect();
+        if sources.is_empty() {
+            return Err(discovery_failure.unwrap_or(Failure::NoReadableSources));
+        }
         Ok(Gathered {
             sources,
-            hits,
-            queries: plan
-                .queries
-                .iter()
-                .map(|query| query.text.clone())
-                .collect(),
             latest: latest.to_owned(),
             resolved_question: plan.resolved_question,
             writer_tokens: budget.writer_tokens,
-            failure: discovery_failure,
         })
     }
 
@@ -457,14 +432,9 @@ impl Search {
             latest,
             resolved_question,
             writer_tokens,
-            failure,
-            ..
         } = self.gather(request, diagnostics).await?;
         let model = self.model.as_ref().ok_or(Failure::ModelNotConfigured)?;
         let context = request.mate_context.as_ref();
-        if sources.is_empty() {
-            return Err(failure.unwrap_or(Failure::NoReadableSources));
-        }
 
         let (server_policy, preferences, answer_language, identity) = match context {
             Some(context) => (
@@ -545,9 +515,7 @@ impl Search {
         focus: &str,
         correction: Option<&str>,
     ) -> Result<Plan, Failure> {
-        let Some(model) = &self.model else {
-            return finish_plan(direct_plan(input), input, max_queries);
-        };
+        let model = self.model.as_ref().ok_or(Failure::ModelNotConfigured)?;
         let output = if input.contextual { 1100 } else { 800 };
         let minimum_queries = usize::from(input.supplied_public_url_count == 0);
         let query_requirement = if minimum_queries == 0 {
@@ -627,12 +595,16 @@ impl Search {
         finish_plan(plan, input, max_queries)
     }
 
-    async fn discover(&self, queries: &[Query]) -> (Vec<Candidate>, Option<Failure>, usize) {
+    pub(crate) async fn discover(
+        &self,
+        queries: &[Query],
+        options: SearchOptions,
+    ) -> (Vec<Candidate>, Option<Failure>, usize) {
         let mut jobs = Vec::new();
         'discovery: for query in queries {
             for engine in &self.engines {
                 let name = engine.name();
-                let search = engine.search(query);
+                let search = engine.search(query, options);
                 jobs.push(async move {
                     let started = Instant::now();
                     let result = search.await;
@@ -665,7 +637,7 @@ impl Search {
             .map(Vec::into_iter)
             .collect::<Vec<_>>();
         let mut seen = HashSet::new();
-        let candidates = (0..RESULTS_PER_QUERY)
+        let candidates = (0..options.count)
             .flat_map(|_| {
                 groups
                     .iter_mut()
@@ -682,7 +654,7 @@ impl Search {
         candidates: Vec<Url>,
         relevance: &pages::Relevance,
         budget: &Budget,
-    ) -> (Vec<Source>, usize, HashSet<usize>) {
+    ) -> (Vec<Source>, usize) {
         let deadline = Instant::now() + Duration::from_secs(budget.fetch_seconds);
         let mut pending = stream::iter(candidates.into_iter().take(budget.attempts).enumerate())
             .map(|(index, url)| async move {
@@ -692,7 +664,10 @@ impl Search {
                     .acquire_owned()
                     .await
                     .expect("page semaphore remains open");
-                (index, pages::fetch(url, relevance, permit).await)
+                (
+                    index,
+                    pages::fetch(url, Some(relevance), permit, deadline).await,
+                )
             })
             .buffer_unordered(4);
         let mut sources = Vec::new();
@@ -710,29 +685,16 @@ impl Search {
                     sources.push((index, source))
                 }
                 Err(error) => {
-                    let code = match error {
-                        PageError::Target => "target",
-                        PageError::Transport => "transport",
-                        PageError::Blocked => "blocked",
-                        PageError::Unsupported => "unsupported",
-                        PageError::TooLarge => "too_large",
-                        PageError::Unreadable => "unreadable",
-                        PageError::Timeout => "timeout",
-                        PageError::NoTextLayer => "no_text_layer",
-                        PageError::NeedsJs => "needs_js",
-                    };
-                    *errors.entry(code).or_insert(0) += 1;
+                    *errors.entry(error.code()).or_insert(0) += 1;
                 }
                 _ => {}
             }
         }
         tracing::info!(stage = "page_attempts", completed = attempts, ?errors);
         sources.sort_unstable_by_key(|(index, _)| *index);
-        let read = sources.iter().map(|(index, _)| *index).collect();
         (
             sources.into_iter().map(|(_, source)| source).collect(),
             attempts,
-            read,
         )
     }
 
@@ -879,9 +841,7 @@ impl Search {
     }
 }
 
-/// Shared checks for planned and direct queries: size limits, no raw URLs,
-/// no duplicates, and the privacy filter before anything reaches the
-/// search engine.
+/// Validate and privacy-filter the answer model's planned queries.
 fn finish_plan(
     mut plan: Plan,
     input: &PlanningInput<'_>,
@@ -934,15 +894,8 @@ fn finish_plan(
     Ok(plan)
 }
 
-/// Without a model the request text itself is the query, in the language
-/// its common words suggest (German by default).
-fn direct_plan(input: &PlanningInput<'_>) -> Plan {
-    let text = input
-        .latest_request
-        .split_whitespace()
-        .take(30)
-        .collect::<Vec<_>>()
-        .join(" ");
+/// Choose the engine's language hint without altering the query.
+pub(crate) fn query_language(text: &str) -> Language {
     let lowered = format!(" {} ", text.to_lowercase());
     let count = |words: &[&str]| {
         words
@@ -977,22 +930,11 @@ fn direct_plan(input: &PlanningInput<'_>) -> Plan {
             ]),
         ),
     ];
-    let language = scores
+    scores
         .iter()
         .max_by_key(|(_, score)| *score)
         .filter(|(_, score)| *score > 0)
-        .map_or(Language::De, |(language, _)| *language);
-    Plan {
-        queries: if text.is_empty() {
-            Vec::new()
-        } else {
-            vec![Query { text, language }]
-        },
-        reference_quote: None,
-        resolved_question: None,
-        evidence_terms: Vec::new(),
-        scrubbed: 0,
-    }
+        .map_or(Language::De, |(language, _)| *language)
 }
 
 #[derive(Serialize)]

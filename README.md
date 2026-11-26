@@ -1,22 +1,24 @@
 # Quelle
 
-Quelle is a small web search service written in Rust. It serves the search route of the Mate assistant and has two modes:
+Quelle is a web search service written in Rust. Choose the endpoint by the output your caller needs.
 
 | Mode | Endpoint | Returns | Needs a model |
 | --- | --- | --- | --- |
-| Answer | `POST /api/search` | An answer with numbered citations and the sources behind it | Yes |
-| Results | `POST /api/sources` | Every page that was read, with its best passages, plus every other search hit | No (better with one) |
+| Answer | `POST /api/search/answer` | An answer with numbered citations and supporting passages | Yes |
+| Content | `POST /api/search/content` | Page text in document order for the caller's exact search query or supplied URLs | No |
 
-It needs a Brave Search API key. The answer mode also needs an OpenAI-compatible model endpoint, for example vLLM. Without a model Quelle still starts; `/api/search` then answers `503` with `model_not_configured` before making any search call, and `/api/sources` keeps working.
+Configure a Brave Search API key at startup. Answer mode also needs a model with chat completions and a vLLM-compatible tokenizer. Without a model, content retrieval works and answer requests return `503 model_not_configured` before making a search call.
+
+When upgrading, move answer calls from `/api/search` to `/api/search/answer`. Replace `/api/sources` calls with `/api/search/content`, sending the finished search query and reading page text from `sources[].content`.
 
 ## How it works
 
-Both modes share steps 1 to 5. The answer mode adds step 6.
+Answer mode runs the following six steps. Content mode uses the same search provider, fetch protections and document readers. Its request and output are described below.
 
-1. **Plan.** The model turns the request into one to three short search queries in the likely source language (de, fr, it or en), plus evidence terms: synonyms and word forms an answering passage is likely to contain ("Erstbesteigung" for "erstmals bestiegen"). Evidence terms only rank passages and are never searched for. Conversation history only resolves references. Without a model, the request text itself is the query.
-2. **Filter.** Before anything leaves the service, each query passes a privacy filter that removes email addresses, phone numbers, AHV numbers, IBANs, card numbers, API keys, tokens and passwords. A query reduced to fragments is dropped.
+1. **Plan.** The model turns the request into one to three short search queries in the likely source language (de, fr, it or en), plus evidence terms such as "Erstbesteigung" for "erstmals bestiegen". These terms help rank passages within a page. Conversation history resolves references.
+2. **Filter.** Before Quelle sends a query to Brave, a privacy filter removes email addresses, phone numbers, AHV numbers, IBANs, card numbers, API keys, tokens and passwords. A query reduced to fragments is dropped.
 3. **Discover.** Each query goes to Brave once (Swiss locale, strict safe search, 20 results). Brave bills per request, so results are cached in memory for 15 minutes.
-4. **Rank.** The model orders the results by title and snippet so the page budget goes to likely primary sources. Without a model the results keep a host-diverse order. Snippets only choose pages; they are never cited.
+4. **Rank.** The model orders the results by title and snippet so the page budget goes to likely primary sources. If reranking fails, Quelle uses a host-diverse order. The writer receives passages from the fetched pages.
 5. **Read.** Pages are fetched with SSRF protection (public addresses only, checked on every redirect), size and time limits, and a desktop browser user agent (Wikimedia sites get an honest one, as their policy asks).
    - HTML is reduced to its largest content region, or the whole page when that region is only a sidebar or teaser list; cookie and JavaScript notices are dropped.
    - PDFs are read through their text layer with `pdftotext` (first 150 pages), which covers born-digital documents and OCR'd scans.
@@ -29,7 +31,7 @@ Logs and diagnostics hold timings and counts, never query text, answers or URLs.
 
 ## API
 
-All `POST` endpoints require `Authorization: Bearer $QUELLE_TOKEN` and take the same JSON body:
+Both search endpoints require `Authorization: Bearer $QUELLE_TOKEN`. Answer requests accept the following JSON fields.
 
 | Field | Meaning |
 | --- | --- |
@@ -41,38 +43,33 @@ All `POST` endpoints require `Authorization: Bearer $QUELLE_TOKEN` and take the 
 | `stream` | Answer mode only: server-sent events instead of one response |
 | `mateContext` | Structured context from Mate's backend (`version: "mate-search-v1"`, original request, server and client instructions, answer language, public affairs, identity) |
 
-### Answer mode: `POST /api/search`
+### Answer mode · `POST /api/search/answer`
 
 ```sh
-curl -sS http://127.0.0.1:3000/api/search \
+curl -sS http://127.0.0.1:3000/api/search/answer \
   -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
   --data '{"query":"Where does IANA describe example domains?","optimizationMode":"speed"}'
 ```
 
 The response holds `message` and `sources` (each with `content` and `metadata.title`, `metadata.url`, and `metadata.retrieval` for `pdf`, `document` or `rendered` pages). With `"stream": true` the same arrives as server-sent `sources`, `response` and `done` or `error` events. Requests with `mateContext` also receive `diagnostics`.
 
-### Results mode: `POST /api/sources`
+### Content mode · `POST /api/search/content`
+
+Use this endpoint when the calling agent should choose what goes into its own context. Pass a finished `query` (up to 600 characters and 75 words) or `urls` (1–20 public HTTP(S) URLs). An optional integer `limit` from 1 to 20 sets the number of results to request and read. It defaults to one full results page (20). These are the [Brave Web Search limits](https://api-dashboard.search.brave.com/api-reference/web/search/get).
 
 ```sh
-curl -sS http://127.0.0.1:3000/api/sources \
+curl -sS http://127.0.0.1:3000/api/search/content \
   -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
-  --data '{"query":"Wann wurde das Matterhorn erstmals bestiegen?"}'
+  --data '{"query":"site:iana.org \"example domains\"","limit":3}'
 ```
 
-```json
-{
-  "queries": ["Matterhorn Erstbesteigung"],
-  "sources": [{ "content": "…best passages…", "metadata": { "title": "Matterhorn – Wikipedia", "url": "https://de.wikipedia.org/wiki/Matterhorn" } }],
-  "hits": [{ "title": "…", "url": "…", "snippet": "…" }],
-  "diagnostics": { "pages": 6, "candidates": 15, "totalMs": 1138 }
-}
-```
+Quelle sends the supplied query to Brave with spellcheck disabled, preserving case, whitespace, quoted phrases and search operators outside privacy redactions. Each cache miss uses one lookup. Quelle attempts the distinct public URLs in Brave's result order. With `{"urls":["https://www.rfc-editor.org/rfc/rfc2606.txt"]}`, it reads the supplied URLs directly and spends zero Brave requests. Both forms work without a model. Reads run four at a time.
 
-- `queries`: the search queries used, after the privacy filter.
-- `sources`: every page that was read, with its selected passages, as in the answer mode.
-- `hits`: every other search result in ranked order, with the engine's `title`, `url` and `snippet`. They were not read or verified.
+The response contains `sources` and `errors`. Each source has `content`, `metadata.url`, `metadata.title`, and `metadata.truncated`. Redirected or exported sources also carry the original `requestedUrl`. Sources follow input or search-result order. Errors identify the individual URL and reason. Partial success returns HTTP 200. If every read fails or discovery finds nothing, the endpoint returns HTTP 422 with `no_readable_sources`. An upstream search outage or rate limit returns the corresponding discovery error.
 
-No answer is written, so this mode is faster and costs no writer call. If no page could be read but there are hits, the response is still `200` with empty `sources`. `stream` is ignored.
+HTML becomes document-order text, including short headings, repeated values and footer contact details. Direct `mailto:` and `tel:` targets, literal concatenations in navigation handlers, simple page-defined contact functions and contact links present in a rendered DOM can be recovered. A handler that depends on a click, an API request or arbitrary application state may yield only its visible label. Plain text retains line breaks, PDFs return their text layer, and office documents return the converter's Markdown.
+
+The output limit is 2 MiB of UTF-8 text per source, matching the HTML download limit. `metadata.truncated` indicates when Quelle cuts text, input HTML or plain text, a rendered DOM, or a PDF at its byte or 150-page limit. It describes Quelle's limits. A site can still require scrolling, pagination, a click or more loading time to reveal additional content.
 
 ### Health and errors
 

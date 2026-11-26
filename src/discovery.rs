@@ -49,12 +49,18 @@ pub enum DiscoveryError {
 pub type DiscoveryFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<Candidate>, DiscoveryError>> + Send + 'a>>;
 
-pub trait SearchEngine: Send + Sync {
-    fn name(&self) -> &'static str;
-    fn search<'a>(&'a self, query: &'a Query) -> DiscoveryFuture<'a>;
+#[derive(Clone, Copy, Hash, Eq, PartialEq)]
+pub struct SearchOptions {
+    pub count: usize,
+    pub spellcheck: bool,
 }
 
-type CacheKey = (String, Language);
+pub trait SearchEngine: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn search<'a>(&'a self, query: &'a Query, options: SearchOptions) -> DiscoveryFuture<'a>;
+}
+
+type CacheKey = (String, Language, SearchOptions);
 
 pub struct Brave {
     pub client: Client,
@@ -122,9 +128,9 @@ impl SearchEngine for Brave {
         "brave"
     }
 
-    fn search<'a>(&'a self, query: &'a Query) -> DiscoveryFuture<'a> {
+    fn search<'a>(&'a self, query: &'a Query, options: SearchOptions) -> DiscoveryFuture<'a> {
         Box::pin(async move {
-            let key = (query.text.to_lowercase(), query.language);
+            let key = (query.text.clone(), query.language, options);
             if let Some(candidates) = self.cached(&key) {
                 tracing::info!(stage = "brave_cache", hit = true);
                 return Ok(candidates);
@@ -135,7 +141,7 @@ impl SearchEngine for Brave {
                 Language::It => ("it", "de-CH"),
                 Language::En => ("en", "de-CH"),
             };
-            let count = RESULTS_PER_QUERY.to_string();
+            let count = options.count.to_string();
             let response = self
                 .client
                 .get(self.endpoint.clone())
@@ -150,6 +156,10 @@ impl SearchEngine for Brave {
                     ("search_lang", language),
                     ("ui_lang", locale),
                     ("count", count.as_str()),
+                    (
+                        "spellcheck",
+                        if options.spellcheck { "true" } else { "false" },
+                    ),
                     ("safesearch", "strict"),
                     ("result_filter", "web"),
                     ("text_decorations", "false"),
@@ -182,7 +192,7 @@ impl SearchEngine for Brave {
                         description: truncate(result.description.trim(), 400),
                     })
                 })
-                .take(RESULTS_PER_QUERY)
+                .take(options.count)
                 .collect::<Vec<_>>();
             // Only successful, non-empty answers are cached so outages retry.
             if !candidates.is_empty() {

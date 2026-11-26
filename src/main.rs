@@ -1,3 +1,4 @@
+mod content;
 mod discovery;
 mod model;
 mod pages;
@@ -150,10 +151,11 @@ fn problem(status: StatusCode, code: &'static str) -> Response {
 
 /// Authenticates, takes a search slot and parses the request body. Shared by
 /// both endpoints; the permit is held until the response is complete.
-async fn admit(
+async fn admit<T: DeserializeOwned>(
     app: &App,
     req: Request<Body>,
-) -> Result<(tokio::sync::OwnedSemaphorePermit, search::Request), Response> {
+    valid: fn(&T) -> bool,
+) -> Result<(tokio::sync::OwnedSemaphorePermit, T), Response> {
     let expected = app.authorization.as_bytes();
     if !req
         .headers()
@@ -187,70 +189,19 @@ async fn admit(
         Ok(Err(_)) => return Err(problem(StatusCode::BAD_REQUEST, "invalid_search_request")),
         Err(_) => return Err(problem(StatusCode::REQUEST_TIMEOUT, "request_body_timeout")),
     };
-    let Ok(request) = serde_json::from_slice::<search::Request>(&body) else {
+    let Ok(request) = serde_json::from_slice::<T>(&body) else {
         return Err(problem(StatusCode::BAD_REQUEST, "invalid_search_request"));
     };
-    if !request.validate() {
+    if !valid(&request) {
         return Err(problem(StatusCode::BAD_REQUEST, "invalid_search_request"));
     }
     Ok((permit, request))
 }
 
-#[derive(Serialize)]
-struct Results {
-    queries: Vec<String>,
-    sources: Vec<Source>,
-    hits: Vec<search::Hit>,
-    diagnostics: Diagnostics,
-}
-
-/// Results without an answer: every page that was read, with its selected
-/// passages, and every other search hit with the engine's title and
-/// snippet. Same request body as /api/search; `stream` is ignored.
-async fn sources(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
-    let started = Instant::now();
-    let (permit, request) = match admit(&app, req).await {
-        Ok(admitted) => admitted,
-        Err(response) => return response,
-    };
-    let _permit = permit;
-    let mut diagnostics = Diagnostics::default();
-    let result = tokio::time::timeout_at(
-        started + REQUEST_TIMEOUT,
-        app.search.gather(&request, &mut diagnostics),
-    )
-    .await
-    .unwrap_or(Err(Failure::Deadline));
-    // An empty read set with hits is still a useful result.
-    let result = match result {
-        Ok(gathered) if gathered.sources.is_empty() && gathered.hits.is_empty() => {
-            Err(gathered.failure.unwrap_or(Failure::NoReadableSources))
-        }
-        other => other,
-    };
-    record(started, &result);
-    diagnostics.total_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    diagnostics.error = result.as_ref().err().map(|failure| failure.code());
-    match result {
-        Ok(gathered) => Json(Results {
-            queries: gathered.queries,
-            sources: gathered.sources,
-            hits: gathered.hits,
-            diagnostics,
-        })
-        .into_response(),
-        Err(failure) => (
-            failure.status(),
-            Json(json!({"error": failure.code(), "diagnostics": diagnostics})),
-        )
-            .into_response(),
-    }
-}
-
-async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
+async fn answer(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     let started = Instant::now();
     let deadline = started + REQUEST_TIMEOUT;
-    let (permit, request) = match admit(&app, req).await {
+    let (permit, request) = match admit(&app, req, search::Request::validate).await {
         Ok(admitted) => admitted,
         Err(response) => return response,
     };
@@ -524,7 +475,7 @@ async fn main() -> ExitCode {
     }
     if app.search.model.is_none() {
         tracing::warn!(
-            "no answer model configured; /api/search answers 503, /api/sources searches the request text directly"
+            "no answer model configured; /api/search/answer returns 503, /api/search/content is available"
         );
     }
     if pages::detect_renderer() {
@@ -533,8 +484,8 @@ async fn main() -> ExitCode {
         tracing::warn!("Lightpanda not found; script-only pages are skipped");
     }
     let router = Router::new()
-        .route("/api/search", post(handle))
-        .route("/api/sources", post(sources))
+        .route("/api/search/answer", post(answer))
+        .route("/api/search/content", post(content::handle))
         .route("/healthz", get(health))
         .route("/api/providers", get(health))
         .with_state(app)

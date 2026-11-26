@@ -173,6 +173,15 @@ fn high_entropy(text: &str) -> bool {
 /// Removes recognisable personal identifiers and secrets from a search
 /// query. Returns the cleaned text and what was removed, without values.
 pub fn scrub(text: &str) -> (String, Vec<Finding>) {
+    let (text, findings) = scrub_verbatim(text);
+    (
+        text.split_whitespace().collect::<Vec<_>>().join(" "),
+        findings,
+    )
+}
+
+/// Preserve search operators, case and whitespace outside redacted spans.
+pub fn scrub_verbatim(text: &str) -> (String, Vec<Finding>) {
     let mut text = text.to_owned();
     let mut findings = Vec::new();
     for rule in RULES.iter() {
@@ -195,8 +204,5 @@ pub fn scrub(text: &str) -> (String, Vec<Finding>) {
     }
     findings.sort_unstable();
     findings.dedup();
-    (
-        text.split_whitespace().collect::<Vec<_>>().join(" "),
-        findings,
-    )
+    (text, findings)
 }

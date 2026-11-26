@@ -11,12 +11,19 @@ use reqwest::{StatusCode, header};
 use scraper::{Html, Selector};
 use serde::Serialize;
 use tokio::{
-    io::AsyncWriteExt, net::lookup_host, process::Command, sync::OwnedSemaphorePermit,
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::lookup_host,
+    process::Command,
+    sync::OwnedSemaphorePermit,
     time::Instant,
 };
 use url::{Host, Url};
 
 use crate::{client_builder, read_body, truncate};
+
+mod clean;
+#[cfg(test)]
+mod tests;
 
 /// HTML beyond this is cut off and the prefix is parsed; long pages keep
 /// their opening content instead of failing.
@@ -42,7 +49,8 @@ static PDF_SUPPORT: OnceLock<bool> = OnceLock::new();
 
 /// Whole budget for one page: download, optional rendering and parsing.
 const FETCH_BUDGET: Duration = Duration::from_secs(15);
-const RENDER_TIMEOUT: Duration = Duration::from_secs(10);
+const RENDER_TIMEOUT: Duration = Duration::from_secs(14);
+const FULL_TEXT_BYTES: usize = PAGE_BYTES;
 /// Pages with less readable text than this also get a rendering attempt.
 const THIN_PAGE: usize = 800;
 /// Each render is a separate browser process of roughly 100 MB.
@@ -169,6 +177,31 @@ pub struct Source {
     pub metadata: Metadata,
 }
 
+impl Source {
+    fn mark_truncated(&mut self, cut: bool) {
+        if let Some(truncated) = &mut self.metadata.truncated {
+            *truncated |= cut;
+        }
+    }
+
+    fn full(url: Url, title: String, text: &str) -> Result<Self, PageError> {
+        if text.trim().is_empty() {
+            return Err(PageError::Unreadable);
+        }
+        let end = text.floor_char_boundary(FULL_TEXT_BYTES.min(text.len()));
+        Ok(Self {
+            content: text[..end].to_owned(),
+            metadata: Metadata {
+                url,
+                title,
+                retrieval: None,
+                pages_read: None,
+                truncated: Some(end < text.len()),
+            },
+        })
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Metadata {
@@ -178,6 +211,8 @@ pub struct Metadata {
     pub retrieval: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pages_read: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -192,6 +227,22 @@ pub enum PageError {
     NoTextLayer,
     /// The page is a script shell or a "JavaScript required" notice.
     NeedsJs,
+}
+
+impl PageError {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Target => "target",
+            Self::Transport => "transport",
+            Self::Blocked => "blocked",
+            Self::Unsupported => "unsupported",
+            Self::TooLarge => "too_large",
+            Self::Unreadable => "unreadable",
+            Self::Timeout => "timeout",
+            Self::NoTextLayer => "no_text_layer",
+            Self::NeedsJs => "needs_js",
+        }
+    }
 }
 
 /// What the request is looking for, used to rank passages within a page.
@@ -332,23 +383,23 @@ async fn read_page(
     mut response: reqwest::Response,
     limit: usize,
     keep_prefix: bool,
-) -> Result<Vec<u8>, crate::BodyError> {
+) -> Result<(Vec<u8>, bool), crate::BodyError> {
     if !keep_prefix {
-        return read_body(response, limit).await;
+        return read_body(response, limit).await.map(|bytes| (bytes, false));
     }
     let mut data = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| crate::BodyError::Read)? {
         let room = limit - data.len();
-        if chunk.len() >= room {
+        if chunk.len() > room {
             data.extend_from_slice(&chunk[..room]);
-            break;
+            return Ok((data, true));
         }
         data.extend_from_slice(&chunk);
     }
-    Ok(data)
+    Ok((data, false))
 }
 
-async fn download(mut url: Url) -> Result<(Url, Vec<u8>, Option<String>, Kind), PageError> {
+async fn download(mut url: Url) -> Result<(Url, Vec<u8>, Option<String>, Kind, bool), PageError> {
     let started = Instant::now();
     for step in 0..=MAX_REDIRECTS {
         let mut client = client_builder();
@@ -448,7 +499,7 @@ async fn download(mut url: Url) -> Result<(Url, Vec<u8>, Option<String>, Kind), 
         } else {
             (PAGE_BYTES, PAGE_TIMEOUT)
         };
-        let bytes = tokio::time::timeout_at(
+        let (bytes, truncated) = tokio::time::timeout_at(
             started + budget,
             read_page(response, limit, !maybe_pdf && !maybe_document),
         )
@@ -472,56 +523,82 @@ async fn download(mut url: Url) -> Result<(Url, Vec<u8>, Option<String>, Kind), 
                 None => Kind::Html,
             },
         };
-        return Ok((url, bytes, content_type, kind));
+        return Ok((url, bytes, content_type, kind, truncated));
     }
     Err(PageError::Blocked)
 }
 
 pub async fn fetch(
     url: Url,
-    relevance: &Relevance,
+    relevance: Option<&Relevance>,
     permit: OwnedSemaphorePermit,
+    deadline: Instant,
 ) -> Result<Source, PageError> {
     let _permit = permit;
-    tokio::time::timeout(FETCH_BUDGET, async {
-        let (url, bytes, content_type, kind) = download(export_url(url)).await?;
+    let deadline = deadline.min(Instant::now() + FETCH_BUDGET);
+    tokio::time::timeout_at(deadline, async {
+        let (url, bytes, content_type, kind, cut) = download(export_url(url)).await?;
         match kind {
             Kind::Pdf => return pdf(url, &bytes, relevance).await,
             Kind::Document(format) => return document(url, bytes, format, relevance).await,
             Kind::Html | Kind::Text => {}
         }
-        let rendered = |url: Url| async move {
-            let html = render(&url).await?;
+        let is_html = matches!(kind, Kind::Html);
+        let rendered = |url: Url, threshold| async move {
+            let (html, cut) = render(&url, threshold).await?;
             let mut source = parse(
                 url,
                 html,
                 Some("text/html; charset=utf-8".to_owned()),
                 relevance,
+                true,
             )
             .await?;
             source.metadata.retrieval = Some("rendered");
+            source.mark_truncated(cut);
             Ok::<_, PageError>(source)
         };
-        match parse(url.clone(), bytes, content_type, relevance).await {
+        static SCRIPT: LazyLock<regex::bytes::Regex> =
+            LazyLock::new(|| regex::bytes::Regex::new(r"(?i)<script[\s>]").expect("script tag"));
+        let has_script = is_html && SCRIPT.is_match(&bytes);
+        match parse(url.clone(), bytes, content_type, relevance, false).await {
             // Script-only pages are rendered. So are pages whose markup holds
             // almost no readable text; the rendered result is kept only when
             // it carries more.
-            Err(PageError::NeedsJs | PageError::Unreadable) if render_enabled() => {
-                rendered(url).await
+            Err(error @ (PageError::NeedsJs | PageError::Unreadable))
+                if has_script && render_enabled() =>
+            {
+                rendered(
+                    url,
+                    if matches!(error, PageError::NeedsJs) {
+                        3000
+                    } else {
+                        300
+                    },
+                )
+                .await
             }
             Err(PageError::NeedsJs) => {
                 tracing::info!(stage = "needs_js", host = url.host_str());
                 Err(PageError::NeedsJs)
             }
-            Ok(source) if render_enabled() && source.content.chars().count() < THIN_PAGE => {
-                match rendered(url).await {
-                    Ok(better)
-                        if better.content.chars().count() > source.content.chars().count() =>
-                    {
-                        Ok(better)
+            Ok(mut source) => {
+                source.mark_truncated(cut);
+                let length = source.content.chars().count();
+                if has_script && render_enabled() && length < THIN_PAGE {
+                    // Give back the static text even if the speculative render stalls.
+                    let mut stop = deadline - Duration::from_millis(150);
+                    if length >= 300 {
+                        stop = stop.min(Instant::now() + Duration::from_secs(2));
                     }
-                    _ => Ok(source),
+                    if let Ok(Ok(better)) =
+                        tokio::time::timeout_at(stop, rendered(url, length + 120)).await
+                        && better.content.chars().count() > length
+                    {
+                        return Ok(better);
+                    }
                 }
+                Ok(source)
             }
             other => other,
         }
@@ -534,12 +611,21 @@ async fn parse(
     url: Url,
     bytes: Vec<u8>,
     content_type: Option<String>,
-    relevance: &Relevance,
+    relevance: Option<&Relevance>,
+    rendered: bool,
 ) -> Result<Source, PageError> {
-    let relevance = relevance.clone();
-    tokio::task::spawn_blocking(move || extract(url, &bytes, content_type.as_deref(), &relevance))
-        .await
-        .map_err(|_| PageError::Unreadable)?
+    let relevance = relevance.cloned();
+    tokio::task::spawn_blocking(move || {
+        extract(
+            url,
+            &bytes,
+            content_type.as_deref(),
+            relevance.as_ref(),
+            rendered,
+        )
+    })
+    .await
+    .map_err(|_| PageError::Unreadable)?
 }
 
 /// Renders a script-only page with Lightpanda and returns the resulting
@@ -547,7 +633,7 @@ async fn parse(
 /// XHR, against private and reserved ranges after DNS resolution, so page
 /// scripts cannot reach internal services. Telemetry is disabled, the
 /// environment is cleared, and the process is killed when the request ends.
-async fn render(url: &Url) -> Result<Vec<u8>, PageError> {
+async fn render(url: &Url, threshold: usize) -> Result<(Vec<u8>, bool), PageError> {
     let Some(binary) = RENDERER.get().and_then(Option::as_ref) else {
         return Err(PageError::NeedsJs);
     };
@@ -569,11 +655,11 @@ async fn render(url: &Url) -> Result<Vec<u8>, PageError> {
             "--wait-until",
             "networkalmostidle",
             "--wait-script",
-            "document.body && (document.body.innerText || '').length > 3000",
+            &format!("document.body && (document.body.innerText || '').length > {threshold}"),
             "--wait-ms",
-            "6000",
+            "12000",
             "--terminate-ms",
-            "8000",
+            "13000",
             "--http-timeout",
             "6000",
             "--http-max-response-size",
@@ -631,8 +717,11 @@ async fn render(url: &Url) -> Result<Vec<u8>, PageError> {
         ok = true
     );
     let mut html = output.stdout;
+    let cut = html.len() > PAGE_BYTES
+        || html.ends_with(b"[truncated]\n")
+        || html.ends_with(b"[truncated]");
     html.truncate(PAGE_BYTES);
-    Ok(html)
+    Ok((html, cut))
 }
 
 /// Media types anydoc converts: Word, Excel, PowerPoint (binary and XML),
@@ -657,13 +746,19 @@ async fn document(
     url: Url,
     bytes: Vec<u8>,
     format: Option<anydoc::Format>,
-    relevance: &Relevance,
+    relevance: Option<&Relevance>,
 ) -> Result<Source, PageError> {
-    let relevance = relevance.clone();
+    let relevance = relevance.cloned();
     let task = tokio::task::spawn_blocking(move || {
         let markdown = std::panic::catch_unwind(|| anydoc::to_markdown_bytes(&bytes, format))
             .map_err(|_| PageError::Unreadable)?
             .map_err(|_| PageError::Unreadable)?;
+        let Some(relevance) = relevance else {
+            let title = pdf_name(&url);
+            let mut source = Source::full(url, title, &markdown)?;
+            source.metadata.retrieval = Some("document");
+            return Ok(source);
+        };
         let passages = markdown_passages(&markdown);
         let title = passages
             .iter()
@@ -833,11 +928,15 @@ fn table_passages(rows: &[Vec<String>], context: &str) -> Vec<String> {
 /// born-digital documents and scans that carry an OCR layer; image-only
 /// scans have no text layer and are skipped. The child process is killed
 /// when the request is dropped or the extraction budget runs out.
-async fn pdf(url: Url, bytes: &[u8], relevance: &Relevance) -> Result<Source, PageError> {
+async fn pdf(url: Url, bytes: &[u8], relevance: Option<&Relevance>) -> Result<Source, PageError> {
+    // Read one extra page in full-text mode to detect a truncated document.
+    let last = if relevance.is_none() {
+        "151"
+    } else {
+        PDF_PAGES
+    };
     let mut child = Command::new("pdftotext")
-        .args([
-            "-q", "-l", PDF_PAGES, "-enc", "UTF-8", "-eol", "unix", "-", "-",
-        ])
+        .args(["-q", "-l", last, "-enc", "UTF-8", "-eol", "unix", "-", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -845,26 +944,56 @@ async fn pdf(url: Url, bytes: &[u8], relevance: &Relevance) -> Result<Source, Pa
         .spawn()
         .map_err(|_| PageError::Unreadable)?;
     let mut stdin = child.stdin.take().ok_or(PageError::Unreadable)?;
-    let input = bytes.to_vec();
-    // pdftotext may stop reading early on a broken file; a write error then
-    // is expected and the exit status decides.
-    let writer = tokio::spawn(async move {
-        let _ = stdin.write_all(&input).await;
-    });
-    let output = tokio::time::timeout(PDF_EXTRACT_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| PageError::Timeout)?
-        .map_err(|_| PageError::Unreadable)?;
-    writer.abort();
-    if !output.status.success() {
+    let reader = child.stdout.take().ok_or(PageError::Unreadable)?;
+    let mut stdout = Vec::new();
+    let success = tokio::time::timeout(PDF_EXTRACT_TIMEOUT, async {
+        let write = async move {
+            // Poppler can stop reading early. Its exit status decides.
+            let _ = stdin.write_all(bytes).await;
+        };
+        let read = async {
+            reader
+                .take(PDF_TEXT_BYTES as u64 + 1)
+                .read_to_end(&mut stdout)
+                .await?;
+            if stdout.len() > PDF_TEXT_BYTES {
+                // Do not buffer an arbitrarily large text layer.
+                child.kill().await?;
+                Ok(true)
+            } else {
+                child.wait().await.map(|status| status.success())
+            }
+        };
+        let ((), result) = tokio::join!(write, read);
+        result
+    })
+    .await
+    .map_err(|_| PageError::Timeout)?
+    .map_err(|_| PageError::Unreadable)?;
+    if !success {
         return Err(PageError::Unreadable);
     }
-    let mut stdout = output.stdout;
+    let cut = stdout.len() > PDF_TEXT_BYTES;
     stdout.truncate(PDF_TEXT_BYTES);
     let text = String::from_utf8_lossy(&stdout).into_owned();
-    let relevance = relevance.clone();
+    let relevance = relevance.cloned();
     tokio::task::spawn_blocking(move || {
         let pages = text.matches('\u{c}').count().max(1);
+        let Some(relevance) = relevance else {
+            let mut page_text = text.split_terminator('\u{c}');
+            let prefix = page_text
+                .by_ref()
+                .take(150)
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let title = pdf_name(&url);
+            let mut source =
+                Source::full(url, title, &prefix).map_err(|_| PageError::NoTextLayer)?;
+            source.mark_truncated(cut || page_text.next().is_some());
+            source.metadata.retrieval = Some("pdf");
+            source.metadata.pages_read = Some(pages.min(150));
+            return Ok(source);
+        };
         let passages = pdf_passages(&text);
         if passages.iter().map(|p| p.chars().count()).sum::<usize>() < 80 {
             return Err(PageError::NoTextLayer);
@@ -950,9 +1079,9 @@ fn pdf_name(url: &Url) -> String {
 }
 
 fn percent_decode(text: &str) -> String {
-    url::form_urlencoded::parse(format!("x={}", text.replace('+', "%2B")).as_bytes())
-        .next()
-        .map_or_else(|| text.to_owned(), |(_, value)| value.into_owned())
+    percent_encoding::percent_decode_str(text)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 pub fn words(input: &str) -> impl Iterator<Item = String> + '_ {
@@ -966,7 +1095,8 @@ fn extract(
     url: Url,
     bytes: &[u8],
     media_type: Option<&str>,
-    relevance: &Relevance,
+    relevance: Option<&Relevance>,
+    rendered: bool,
 ) -> Result<Source, PageError> {
     let charset = media_type.and_then(|media_type| {
         media_type.split(';').skip(1).find_map(|part| {
@@ -981,6 +1111,10 @@ fn extract(
     let (text, _, _) = encoding.decode(bytes);
     let fallback_title = || url.host_str().unwrap_or("Web source").to_owned();
     if media_type.is_some_and(|media_type| media_type.starts_with("text/plain")) {
+        let Some(relevance) = relevance else {
+            let title = fallback_title();
+            return Source::full(url, title, &text);
+        };
         return source(
             url.clone(),
             fallback_title(),
@@ -1021,21 +1155,46 @@ fn extract(
         return Err(PageError::Blocked);
     }
 
+    let Some(relevance) = relevance else {
+        let text = clean::page_text(document.root_element());
+        let body = std::slice::from_ref(&text);
+        if needs_script(&document, body, text.len(), rendered)
+            || (!rendered && client_template(&document, body))
+        {
+            return Err(PageError::NeedsJs);
+        }
+        return Source::full(url, title, text.trim_matches(['\n', '\r']));
+    };
     let blocks = |region: scraper::ElementRef<'_>| {
         region
             .select(&BLOCKS)
             .take(MAX_BLOCKS)
             .filter(|element| {
-                (element.value().name() != "div" || leaf_div(*element))
-                    && !discarded(*element)
+                !discarded(*element)
                     && !element
                         .ancestors()
-                        .skip(1)
                         .filter_map(scraper::ElementRef::wrap)
                         .any(discarded)
             })
             .map(|element| {
-                let text = normalize(visible_text(element), 2000);
+                let text = if element.value().name() == "div" && !leaf_div(element) {
+                    // Inline siblings of nested blocks can carry the actual
+                    // article text (e.g. a quotation beside a list of tags).
+                    normalize(
+                        element.children().flat_map(|node| {
+                            if let Some(child) = scraper::ElementRef::wrap(node)
+                                && clean::inline(child.value().name())
+                                && !discarded(child)
+                            {
+                                return visible_text(child).collect::<Vec<_>>();
+                            }
+                            node.value().as_text().map(|t| &**t).into_iter().collect()
+                        }),
+                        2000,
+                    )
+                } else {
+                    normalize(visible_text(element), 2000)
+                };
                 match cell_label(element) {
                     Some(label) if !label.is_empty() && label != text => format!("{label}: {text}"),
                     _ => text,
@@ -1046,8 +1205,8 @@ fn extract(
     let size = |blocks: &[String]| blocks.iter().map(String::len).sum::<usize>();
     let body = blocks(document.root_element());
     let body_size = size(&body);
-    if needs_script(&document, &body, body_size)
-        || (render_enabled() && client_template(&document, &body))
+    if needs_script(&document, &body, body_size, rendered)
+        || (!rendered && client_template(&document, &body))
     {
         return Err(PageError::NeedsJs);
     }
@@ -1059,12 +1218,13 @@ fn extract(
         .map(blocks)
         .max_by_key(|region| size(region))
         .filter(|region| size(region) >= 500 && size(region) * 10 >= body_size * 3);
-    let passages = region.unwrap_or(body);
+    let mut passages = region.unwrap_or(body);
+    passages.extend(clean::contact_passages(document.root_element(), &title));
     source(url, title, passages.into_iter(), relevance)
 }
 
 /// Script shells: a "JavaScript required" notice or an empty app root.
-fn needs_script(document: &Html, body: &[String], body_size: usize) -> bool {
+fn needs_script(document: &Html, body: &[String], body_size: usize, rendered: bool) -> bool {
     static SHELL: LazyLock<Selector> = LazyLock::new(|| {
         Selector::parse("app-root, #root, #app, #__next, #__nuxt, [ng-version], [data-reactroot]")
             .expect("shell selector")
@@ -1073,12 +1233,21 @@ fn needs_script(document: &Html, body: &[String], body_size: usize) -> bool {
         LazyLock::new(|| Selector::parse("noscript").expect("noscript selector"));
     // Server-rendered apps keep their root element, so a root alone only
     // counts when the page carries almost no text.
-    (body_size < 1500
-        && (body.iter().any(|block| script_notice(block))
-            || document
-                .select(&NOSCRIPT)
-                .any(|element| script_notice(&element.text().collect::<String>()))))
-        || (body_size < 300 && document.select(&SHELL).next().is_some())
+    let empty_root = body_size < 3000
+        && document
+            .select(&SHELL)
+            .any(|root| !visible_text(root).any(|part| !part.trim().is_empty()));
+    empty_root
+        || (body_size < 1500
+            && (body
+                .iter()
+                .flat_map(|block| block.lines())
+                .any(script_notice)
+                || (!rendered
+                    && body_size < 300
+                    && document
+                        .select(&NOSCRIPT)
+                        .any(|element| script_notice(&element.text().collect::<String>())))))
 }
 
 /// Google Docs, Sheets and Drive links point at script applications; their
@@ -1216,7 +1385,9 @@ fn sniff_encoding(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
 fn client_template(document: &Html, body: &[String]) -> bool {
     static BINDINGS: LazyLock<Selector> = LazyLock::new(|| {
         Selector::parse(
-            "[ng-app], [data-ng-app], [ng-controller], [ng-bind], [ng-repeat], [ng-if], [v-cloak], [x-data]",
+            "[ng-app], [data-ng-app], [ng-controller], [data-ng-controller], \
+             [ng-bind], [data-ng-bind], [ng-bind-html], [data-ng-bind-html], \
+             [ng-repeat], [data-ng-repeat], [ng-if], [data-ng-if], [v-cloak], [x-data]",
         )
         .expect("template selector")
     });
@@ -1235,7 +1406,9 @@ fn client_template(document: &Html, body: &[String]) -> bool {
 fn script_notice(text: &str) -> bool {
     static NOTICE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
-            r"(?i)javascript|browser (is )?(not|nicht) (supported|unterstützt)",
+            r"(?i)(?:enable|activate|allow|requires?)\s+javascript|javascript (?:is (?:required|disabled)|required|aktivieren|einschalten)",
+            r"|(?:activer|activez|attivare|attiva)\s+javascript|javascript[- ](?:capable|fähigen) browser",
+            r"|(?:navigateur supportant|browser che supporta) javascript|browser (is )?(not|nicht) (supported|unterstützt)",
             r"|navigateur (n'est pas|non) (pris en charge|supporté)",
         ))
         .expect("script notice pattern")
@@ -1247,12 +1420,12 @@ fn script_notice(text: &str) -> bool {
 fn notice(text: &str) -> bool {
     static NOTICE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
-            r"(?i)javascript|cookies?\b|browser (is )?(not|nicht) (supported|unterstützt)",
-            r"|navigateur (n'est pas|non) (pris en charge|supporté)",
+            r"(?i)(?:accept|allow|enable|accepter|akzeptieren)\s+(?:all |alle |les |tous les )?cookies",
+            r"|cookies (?:akzeptieren|zulassen)",
         ))
         .expect("notice pattern")
     });
-    text.chars().count() < 400 && NOTICE.is_match(text)
+    script_notice(text) || (text.chars().count() < 400 && NOTICE.is_match(text))
 }
 
 /// Text of an element without inline script, style or template content.
@@ -1439,6 +1612,7 @@ fn source(
             url,
             retrieval: None,
             pages_read: None,
+            truncated: None,
         },
     })
 }
