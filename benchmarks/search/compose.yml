@@ -1,0 +1,71 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    ports: ["127.0.0.1:${BENCH_SEARX_PORT}:8080"]
+    volumes: ["${BENCH_RUNTIME}/settings.yml:/etc/searxng/settings.yml:ro"]
+    environment:
+      GRANIAN_WORKERS: "1"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    mem_limit: 512m
+  redis:
+    image: redis:alpine
+    mem_limit: 256m
+  postgres:
+    image: ghcr.io/firecrawl/nuq-postgres:latest
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: benchmark-local-only
+      POSTGRES_DB: postgres
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "+S 2:2"
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+  playwright:
+    image: ghcr.io/firecrawl/playwright-service:latest
+    environment:
+      PORT: "3000"
+      MAX_CONCURRENT_PAGES: "4"
+    mem_limit: 1536m
+    shm_size: 256m
+  firecrawl:
+    image: ghcr.io/firecrawl/firecrawl:latest
+    ports: ["127.0.0.1:${BENCH_FIRECRAWL_PORT}:3002"]
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "3002"
+      ENV: local
+      USE_DB_AUTHENTICATION: "false"
+      REDIS_URL: redis://redis:6379
+      REDIS_RATE_LIMIT_URL: redis://redis:6379
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: benchmark-local-only
+      POSTGRES_DB: postgres
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      NUQ_RABBITMQ_URL: amqp://rabbitmq:5672
+      NUQ_WORKER_COUNT: "1"
+      NUM_WORKERS_PER_QUEUE: "4"
+      CRAWL_CONCURRENT_REQUESTS: "4"
+      MAX_CONCURRENT_JOBS: "4"
+      PLAYWRIGHT_MICROSERVICE_URL: http://playwright:3000/scrape
+      SEARXNG_ENDPOINT: http://searxng:8080
+      SEARXNG_ENGINES: braveapi
+      SEARXNG_CATEGORIES: general
+    depends_on:
+      postgres: {condition: service_healthy}
+      rabbitmq: {condition: service_healthy}
+      redis: {condition: service_started}
+      playwright: {condition: service_started}
+    mem_limit: 3g

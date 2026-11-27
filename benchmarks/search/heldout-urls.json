@@ -1,0 +1,122 @@
+[
+  {
+    "id": "ho01",
+    "category": "gov_table",
+    "url": "https://www.ecb.europa.eu/stats/policy_and_exchange_rates/key_ecb_interest_rates/html/index.en.html",
+    "criteria": "ECB key interest rates table preserves rate types, effective dates, and percentage values cleanly."
+  },
+  {
+    "id": "ho02",
+    "category": "swiss_gov",
+    "url": "https://www.admin.ch/gov/en/start/federal-council.html",
+    "criteria": "Swiss Federal Council overview preserves substantive content, accordions/links, and strips navigation chrome."
+  },
+  {
+    "id": "ho03",
+    "category": "swiss_gov",
+    "url": "https://www.ch.ch/en/",
+    "criteria": "Swiss official portal homepage preserves multilingual public-service guidance cleanly without excessive chrome."
+  },
+  {
+    "id": "ho04",
+    "category": "swiss_gov",
+    "url": "https://www.seco.admin.ch/seco/de/home/Arbeit/Arbeitsbedingungen/Arbeitnehmerschutz/Arbeits-und-Ruhezeiten.html",
+    "criteria": "SECO German working-time rules preserve legal content, links, and collapsed sections without boilerplate."
+  },
+  {
+    "id": "ho05",
+    "category": "docs_code",
+    "url": "https://docs.python.org/3/library/asyncio-task.html",
+    "criteria": "Python asyncio docs preserve headings, code indentation, inline code, and strip Sphinx sidebar navigation."
+  },
+  {
+    "id": "ho06",
+    "category": "docs_code",
+    "url": "https://go.dev/doc/effective_go",
+    "criteria": "Effective Go preserves long-form prose, Go code indentation, and section headings cleanly."
+  },
+  {
+    "id": "ho07",
+    "category": "docs_code",
+    "url": "https://docs.docker.com/engine/storage/volumes/",
+    "criteria": "Docker Volumes docs preserve CLI examples, headings, and comparison details without sidebar noise."
+  },
+  {
+    "id": "ho08",
+    "category": "docs_manpage",
+    "url": "https://git-scm.com/docs/git-rebase",
+    "criteria": "git-rebase reference preserves ASCII commit graphs, flags, and option definitions cleanly."
+  },
+  {
+    "id": "ho09",
+    "category": "docs_code",
+    "url": "https://www.typescriptlang.org/docs/handbook/2/narrowing.html",
+    "criteria": "TypeScript Handbook preserves TypeScript code blocks, headings, and prose cleanly."
+  },
+  {
+    "id": "ho10",
+    "category": "docs_spa",
+    "url": "https://react.dev/reference/react/useEffect",
+    "criteria": "React useEffect reference preserves API signature, caveats, code examples, and strips nav chrome."
+  },
+  {
+    "id": "ho11",
+    "category": "docs_table",
+    "url": "https://tailwindcss.com/docs/grid-template-columns",
+    "criteria": "Tailwind utility reference preserves class-to-CSS table structure and examples cleanly."
+  },
+  {
+    "id": "ho12",
+    "category": "reference",
+    "url": "https://en.wikipedia.org/wiki/Swiss_franc",
+    "criteria": "Wikipedia article preserves sections, infobox facts, and citations cleanly without edit/nav clutter."
+  },
+  {
+    "id": "ho13",
+    "category": "spec",
+    "url": "https://semver.org/",
+    "criteria": "Semantic Versioning spec preserves numbered specification rules and headings cleanly."
+  },
+  {
+    "id": "ho14",
+    "category": "layout_table",
+    "url": "https://news.ycombinator.com/",
+    "criteria": "Hacker News nested layout table is flattened cleanly into readable story links without broken Markdown tables."
+  },
+  {
+    "id": "ho15",
+    "category": "community",
+    "url": "https://lobste.rs/",
+    "criteria": "Lobsters story list extracts titles, links, and tags cleanly without excessive chrome."
+  },
+  {
+    "id": "ho16",
+    "category": "longform",
+    "url": "https://martinfowler.com/articles/microservices.html",
+    "criteria": "Long-form technical article preserves headings, paragraphs, and figures cleanly."
+  },
+  {
+    "id": "ho17",
+    "category": "pdf",
+    "url": "https://arxiv.org/pdf/2005.11401",
+    "criteria": "RAG academic PDF extracts full readable text without soft-hyphen corruption or truncation."
+  },
+  {
+    "id": "ho18",
+    "category": "ecommerce",
+    "url": "https://books.toscrape.com/",
+    "criteria": "Book catalog preserves titles, prices, and stock indicators cleanly without sidebar category noise."
+  },
+  {
+    "id": "ho19",
+    "category": "js_delayed",
+    "url": "https://quotes.toscrape.com/js-delayed/",
+    "criteria": "Delayed JavaScript page waits for actual rendered quotations instead of returning an empty shell."
+  },
+  {
+    "id": "ho20",
+    "category": "spec_long",
+    "url": "https://www.w3.org/TR/wai-aria-1.2/",
+    "criteria": "W3C WAI-ARIA specification preserves structured definitions, roles, and tables cleanly."
+  }
+]
