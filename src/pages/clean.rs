@@ -1,15 +1,85 @@
-use std::{collections::HashMap, sync::LazyLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::LazyLock,
+};
 
-use ego_tree::iter::Edge;
+use ego_tree::{NodeId, iter::Edge};
 use regex::Regex;
-use scraper::{ElementRef, Selector};
+use scraper::{ElementRef, Html, Selector};
+
+pub(super) fn content_text(document: &Html, base: &url::Url, keep_chrome: bool) -> String {
+    let root = document.root_element();
+    let full = page_text_with_links(root, keep_chrome, Some(base));
+    if keep_chrome {
+        return full;
+    }
+    static MAIN: LazyLock<Selector> =
+        LazyLock::new(|| Selector::parse("main, article, [role=main]").unwrap());
+    let best = document
+        .select(&MAIN)
+        .filter(|el| {
+            !el.ancestors().filter_map(ElementRef::wrap).any(|p| {
+                matches!(p.value().name(), "noscript" | "template")
+                    || p.attr("hidden").is_some()
+                    || p.attr("aria-hidden") == Some("true")
+            })
+        })
+        .take(32)
+        .map(|el| page_text_with_links(el, false, Some(base)))
+        .max_by_key(String::len);
+    let Some(mut main) = best.filter(|s| s.trim().len() >= 250 && s.len() * 4 >= full.len()) else {
+        return full;
+    };
+    // Contact information outside the article can be evidence too. Keep its
+    // public targets without importing the entire site footer or consent UI.
+    let helpers = contact_helpers(root);
+    let disclosures = disclosure_ids(root);
+    static CONTACT: LazyLock<Selector> = LazyLock::new(|| Selector::parse("a, button").unwrap());
+    for el in root.select(&CONTACT) {
+        if std::iter::once(el)
+            .chain(el.ancestors().filter_map(ElementRef::wrap))
+            .any(|p| {
+                is_hidden_node(p, &disclosures)
+                    || matches!(p.value().name(), "noscript" | "template")
+                    || super::markdown::is_markdown_chrome(p)
+            })
+        {
+            continue;
+        }
+        if let Some(target) = contact(el, &helpers)
+            && !same_contact(&main, &target)
+        {
+            let label = super::normalize(el.text(), 150);
+            main.push('\n');
+            if label.is_empty() || same_contact(&label, &target) {
+                main.push_str(&target);
+            } else {
+                main.push_str(&label);
+                main.push_str(" (");
+                main.push_str(&target);
+                main.push(')');
+            }
+            main.push('\n');
+        }
+    }
+    main
+}
 
 /// Collect visible body text once, including short labels, mixed inline/block
 /// content, contact links and the footer. Preserve line breaks in code samples.
 /// Without `keep_chrome`, site navigation, search forms, the site banner and
 /// skip links are left out.
 pub(super) fn page_text(root: ElementRef<'_>, keep_chrome: bool) -> String {
+    page_text_with_links(root, keep_chrome, None)
+}
+
+pub(super) fn page_text_with_links(
+    root: ElementRef<'_>,
+    keep_chrome: bool,
+    base: Option<&url::Url>,
+) -> String {
     let helpers = contact_helpers(root);
+    let disclosures = disclosure_ids(root);
     let mut text = String::new();
     let mut skip = None;
     let mut pre = 0;
@@ -31,11 +101,21 @@ pub(super) fn page_text(root: ElementRef<'_>, keep_chrome: bool) -> String {
                 if matches!(
                     name,
                     "head" | "script" | "style" | "noscript" | "template" | "svg"
-                ) || el.attr("hidden").is_some()
-                    || el.attr("aria-hidden") == Some("true")
-                    || el.attr("style").is_some_and(hidden_style)
-                    || (!keep_chrome && chrome(el))
+                ) || is_hidden_node(el, &disclosures)
+                    || (!keep_chrome && super::markdown::is_markdown_chrome(el))
                 {
+                    skip = Some(node.id());
+                    continue;
+                }
+                if name == "table"
+                    && let Some(base) = base
+                {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str(&super::markdown::table_text(el, base));
+                    text.push('\n');
+                    space = false;
                     skip = Some(node.id());
                     continue;
                 }
@@ -48,8 +128,9 @@ pub(super) fn page_text(root: ElementRef<'_>, keep_chrome: bool) -> String {
             } else {
                 if matches!(name, "a" | "button")
                     && let Some(contact) = contact(el, &helpers)
-                    && !text[link_start..].contains(&contact)
+                    && !same_contact(&text[link_start..], &contact)
                 {
+                    trim_trailing_link_ws(&mut text, link_start);
                     if text.len() > link_start {
                         text.push_str(" (");
                         text.push_str(&contact);
@@ -57,9 +138,25 @@ pub(super) fn page_text(root: ElementRef<'_>, keep_chrome: bool) -> String {
                     } else {
                         text.push_str(&contact);
                     }
+                    space = true;
                 }
                 if name == "pre" {
                     pre -= 1;
+                }
+                if name == "a"
+                    && let Some(base) = base
+                    && let Some(href) = el.attr("href").filter(|h| !h.trim().is_empty())
+                    && let Ok(url) = base.join(href).and_then(|u| {
+                        super::evidence_url(u).map_err(|_| url::ParseError::EmptyHost)
+                    })
+                {
+                    trim_trailing_link_ws(&mut text, link_start);
+                    if text.len() > link_start && !text[link_start..].contains(url.as_str()) {
+                        text.push_str(" (");
+                        text.push_str(url.as_str());
+                        text.push(')');
+                        space = true;
+                    }
                 }
             }
             if matches!(name, "td" | "th") {
@@ -75,10 +172,17 @@ pub(super) fn page_text(root: ElementRef<'_>, keep_chrome: bool) -> String {
                 text.push_str(value);
             } else {
                 for c in value.chars() {
+                    if is_invisible_format_char(c) {
+                        continue;
+                    }
                     if c.is_whitespace() {
                         space = true;
                     } else {
-                        if space && !text.is_empty() && !text.ends_with('\n') {
+                        let suppress = matches!(
+                            c,
+                            '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '’' | '\''
+                        );
+                        if space && !suppress && !text.is_empty() && !text.ends_with('\n') {
                             text.push(' ');
                         }
                         space = false;
@@ -94,6 +198,173 @@ pub(super) fn page_text(root: ElementRef<'_>, keep_chrome: bool) -> String {
     text
 }
 
+fn trim_trailing_link_ws(text: &mut String, link_start: usize) {
+    while text.len() > link_start && text.ends_with([' ', '\n', '\r', '\t']) {
+        text.pop();
+    }
+}
+
+pub(super) fn is_invisible_format_char(c: char) -> bool {
+    matches!(c, '\u{00ad}' | '\u{200b}' | '\u{feff}')
+}
+
+pub(super) fn strip_invisible_format_chars(text: &str) -> String {
+    text.chars()
+        .filter(|&c| !is_invisible_format_char(c))
+        .collect()
+}
+
+/// Returns true when `haystack` already expresses the same email or phone number
+/// as `target` (ignoring case for emails and spacing/formatting/`00` vs `+` for
+/// phone numbers), preventing redundant `+41 58 462 41 97 (+41584624197)` output.
+pub(super) fn same_contact(haystack: &str, target: &str) -> bool {
+    let target_trimmed = target.trim();
+    if target_trimmed.is_empty() {
+        return true;
+    }
+    let hay_lower = haystack.to_ascii_lowercase();
+    let target_lower = target_trimmed.to_ascii_lowercase();
+    if hay_lower.contains(&target_lower) {
+        return true;
+    }
+    if target_trimmed.contains('@') {
+        return false;
+    }
+    let norm_digits = |s: &str| -> String {
+        let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+        digits.strip_prefix("00").unwrap_or(&digits).to_owned()
+    };
+    let target_digits = norm_digits(target_trimmed);
+    if target_digits.len() < 6 {
+        return false;
+    }
+    let hay_digits = norm_digits(haystack);
+    hay_digits.contains(&target_digits)
+}
+
+/// Identifies collapsed content disclosure containers (ARIA accordions and tab
+/// panels) whose `hidden`, `aria-hidden="true"`, or `visibility:hidden` /
+/// `display:none` styling hides unread article sections rather than decorative
+/// icons, dialogs, loading indicators or navigation chrome.
+pub(super) fn disclosure_ids(root: ElementRef<'_>) -> HashSet<NodeId> {
+    static TOGGLE: LazyLock<Selector> = LazyLock::new(|| {
+        Selector::parse(
+            "button[aria-controls], [role=button][aria-controls], [role=tab][aria-controls], [aria-expanded][aria-controls]",
+        )
+        .unwrap()
+    });
+    static CANDIDATES: LazyLock<Selector> = LazyLock::new(|| {
+        Selector::parse("[role=tabpanel], [role=region][aria-labelledby], [id], [class]").unwrap()
+    });
+
+    let mut controlled_ids: HashSet<&str> = HashSet::new();
+    for toggle in root.select(&TOGGLE) {
+        let in_chrome = std::iter::once(toggle)
+            .chain(toggle.ancestors().filter_map(ElementRef::wrap))
+            .any(|p| {
+                matches!(p.value().name(), "nav" | "dialog" | "aside")
+                    || matches!(
+                        p.attr("role"),
+                        Some(
+                            "navigation" | "search" | "dialog" | "alertdialog" | "menu" | "menubar"
+                        )
+                    )
+                    || super::markdown::is_markdown_chrome(p)
+            });
+        if in_chrome {
+            continue;
+        }
+        if let Some(controls) = toggle.attr("aria-controls") {
+            for id in controls.split_whitespace() {
+                let lower = id.to_ascii_lowercase();
+                if !lower.contains("search")
+                    && !lower.contains("menu")
+                    && !lower.contains("nav")
+                    && !lower.contains("cookie")
+                    && !lower.contains("modal")
+                {
+                    controlled_ids.insert(id);
+                }
+            }
+        }
+    }
+
+    let mut ids = HashSet::new();
+    for el in root.select(&CANDIDATES) {
+        if matches!(
+            el.value().name(),
+            "head"
+                | "script"
+                | "style"
+                | "noscript"
+                | "template"
+                | "svg"
+                | "iframe"
+                | "dialog"
+                | "nav"
+                | "aside"
+                | "header"
+                | "footer"
+        ) || matches!(
+            el.attr("role"),
+            Some(
+                "status"
+                    | "alert"
+                    | "dialog"
+                    | "alertdialog"
+                    | "menu"
+                    | "menubar"
+                    | "tooltip"
+                    | "navigation"
+                    | "search"
+                    | "banner"
+                    | "table"
+            )
+        ) || el.attr("aria-busy") == Some("true")
+            || el.attr("aria-modal") == Some("true")
+            || el.attr("data-component").is_some()
+            || el.attr("identifier") == Some("table")
+            || super::markdown::is_markdown_chrome(el)
+        {
+            continue;
+        }
+        let is_tabpanel = el.attr("role") == Some("tabpanel");
+        let is_labeled_region =
+            el.attr("role") == Some("region") && el.attr("aria-labelledby").is_some();
+        let is_controlled = el.attr("id").is_some_and(|id| controlled_ids.contains(id));
+        let has_disclosure_class = el.attr("class").is_some_and(|cls| {
+            cls.split_whitespace().any(|tok| {
+                let lower = tok.to_ascii_lowercase();
+                matches!(
+                    lower.as_str(),
+                    "accordion__drawer"
+                        | "accordion__content"
+                        | "accordion-body"
+                        | "accordion-content"
+                        | "accordion-collapse"
+                        | "accordion-panel"
+                        | "tab-pane"
+                        | "tabpanel"
+                        | "collapsible-content"
+                )
+            })
+        });
+        if is_tabpanel || is_labeled_region || is_controlled || has_disclosure_class {
+            ids.insert(el.id());
+        }
+    }
+    ids
+}
+
+pub(super) fn is_hidden_node(el: ElementRef<'_>, disclosures: &HashSet<NodeId>) -> bool {
+    if disclosures.contains(&el.id()) {
+        return false;
+    }
+    el.attr("hidden").is_some()
+        || el.attr("aria-hidden") == Some("true")
+        || el.attr("style").is_some_and(hidden_style)
+}
+
 /// Page chrome: navigation, search, the site banner, language switchers and
 /// skip links. Headers inside the main content or holding the page heading
 /// stay, and so do footers, which carry addresses and contact details.
@@ -104,10 +375,11 @@ pub(super) fn is_chrome(el: ElementRef<'_>) -> bool {
 fn chrome(el: ElementRef<'_>) -> bool {
     static SKIP_LINK: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
-            r"(?i)^(?:skip|jump)(?: directly)? to (?:the )?(?:main )?(?:content|navigation|search)",
-            r"|^(?:direkt )?zu[mr]? (?:haupt)?(?:inhalt|navigation|suche)",
-            r"|^(?:aller|passer|accéder) (?:directement )?(?:au|à la) (?:contenu|navigation|recherche)",
-            r"|^(?:vai|salta|passa) (?:direttamente )?(?:al|alla) (?:contenuto|navigazione|ricerca)",
+            r"(?i)^(?:skip|jump)(?: directly)? to (?:the )?(?:main )?(?:content|navigation|search|footer)",
+            r"|^(?:direkt )?zu[mr]? (?:haupt)?(?:inhalt|navigation|suche|footer|fusszeile|fußzeile)(?: springen)?",
+            r"|^überspringe(?:n)? (?:den |die )?(?:haupt)?(?:inhalt|navigation|suche)",
+            r"|^(?:aller|passer|accéder) (?:directement )?(?:au|à la) (?:contenu|navigation|recherche|pied de page)",
+            r"|^(?:vai|salta|passa) (?:direttamente )?(?:al|alla) (?:contenuto|navigazione|ricerca|piè di pagina)",
         ))
         .expect("skip link pattern")
     });
@@ -226,7 +498,7 @@ pub(super) fn inline(name: &str) -> bool {
     )
 }
 
-struct Helper {
+pub(super) struct Helper {
     params: Vec<String>,
     expression: String,
 }
@@ -243,7 +515,7 @@ fn navigation_expression(js: &str) -> Option<&str> {
     m.name("set").or_else(|| m.name("open")).map(|s| s.as_str())
 }
 
-fn contact_helpers(root: ElementRef<'_>) -> HashMap<String, Helper> {
+pub(super) fn contact_helpers(root: ElementRef<'_>) -> HashMap<String, Helper> {
     static SCRIPTS: LazyLock<Selector> =
         LazyLock::new(|| Selector::parse("script:not([src])").unwrap());
     static FUNCTION: LazyLock<Regex> = LazyLock::new(|| {
@@ -329,7 +601,7 @@ fn from_handler(js: &str, helpers: &HashMap<String, Helper>) -> Option<String> {
     concatenate(&helper.expression, &vars)
 }
 
-fn contact(el: ElementRef<'_>, helpers: &HashMap<String, Helper>) -> Option<String> {
+pub(super) fn contact(el: ElementRef<'_>, helpers: &HashMap<String, Helper>) -> Option<String> {
     [el.attr("href"), el.attr("onclick")]
         .into_iter()
         .flatten()

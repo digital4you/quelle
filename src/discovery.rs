@@ -163,6 +163,22 @@ impl EnginePool {
         retries: &AtomicUsize,
     ) -> Result<Vec<Candidate>, DiscoveryError> {
         let key = (query.text.clone(), query.language, options);
+        static FLIGHTS: std::sync::OnceLock<crate::cache::Cache<()>> = std::sync::OnceLock::new();
+        let flight_key = serde_json::to_string(&(
+            &query.text,
+            query.language,
+            options.count,
+            options.spellcheck,
+        ))
+        .map_err(|_| DiscoveryError::Unavailable)?;
+        let _flight = FLIGHTS
+            .get_or_init(|| crate::cache::Cache::new(1, 1))
+            .flight(
+                &flight_key,
+                tokio::time::Instant::now() + Duration::from_secs(20),
+            )
+            .await
+            .map_err(|_| DiscoveryError::Unavailable)?;
         if let Some(hits) = self.cached(&key) {
             tracing::info!(stage = "discovery_cache", hit = true);
             return Ok(hits);

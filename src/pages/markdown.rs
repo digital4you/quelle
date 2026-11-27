@@ -18,7 +18,7 @@ use scraper::{ElementRef, Html, Selector};
 use serde::Serialize;
 use url::Url;
 
-use super::{clean, public_url};
+use super::{clean, evidence_url};
 
 /// Rich metadata extracted from HTML `<meta>` / `<link>` tags and response info.
 #[derive(Clone, Debug, Default, Serialize)]
@@ -85,11 +85,7 @@ pub fn extract_meta(document: &Html, base_url: &Url) -> PageMeta {
         meta.canonical_url = Some(resolved.into());
     }
     for tag in document.select(&META) {
-        let Some(content) = tag
-            .attr("content")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
+        let Some(content) = tag.attr("content").map(str::trim).filter(|s| !s.is_empty()) else {
             continue;
         };
         if let Some(name) = tag.attr("name") {
@@ -143,10 +139,7 @@ fn extract_json_ld_meta(document: &Html, meta: &mut PageMeta) {
             continue;
         };
         visit_json_ld(&val, meta);
-        if meta.author.is_some()
-            && meta.published_time.is_some()
-            && meta.modified_time.is_some()
-        {
+        if meta.author.is_some() && meta.published_time.is_some() && meta.modified_time.is_some() {
             break;
         }
     }
@@ -207,7 +200,6 @@ pub fn extract_links(document: &Html, base_url: &Url, max_links: usize) -> Vec<U
             continue;
         };
         if raw.is_empty()
-            || raw.starts_with('#')
             || raw.starts_with("javascript:")
             || raw.starts_with("mailto:")
             || raw.starts_with("tel:")
@@ -218,7 +210,7 @@ pub fn extract_links(document: &Html, base_url: &Url, max_links: usize) -> Vec<U
         let Ok(joined) = base_url.join(raw) else {
             continue;
         };
-        let Ok(clean_url) = public_url(joined) else {
+        let Ok(clean_url) = evidence_url(joined) else {
             continue;
         };
         if seen.insert(clean_url.clone()) {
@@ -240,6 +232,10 @@ pub fn html_to_markdown(
 ) -> String {
     let excluded = collect_matching_ids(document, &options.exclude_tags);
 
+    let root = document.root_element();
+    let disclosures = clean::disclosure_ids(root);
+    let helpers = clean::contact_helpers(root);
+
     // If `include_tags` is specified, render only matching subtrees in order.
     if !options.include_tags.is_empty() {
         let mut out = String::new();
@@ -250,7 +246,15 @@ pub fn html_to_markdown(
             };
             for el in document.select(&selector) {
                 if rendered.insert(el.id()) && !excluded.contains(&el.id()) {
-                    let chunk = render_element(el, base_url, false, &excluded, max_bytes);
+                    let chunk = render_element(
+                        el,
+                        base_url,
+                        false,
+                        &excluded,
+                        &disclosures,
+                        &helpers,
+                        max_bytes,
+                    );
                     if !chunk.is_empty() {
                         if !out.is_empty() {
                             out.push_str("\n\n");
@@ -269,7 +273,6 @@ pub fn html_to_markdown(
         return tidy_markdown(&out, max_bytes);
     }
 
-    let root = document.root_element();
     // When `only_main_content` is enabled, prefer a substantial `<main>` /
     // `<article>` / `[role="main"]` region so UI modals, theme pickers, and
     // sidebars outside `<main>` are dropped cleanly.
@@ -277,29 +280,102 @@ pub fn html_to_markdown(
         static MAIN_REGIONS: LazyLock<Selector> = LazyLock::new(|| {
             Selector::parse("main, [role=main], article").expect("main region selector")
         });
-        let full = render_element(root, base_url, true, &excluded, max_bytes);
+        let full = render_element(
+            root,
+            base_url,
+            true,
+            &excluded,
+            &disclosures,
+            &helpers,
+            max_bytes,
+        );
         let full_len = full.trim().len();
         let best_region = document
             .select(&MAIN_REGIONS)
+            .filter(|el| {
+                !excluded.contains(&el.id())
+                    && !el.ancestors().filter_map(ElementRef::wrap).any(|p| {
+                        matches!(p.value().name(), "noscript" | "template")
+                            || clean::is_hidden_node(p, &disclosures)
+                    })
+            })
             .take(32)
-            .filter(|el| !excluded.contains(&el.id()))
-            .map(|el| render_element(el, base_url, true, &excluded, max_bytes))
+            .map(|el| {
+                render_element(
+                    el,
+                    base_url,
+                    true,
+                    &excluded,
+                    &disclosures,
+                    &helpers,
+                    max_bytes,
+                )
+            })
             .max_by_key(|s| s.trim().len());
-        if let Some(region) = best_region {
+        if let Some(mut region) = best_region {
             let rlen = region.trim().len();
             if rlen >= 250 && rlen * 4 >= full_len {
+                // Supplement public contact targets outside the main article
+                // (e.g. press/footer contacts) without importing site chrome.
+                static CONTACT: LazyLock<Selector> =
+                    LazyLock::new(|| Selector::parse("a, button").unwrap());
+                for el in root.select(&CONTACT) {
+                    if std::iter::once(el)
+                        .chain(el.ancestors().filter_map(ElementRef::wrap))
+                        .any(|p| {
+                            excluded.contains(&p.id())
+                                || clean::is_hidden_node(p, &disclosures)
+                                || matches!(p.value().name(), "noscript" | "template")
+                                || is_markdown_chrome(p)
+                        })
+                    {
+                        continue;
+                    }
+                    if let Some(target) = clean::contact(el, &helpers)
+                        && !clean::same_contact(&region, &target)
+                    {
+                        let label = super::normalize(el.text(), 150);
+                        let scheme = if target.contains('@') {
+                            "mailto"
+                        } else {
+                            "tel"
+                        };
+                        ensure_blank_line(&mut region);
+                        if label.is_empty() || clean::same_contact(&label, &target) {
+                            region.push_str(&format!("[{target}]({scheme}:{target})\n"));
+                        } else {
+                            region.push_str(&format!("[{label}]({scheme}:{target})\n"));
+                        }
+                    }
+                }
                 return tidy_markdown(&region, max_bytes);
             }
         }
         let md = if full.trim().is_empty() {
-            render_element(root, base_url, false, &excluded, max_bytes)
+            render_element(
+                root,
+                base_url,
+                false,
+                &excluded,
+                &disclosures,
+                &helpers,
+                max_bytes,
+            )
         } else {
             full
         };
         return tidy_markdown(&md, max_bytes);
     }
 
-    let md = render_element(root, base_url, false, &excluded, max_bytes);
+    let md = render_element(
+        root,
+        base_url,
+        false,
+        &excluded,
+        &disclosures,
+        &helpers,
+        max_bytes,
+    );
     tidy_markdown(&md, max_bytes)
 }
 
@@ -330,6 +406,12 @@ struct ListItemFrame {
 struct LinkFrame {
     href: String,
     start_len: usize,
+    contact_target: Option<String>,
+}
+
+struct PreFrame {
+    body_start: usize,
+    lang: Option<String>,
 }
 
 struct TableFrame {
@@ -340,6 +422,10 @@ struct TableFrame {
     current_row: Vec<String>,
     in_row: bool,
     cell_start: Option<usize>,
+    cell_span: (usize, usize),
+    spans: Vec<Option<(usize, String)>>,
+    caption: String,
+    caption_start: Option<usize>,
 }
 
 impl TableFrame {
@@ -352,6 +438,37 @@ impl TableFrame {
             current_row: Vec::new(),
             in_row: false,
             cell_start: None,
+            cell_span: (1, 1),
+            spans: Vec::new(),
+            caption: String::new(),
+            caption_start: None,
+        }
+    }
+
+    fn carry_span(&mut self) -> bool {
+        let col = self.current_row.len();
+        if let Some(Some((remaining, value))) = self.spans.get_mut(col) {
+            self.current_row.push(value.clone());
+            *remaining -= 1;
+            if *remaining == 0 {
+                self.spans[col] = None;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    fn push_cell(&mut self, value: String) {
+        while self.carry_span() {}
+        let (cols, rows) = self.cell_span;
+        for _ in 0..cols {
+            let col = self.current_row.len();
+            self.current_row.push(value.clone());
+            if rows > 1 {
+                self.spans.resize(self.spans.len().max(col + 1), None);
+                self.spans[col] = Some((rows - 1, value.clone()));
+            }
         }
     }
 
@@ -395,6 +512,10 @@ impl TableFrame {
 
     fn format_markdown(&self) -> String {
         let mut buf = String::new();
+        if !self.caption.is_empty() {
+            buf.push_str(&self.caption);
+            buf.push_str("\n\n");
+        }
         if self.is_data_table() {
             let cols = self.rows.iter().map(|r| r.len()).max().unwrap_or(0);
             let mut emitted_header = false;
@@ -406,7 +527,7 @@ impl TableFrame {
                 for idx in 0..cols {
                     let cell = row.get(idx).map(String::as_str).unwrap_or("");
                     buf.push(' ');
-                    buf.push_str(cell);
+                    buf.push_str(&cell.replace('|', "\\|"));
                     buf.push_str(" |");
                 }
                 buf.push('\n');
@@ -437,16 +558,33 @@ impl TableFrame {
     }
 }
 
+pub(super) fn table_text(root: ElementRef<'_>, base: &Url) -> String {
+    let disclosures = clean::disclosure_ids(root);
+    let helpers = clean::contact_helpers(root);
+    render_element(
+        root,
+        base,
+        true,
+        &HashSet::new(),
+        &disclosures,
+        &helpers,
+        super::FULL_TEXT_BYTES,
+    )
+}
+
 fn render_element(
     root: ElementRef<'_>,
     base_url: &Url,
     strip_chrome: bool,
     excluded: &HashSet<NodeId>,
+    disclosures: &HashSet<NodeId>,
+    helpers: &HashMap<String, clean::Helper>,
     max_bytes: usize,
 ) -> String {
     let mut out = String::new();
     let mut skip: Option<NodeId> = None;
     let mut pre_depth: usize = 0;
+    let mut pre_frames: Vec<PreFrame> = Vec::new();
     let mut code_depth: usize = 0;
     let mut blockquote_depth: usize = 0;
     let mut lists: Vec<ListKind> = Vec::new();
@@ -485,36 +623,46 @@ fn render_element(
                             | "iframe"
                             | "dialog"
                     )
-                    || el.attr("hidden").is_some()
-                    || el.attr("aria-hidden") == Some("true")
+                    || clean::is_hidden_node(el, disclosures)
                     || el.attr("aria-modal") == Some("true")
-                    || el.attr("style").is_some_and(clean::hidden_style)
                     || (strip_chrome && is_markdown_chrome(el))
                 {
                     skip = Some(node.id());
                     continue;
                 }
+                if pre_depth > 0 {
+                    if name == "pre" {
+                        pre_depth += 1;
+                    }
+                    continue;
+                }
                 match name {
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                        let level = (name.as_bytes()[1] - b'0') as usize;
-                        ensure_blank_line(&mut out);
-                        prefix_blockquote(&mut out, blockquote_depth);
-                        for _ in 0..level {
-                            out.push('#');
+                        if links.is_empty() {
+                            let level = (name.as_bytes()[1] - b'0') as usize;
+                            ensure_blank_line(&mut out);
+                            prefix_blockquote(&mut out, blockquote_depth);
+                            for _ in 0..level {
+                                out.push('#');
+                            }
+                            out.push(' ');
+                            heading_open = Some(out.len());
+                            pending_space = false;
+                        } else {
+                            pending_space = true;
                         }
-                        out.push(' ');
-                        heading_open = Some(out.len());
-                        pending_space = false;
                     }
                     "p" => {
-                        if !in_table_row {
+                        if !in_table_row && links.is_empty() {
                             ensure_blank_line(&mut out);
                             prefix_blockquote(&mut out, blockquote_depth);
                             pending_space = false;
+                        } else {
+                            pending_space = true;
                         }
                     }
                     "br" => {
-                        if in_table_row {
+                        if in_table_row || !links.is_empty() {
                             pending_space = true;
                         } else {
                             out.push('\n');
@@ -535,11 +683,10 @@ fn render_element(
                     "pre" => {
                         ensure_blank_line(&mut out);
                         let lang = code_language(el);
-                        out.push_str("```");
-                        if let Some(lang) = lang {
-                            out.push_str(&lang);
-                        }
-                        out.push('\n');
+                        pre_frames.push(PreFrame {
+                            body_start: out.len(),
+                            lang,
+                        });
                         pre_depth += 1;
                         pending_space = false;
                     }
@@ -555,25 +702,21 @@ fn render_element(
                         pending_space = false;
                     }
                     "code" => {
-                        if pre_depth == 0 && code_depth == 0 {
+                        if code_depth == 0 {
                             flush_space(&mut out, &mut pending_space, '`');
                             out.push('`');
                         }
                         code_depth += 1;
                     }
                     "strong" | "b" => {
-                        if pre_depth == 0 {
-                            flush_space(&mut out, &mut pending_space, '*');
-                            out.push_str("**");
-                            bold_open.insert(node.id(), true);
-                        }
+                        flush_space(&mut out, &mut pending_space, '*');
+                        out.push_str("**");
+                        bold_open.insert(node.id(), true);
                     }
                     "em" | "i" => {
-                        if pre_depth == 0 {
-                            flush_space(&mut out, &mut pending_space, '*');
-                            out.push('*');
-                            italic_open.insert(node.id(), true);
-                        }
+                        flush_space(&mut out, &mut pending_space, '*');
+                        out.push('*');
+                        italic_open.insert(node.id(), true);
                     }
                     "ul" => {
                         if lists.is_empty() {
@@ -619,30 +762,44 @@ fn render_element(
                         });
                         pending_space = false;
                     }
-                    "a" => {
-                        if let Some(href) = el.attr("href").map(str::trim)
-                            && !href.is_empty()
-                            && !href.starts_with('#')
-                            && !href.starts_with("javascript:")
-                        {
-                            let resolved = if href.starts_with("mailto:") || href.starts_with("tel:")
-                            {
-                                Some(href.to_owned())
+                    "a" | "button" => {
+                        if let Some(target) = clean::contact(el, helpers) {
+                            let scheme = if target.contains('@') {
+                                "mailto"
                             } else {
-                                base_url.join(href).ok().map(String::from)
+                                "tel"
                             };
-                            if let Some(url) = resolved {
-                                // Separate adjacent links like `[A](u1)[B](u2)` -> `[A](u1) [B](u2)`
-                                if out.ends_with(')') || out.ends_with("**") {
-                                    pending_space = true;
-                                }
-                                flush_space(&mut out, &mut pending_space, '[');
-                                out.push('[');
-                                links.push(LinkFrame {
-                                    href: url,
-                                    start_len: out.len(),
-                                });
+                            if out.ends_with(')') {
+                                pending_space = true;
                             }
+                            flush_space(&mut out, &mut pending_space, '[');
+                            out.push('[');
+                            links.push(LinkFrame {
+                                href: format!("{scheme}:{target}"),
+                                start_len: out.len(),
+                                contact_target: Some(target),
+                            });
+                        } else if name == "a"
+                            && let Some(href) = el.attr("href").map(str::trim)
+                            && !href.is_empty()
+                            && !href.starts_with("javascript:")
+                            && let Some(url) = base_url
+                                .join(href)
+                                .ok()
+                                .and_then(|u| evidence_url(u).ok())
+                                .map(String::from)
+                        {
+                            // Separate adjacent links like `[A](u1)[B](u2)` -> `[A](u1) [B](u2)`
+                            if out.ends_with(')') {
+                                pending_space = true;
+                            }
+                            flush_space(&mut out, &mut pending_space, '[');
+                            out.push('[');
+                            links.push(LinkFrame {
+                                href: url,
+                                start_len: out.len(),
+                                contact_target: None,
+                            });
                         }
                     }
                     "img" => {
@@ -654,6 +811,7 @@ fn render_element(
                         {
                             flush_space(&mut out, &mut pending_space, '!');
                             out.push_str(&format!("![{alt}]({resolved})"));
+                            pending_space = true;
                         }
                     }
                     "table" => {
@@ -672,6 +830,11 @@ fn render_element(
                             pending_space = false;
                         }
                     }
+                    "caption" => {
+                        if let Some(t) = tables.last_mut() {
+                            t.caption_start = Some(out.len());
+                        }
+                    }
                     "td" | "th" => {
                         if let Some(t) = tables.last_mut()
                             && t.in_row
@@ -680,52 +843,88 @@ fn render_element(
                                 t.has_th = true;
                             }
                             t.cell_start = Some(out.len());
+                            let span = |name| {
+                                el.attr(name)
+                                    .and_then(|s| s.parse::<usize>().ok())
+                                    .unwrap_or(1)
+                                    .clamp(1, 32)
+                            };
+                            t.cell_span = (span("colspan"), span("rowspan"));
                             pending_space = false;
                         }
                     }
                     _ => {
-                        if !clean::inline(name) && !in_table_row {
-                            ensure_newline(&mut out);
-                            pending_space = false;
+                        if !clean::inline(name) {
+                            if in_table_row || !links.is_empty() {
+                                pending_space = true;
+                            } else {
+                                ensure_newline(&mut out);
+                                pending_space = false;
+                            }
                         }
                     }
                 }
             } else {
                 // Close tag
+                if pre_depth > 0 {
+                    if name == "pre" {
+                        pre_depth = pre_depth.saturating_sub(1);
+                        if pre_depth == 0
+                            && let Some(frame) = pre_frames.pop()
+                        {
+                            let body = out[frame.body_start..].to_owned();
+                            out.truncate(frame.body_start);
+                            let fence_len = max_backtick_run(&body).max(2) + 1;
+                            for _ in 0..fence_len {
+                                out.push('`');
+                            }
+                            if let Some(lang) = frame.lang {
+                                out.push_str(&lang);
+                            }
+                            out.push('\n');
+                            out.push_str(&body);
+                            if !out.ends_with('\n') {
+                                out.push('\n');
+                            }
+                            for _ in 0..fence_len {
+                                out.push('`');
+                            }
+                            out.push_str("\n\n");
+                            pending_space = false;
+                        }
+                    }
+                    continue;
+                }
                 match name {
                     "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                        if let Some(start) = heading_open.take() {
-                            if out[start..].trim().is_empty() {
-                                let line_start = out[..start].rfind('\n').map_or(0, |i| i + 1);
-                                out.truncate(line_start);
-                            } else {
-                                out.push_str("\n\n");
+                        if links.is_empty() {
+                            if let Some(start) = heading_open.take() {
+                                if out[start..].trim().is_empty() {
+                                    let line_start = out[..start].rfind('\n').map_or(0, |i| i + 1);
+                                    out.truncate(line_start);
+                                } else {
+                                    out.push_str("\n\n");
+                                }
                             }
+                            pending_space = false;
+                        } else {
+                            pending_space = true;
                         }
-                        pending_space = false;
                     }
                     "p" => {
-                        if !in_table_row {
+                        if !in_table_row && links.is_empty() {
                             ensure_blank_line(&mut out);
                         }
-                        pending_space = false;
+                        pending_space = in_table_row || !links.is_empty();
                     }
                     "blockquote" => {
                         blockquote_depth = blockquote_depth.saturating_sub(1);
                         ensure_blank_line(&mut out);
                         pending_space = false;
                     }
-                    "pre" => {
-                        pre_depth = pre_depth.saturating_sub(1);
-                        if !out.ends_with('\n') {
-                            out.push('\n');
-                        }
-                        out.push_str("```\n\n");
-                        pending_space = false;
-                    }
                     "code" => {
                         code_depth = code_depth.saturating_sub(1);
-                        if pre_depth == 0 && code_depth == 0 {
+                        if code_depth == 0 {
                             out.push('`');
                         }
                     }
@@ -752,10 +951,7 @@ fn render_element(
                     }
                     "span" | "small" | "label" => {
                         // Separate adjacent inline containers like `<span>quote</span><span>by Author</span>`
-                        if pre_depth == 0
-                            && !out.is_empty()
-                            && !out.ends_with([' ', '\n', '[', '(', '*', '`'])
-                        {
+                        if !out.is_empty() && !out.ends_with([' ', '\n', '[', '(', '*', '`']) {
                             pending_space = true;
                         }
                     }
@@ -783,11 +979,20 @@ fn render_element(
                         }
                         pending_space = false;
                     }
-                    "a" => {
-                        if let Some(frame) = links.pop() {
-                            let label = out[frame.start_len..].trim().to_owned();
+                    "a" | "button" => {
+                        if let Some(frame) = links.last()
+                            && (name == "a" || frame.contact_target.is_some())
+                        {
+                            let frame = links.pop().unwrap();
+                            let label = out[frame.start_len..]
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ");
                             if label.is_empty() {
                                 out.truncate(frame.start_len.saturating_sub(1));
+                                if let Some(target) = frame.contact_target {
+                                    out.push_str(&target);
+                                }
                             } else {
                                 out.truncate(frame.start_len);
                                 out.push_str(&label);
@@ -803,16 +1008,28 @@ fn render_element(
                             && let Some(start) = t.cell_start.take()
                         {
                             let cell = out[start..]
-                                .replace('|', "\\|")
                                 .split_whitespace()
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             out.truncate(start);
-                            t.current_row.push(cell);
+                            t.push_cell(cell);
+                        }
+                    }
+                    "caption" => {
+                        if let Some(t) = tables.last_mut()
+                            && let Some(start) = t.caption_start.take()
+                        {
+                            t.caption = out[start..].trim().to_owned();
+                            out.truncate(start);
                         }
                     }
                     "tr" => {
                         if let Some(t) = tables.last_mut() {
+                            while t.current_row.len() < t.spans.len() {
+                                if !t.carry_span() {
+                                    t.current_row.push(String::new());
+                                }
+                            }
                             if t.in_row && !t.current_row.is_empty() {
                                 let row = std::mem::take(&mut t.current_row);
                                 t.rows.push(row);
@@ -837,9 +1054,13 @@ fn render_element(
                         pending_space = false;
                     }
                     _ => {
-                        if !clean::inline(name) && !in_table_row {
-                            ensure_newline(&mut out);
-                            pending_space = false;
+                        if !clean::inline(name) {
+                            if in_table_row || !links.is_empty() {
+                                pending_space = true;
+                            } else {
+                                ensure_newline(&mut out);
+                                pending_space = false;
+                            }
                         }
                     }
                 }
@@ -851,6 +1072,9 @@ fn render_element(
                 out.push_str(text);
             } else {
                 for c in text.chars() {
+                    if code_depth == 0 && clean::is_invisible_format_char(c) {
+                        continue;
+                    }
                     if c.is_whitespace() {
                         pending_space = true;
                     } else {
@@ -867,6 +1091,20 @@ fn render_element(
     }
 
     out
+}
+
+fn max_backtick_run(text: &str) -> usize {
+    let mut best = 0;
+    let mut current = 0;
+    for b in text.bytes() {
+        if b == b'`' {
+            current += 1;
+            best = best.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    best
 }
 
 fn code_language(pre: ElementRef<'_>) -> Option<String> {
@@ -899,7 +1137,7 @@ fn code_language(pre: ElementRef<'_>) -> Option<String> {
     None
 }
 
-fn is_markdown_chrome(el: ElementRef<'_>) -> bool {
+pub(super) fn is_markdown_chrome(el: ElementRef<'_>) -> bool {
     if clean::is_chrome(el) {
         return true;
     }
@@ -912,6 +1150,13 @@ fn is_markdown_chrome(el: ElementRef<'_>) -> bool {
     if matches!(el.value().name(), "aside") {
         return true;
     }
+    let protected = || {
+        static PROTECTED: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse("h1, main, article, [role=main]").unwrap());
+        matches!(el.value().name(), "html" | "body" | "main" | "article")
+            || el.attr("role") == Some("main")
+            || el.select(&PROTECTED).next().is_some()
+    };
     // Conservative EU/CH cookie-consent banner & CMP overlay stripping
     if let Some(id) = el.attr("id") {
         let lower = id.to_ascii_lowercase();
@@ -934,6 +1179,20 @@ fn is_markdown_chrome(el: ElementRef<'_>) -> bool {
         {
             return true;
         }
+        if matches!(
+            lower.as_str(),
+            "sidebar"
+                | "pgsidenav"
+                | "pgnavbar"
+                | "submenu"
+                | "searchmenu"
+                | "site-navigation"
+                | "main-navigation"
+                | "skip-links"
+        ) && !protected()
+        {
+            return true;
+        }
     }
     if let Some(cls) = el.attr("class") {
         let lower = cls.to_ascii_lowercase();
@@ -949,6 +1208,25 @@ fn is_markdown_chrome(el: ElementRef<'_>) -> bool {
                     | "onetrust-pc-dark-filter"
             )
         }) {
+            return true;
+        }
+        if lower.split_whitespace().any(|token| {
+            matches!(
+                token,
+                "sidebar"
+                    | "mainmenu"
+                    | "submenu"
+                    | "searchmenu"
+                    | "navbar-collapse"
+                    | "navheader"
+                    | "navfooter"
+                    | "menu-dropdowns"
+                    | "headernavigationandutilitycontainer"
+                    | "skip-link"
+                    | "skip-links"
+            )
+        }) && !protected()
+        {
             return true;
         }
     }
@@ -1005,11 +1283,18 @@ fn prefix_blockquote(out: &mut String, depth: usize) {
 fn tidy_markdown(raw: &str, max_bytes: usize) -> String {
     let mut cleaned = String::with_capacity(raw.len().min(max_bytes));
     let mut blank_run = 0usize;
-    let mut in_code = false;
+    let mut fence_len = 0usize;
     for line in raw.lines() {
-        if line.trim_start().starts_with("```") {
-            in_code = !in_code;
+        let trimmed = line.trim_start();
+        let leading_ticks = trimmed.bytes().take_while(|&b| b == b'`').count();
+        if fence_len == 0 {
+            if leading_ticks >= 3 {
+                fence_len = leading_ticks;
+            }
+        } else if leading_ticks >= fence_len && trimmed[leading_ticks..].trim().is_empty() {
+            fence_len = 0;
         }
+        let in_code = fence_len > 0 || leading_ticks >= 3;
         let line = if in_code { line } else { line.trim_end() };
         if !in_code && line.is_empty() {
             blank_run += 1;
@@ -1072,7 +1357,10 @@ mod tests {
             "missing formatted paragraph: {md}"
         );
         assert!(md.contains("- First\n- Second"), "missing list: {md}");
-        assert!(md.contains("```\nlet x = 1;\n```"), "missing code block: {md}");
+        assert!(
+            md.contains("```\nlet x = 1;\n```"),
+            "missing code block: {md}"
+        );
         assert!(
             md.contains("| Name | Value |\n| --- | --- |\n| Alpha | 42 |"),
             "missing table: {md}"
@@ -1143,13 +1431,22 @@ mod tests {
         assert!(!md.contains("Keyboard shortcuts"), "dialog leaked: {md}");
         assert!(!md.contains("\n-\n"), "empty bullet remained: {md}");
         assert!(md.contains("- Real item"), "real item missing: {md}");
-        assert!(md.contains("“Quote text.” by Author"), "missing span space: {md}");
+        assert!(
+            md.contains("“Quote text.” by Author"),
+            "missing span space: {md}"
+        );
         assert!(
             md.contains("[Link A](https://example.org/a) [Link B](https://example.org/b)"),
             "adjacent links glued: {md}"
         );
-        assert!(!md.contains("| --- |"), "layout table should be flattened: {md}");
-        assert!(md.contains("1. [Story Title](https://example.org/story)"), "flattened row missing: {md}");
+        assert!(
+            !md.contains("| --- |"),
+            "layout table should be flattened: {md}"
+        );
+        assert!(
+            md.contains("1. [Story Title](https://example.org/story)"),
+            "flattened row missing: {md}"
+        );
     }
 
     #[test]
@@ -1185,9 +1482,18 @@ mod tests {
         let doc = Html::parse_document(html);
         let md = html_to_markdown(&doc, &base, &ExtractOptions::default(), 64 * 1024);
 
-        assert!(!md.contains("personalize ads"), "cookie banner leaked: {md}");
-        assert!(md.contains("```rust\nfn main() {}\n```"), "missing code lang: {md}");
-        assert!(md.contains("**Ownership**\n: Each value has a single owner."), "missing dl/dt/dd: {md}");
+        assert!(
+            !md.contains("personalize ads"),
+            "cookie banner leaked: {md}"
+        );
+        assert!(
+            md.contains("```rust\nfn main() {}\n```"),
+            "missing code lang: {md}"
+        );
+        assert!(
+            md.contains("**Ownership**\n: Each value has a single owner."),
+            "missing dl/dt/dd: {md}"
+        );
 
         let meta = extract_meta(&doc, &base);
         assert_eq!(meta.author.as_deref(), Some("Ada Lovelace"));

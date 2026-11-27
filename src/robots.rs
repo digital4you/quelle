@@ -224,14 +224,14 @@ pub async fn fetch_robots(url: &Url, deadline: TokioInstant) -> RobotsPolicy {
         return RobotsPolicy::default();
     };
     let fetch_deadline = deadline.min(TokioInstant::now() + Duration::from_secs(6));
-    let policy = match pages::download_raw(robots_url.clone(), ROBOTS_MAX_BYTES, fetch_deadline).await
-    {
-        Ok((_, _, _, bytes)) => {
-            let text = String::from_utf8_lossy(&bytes);
-            RobotsPolicy::parse(&text, &robots_url)
-        }
-        Err(_) => RobotsPolicy::default(),
-    };
+    let policy =
+        match pages::download_raw(robots_url.clone(), ROBOTS_MAX_BYTES, fetch_deadline).await {
+            Ok((_, _, _, bytes)) => {
+                let text = String::from_utf8_lossy(&bytes);
+                RobotsPolicy::parse(&text, &robots_url)
+            }
+            Err(_) => RobotsPolicy::default(),
+        };
 
     if let Some(delay) = policy.crawl_delay
         && let Some(host) = url.host_str()

@@ -19,7 +19,7 @@ const DEFAULT_HOST_CONCURRENCY: usize = 2;
 const DEFAULT_HOST_SPACING: Duration = Duration::from_millis(250);
 const MAX_HOST_ENTRIES: usize = 2048;
 const CACHE_ENTRIES: usize = 256;
-const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const CACHE_RETENTION: Duration = Duration::from_secs(30 * 60);
 const MAX_CACHED_BODY: usize = 512 * 1024;
 
 static HOST_CONCURRENCY: OnceLock<usize> = OnceLock::new();
@@ -38,10 +38,7 @@ fn host_concurrency() -> usize {
 }
 
 fn host_spacing() -> Duration {
-    HOST_SPACING
-        .get()
-        .copied()
-        .unwrap_or(DEFAULT_HOST_SPACING)
+    HOST_SPACING.get().copied().unwrap_or(DEFAULT_HOST_SPACING)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +55,24 @@ pub struct CachedResponse {
     pub content_type: Option<String>,
     pub bytes: Vec<u8>,
     pub truncated: bool,
+    pub etag: Option<header::HeaderValue>,
+    pub last_modified: Option<header::HeaderValue>,
+    pub freshness: Duration,
+}
+
+impl CachedResponse {
+    pub fn fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (
+            &self.final_url,
+            &self.content_type,
+            &self.bytes,
+            self.truncated,
+        )
+            .hash(&mut hash);
+        hash.finish()
+    }
 }
 
 struct HostState {
@@ -130,12 +145,7 @@ impl Politeness {
         if map.len() >= MAX_HOST_ENTRIES {
             // Evict entries that haven't been touched recently.
             let cutoff = Instant::now() - Duration::from_secs(300);
-            map.retain(|_, v| {
-                v.last_used
-                    .lock()
-                    .map(|t| *t >= cutoff)
-                    .unwrap_or(false)
-            });
+            map.retain(|_, v| v.last_used.lock().map(|t| *t >= cutoff).unwrap_or(false));
             if map.len() >= MAX_HOST_ENTRIES
                 && let Some(oldest) = map
                     .iter()
@@ -165,7 +175,7 @@ impl Politeness {
     }
 
     /// Returns the last winning fetch tier for `host` (cached for 30 minutes)
-    /// so subsequent requests skip wasted 403 escalations.
+    /// so escalation can reuse a previously successful renderer.
     pub fn preferred_tier(&self, host: &str) -> Option<FetchTier> {
         let state = self.host_state(host);
         let guard = state.preferred_tier.lock().ok()?;
@@ -183,16 +193,13 @@ impl Politeness {
 
     /// Acquires a per-host concurrency slot and waits for any active spacing
     /// or rate-limit cooldown, bounded by `deadline`.
-    pub async fn acquire(
-        &self,
-        host: &str,
-        deadline: tokio::time::Instant,
-    ) -> Option<HostPermit> {
+    pub async fn acquire(&self, host: &str, deadline: tokio::time::Instant) -> Option<HostPermit> {
         let state = self.host_state(host);
-        let permit = tokio::time::timeout_at(deadline, Arc::clone(&state.semaphore).acquire_owned())
-            .await
-            .ok()?
-            .ok()?;
+        let permit =
+            tokio::time::timeout_at(deadline, Arc::clone(&state.semaphore).acquire_owned())
+                .await
+                .ok()?
+                .ok()?;
 
         // Honor any active cooldown from a previous 429/503.
         let cooldown_wait = state
@@ -246,7 +253,21 @@ impl Politeness {
         }
         let cache = self.cache.lock().ok()?;
         let (stored, entry) = cache.get(url.as_str())?;
-        (stored.elapsed() <= max_age).then(|| entry.clone())
+        (stored.elapsed() < max_age.min(entry.freshness)).then(|| entry.clone())
+    }
+
+    /// Validators may outlive freshness, but never allow serving stale bodies
+    /// without a fresh upstream 304 response.
+    pub fn cache_stale(&self, url: &Url) -> Option<CachedResponse> {
+        let cache = self.cache.lock().ok()?;
+        let (stored, entry) = cache.get(url.as_str())?;
+        (stored.elapsed() < CACHE_RETENTION).then(|| entry.clone())
+    }
+
+    pub fn cache_remove(&self, url: &Url) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(url.as_str());
+        }
     }
 
     pub fn cache_put(&self, url: &Url, entry: CachedResponse) {
@@ -256,7 +277,7 @@ impl Politeness {
         let Ok(mut cache) = self.cache.lock() else {
             return;
         };
-        cache.retain(|_, (stored, _)| stored.elapsed() <= DEFAULT_CACHE_TTL);
+        cache.retain(|_, (stored, _)| stored.elapsed() <= CACHE_RETENTION);
         if cache.len() >= CACHE_ENTRIES
             && let Some(oldest) = cache
                 .iter()

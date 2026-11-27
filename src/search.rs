@@ -220,6 +220,7 @@ fn millis(started: Instant) -> u64 {
 pub struct Search {
     /// Answer generation needs a model. Content retrieval does not.
     pub model: Option<Model>,
+    pub reranker: Option<crate::rerank::Reranker>,
     pub engines: EnginePool,
     pub page_slots: Arc<Semaphore>,
 }
@@ -238,6 +239,52 @@ pub struct Prepared {
 }
 
 impl Search {
+    pub async fn rank_candidates(
+        &self,
+        query: &str,
+        language: Language,
+        mut hits: Vec<Candidate>,
+        domains: &[String],
+        strategy: crate::rerank::Strategy,
+    ) -> (Vec<Candidate>, Option<&'static str>) {
+        use crate::rerank::Strategy;
+        if strategy == Strategy::Engine {
+            if !domains.is_empty() {
+                hits.sort_by_key(|h| !crate::selection::matches_domain(&h.url, domains));
+            }
+            return (hits, None);
+        }
+        let hits = crate::selection::order(query, language, hits, domains);
+        if hits.len() < 2 || strategy == Strategy::Heuristic {
+            return (hits, None);
+        }
+        let ranked = match strategy {
+            Strategy::Rerank => match &self.reranker {
+                Some(model) => model.rank(query, &hits).await,
+                None => Err("reranker_not_configured"),
+            },
+            Strategy::Chat => match &self.model {
+                Some(model) => crate::rerank::chat_rank(model, query, &hits).await,
+                None => Err("chat_not_configured"),
+            },
+            _ => unreachable!(),
+        };
+        match ranked {
+            Ok(indices) => (
+                crate::selection::constrain(
+                    query,
+                    indices.into_iter().map(|i| hits[i].clone()).collect(),
+                    domains,
+                ),
+                None,
+            ),
+            Err(error) => {
+                tracing::info!(stage = "ranking_fallback", error);
+                (hits, Some(error))
+            }
+        }
+    }
+
     /// Selects the passages and request context for the answer writer.
     async fn gather(
         &self,
@@ -664,7 +711,7 @@ impl Search {
             })
             .buffer_unordered(4);
         let mut sources = Vec::new();
-        let mut fetched = HashSet::new();
+        let mut fetched = crate::selection::EvidenceSet::default();
         let mut attempts = 0;
         let mut errors = BTreeMap::new();
         while sources.len() < budget.pages {
@@ -674,7 +721,7 @@ impl Search {
             };
             attempts += 1;
             match result {
-                Ok(source) if fetched.insert(source.metadata.url.clone()) => {
+                Ok(source) if fetched.insert(&source.metadata.url, &source.content) => {
                     sources.push((index, source))
                 }
                 Err(error) => {
@@ -708,7 +755,31 @@ impl Search {
         let mut rest = candidates;
         let mut ordered = rest.drain(..fixed).collect::<Vec<_>>();
         let tail = rest.split_off(rest.len().min(POOL));
-        let pool = rest;
+        let query = input.resolved_question.unwrap_or(input.latest_request);
+        let hits = rest
+            .into_iter()
+            .map(|url| {
+                details.get(&url).cloned().unwrap_or(Candidate {
+                    url,
+                    title: String::new(),
+                    description: String::new(),
+                })
+            })
+            .collect();
+        let strategy = if self.reranker.is_some() {
+            crate::rerank::Strategy::Rerank
+        } else {
+            crate::rerank::Strategy::Heuristic
+        };
+        let (hits, _) = self
+            .rank_candidates(query, query_language(query), hits, &[], strategy)
+            .await;
+        let pool: Vec<_> = hits.into_iter().map(|h| h.url).collect();
+        if self.reranker.is_some() {
+            ordered.extend(pool);
+            ordered.extend(tail);
+            return ordered;
+        }
         if wanted == 0 || pool.len() <= budget.pages.min(wanted) {
             ordered.extend(pool);
             ordered.extend(tail);
@@ -748,7 +819,7 @@ impl Search {
             "properties":{"ids":{"type":"array","maxItems":wanted,
                 "items":{"type":"integer","minimum":1,"maximum":pool.len()}}}});
         let output = 300;
-        let ranked = async {
+        let ranked = tokio::time::timeout(Duration::from_secs(5), async {
             let model = self.model.as_ref().ok_or(Failure::ModelNotConfigured)?;
             if !model.fits(&messages, output).await? {
                 return Err(Failure::ContextTooLarge);
@@ -757,8 +828,9 @@ impl Search {
                 .complete(&messages, output, Some(("result_ranking", schema)))
                 .await?;
             serde_json::from_str::<Ranking>(&answer).map_err(|_| Failure::InvalidPlan)
-        }
-        .await;
+        })
+        .await
+        .unwrap_or(Err(Failure::Deadline));
         match ranked {
             Ok(ranking) => {
                 let mut chosen = vec![false; pool.len()];

@@ -1,3 +1,4 @@
+mod cache;
 mod content;
 mod crawl;
 mod discovery;
@@ -5,9 +6,11 @@ mod model;
 mod pages;
 mod politeness;
 mod privacy;
+mod rerank;
 mod robots;
 mod scrape;
 mod search;
+mod selection;
 
 use std::{
     convert::Infallible, env, net::SocketAddr, process::ExitCode, sync::Arc, time::Duration,
@@ -429,6 +432,38 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
     let authorization = secret_header(format!("Bearer {token}"), "QUELLE_TOKEN")?;
     let client = client_builder().build().map_err(|_| "HTTP client")?;
     let model = configure_model(&client, &token)?;
+    let reranker = match env::var("QUELLE_RERANK_URL") {
+        Ok(value) => {
+            let endpoint = sidecar_endpoint(&value, "QUELLE_RERANK_URL")?;
+            let key = env::var("QUELLE_RERANK_API_KEY")
+                .ok()
+                .filter(|v| !v.is_empty());
+            if key.as_deref() == Some(&token) {
+                return Err("service and reranker credentials must be distinct");
+            }
+            let auth = key
+                .map(|v| secret_header(format!("Bearer {v}"), "QUELLE_RERANK_API_KEY"))
+                .transpose()?;
+            Some(rerank::Reranker::new(
+                client.clone(),
+                endpoint,
+                auth,
+                env_text("QUELLE_RERANK_MODEL")?,
+                Duration::from_millis(
+                    positive_env("QUELLE_RERANK_TIMEOUT_MS", 3000, 100, 30_000)? as u64
+                ),
+            ))
+        }
+        Err(env::VarError::NotPresent) => {
+            if env::var_os("QUELLE_RERANK_MODEL").is_some()
+                || env::var_os("QUELLE_RERANK_API_KEY").is_some()
+            {
+                return Err("QUELLE_RERANK_URL is required with reranker settings");
+            }
+            None
+        }
+        Err(_) => return Err("QUELLE_RERANK_URL"),
+    };
     let engines = configure_engines(&client, &token)?;
     let user_agent = env::var("QUELLE_USER_AGENT")
         .ok()
@@ -474,12 +509,15 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
     let host_concurrency = positive_env("QUELLE_HOST_CONCURRENCY", 2, 1, 16)?;
     let host_spacing_ms = positive_env("QUELLE_HOST_SPACING_MS", 250, 0, 10_000)? as u64;
     politeness::configure(host_concurrency, host_spacing_ms);
+    let render_concurrency = positive_env("QUELLE_RENDER_CONCURRENCY", 4, 1, 16)?;
+    pages::set_render_concurrency(render_concurrency);
     let concurrent = positive_env("QUELLE_CONCURRENCY", 8, 1, 64)?;
     let app = App {
         authorization,
         slots: Arc::new(Semaphore::new(concurrent)),
         search: Search {
             model,
+            reranker,
             engines,
             page_slots: Arc::new(Semaphore::new(concurrent * 4)),
         },

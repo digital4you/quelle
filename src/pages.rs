@@ -23,6 +23,7 @@ use crate::{politeness, read_body, truncate};
 
 mod clean;
 pub mod markdown;
+mod quality;
 #[cfg(test)]
 mod tests;
 
@@ -61,10 +62,23 @@ const FULL_TEXT_BYTES: usize = PAGE_BYTES;
 /// Pages with less readable text than this also get a rendering attempt.
 const THIN_PAGE: usize = 800;
 /// Each render is a separate browser process of roughly 100 MB.
-static RENDER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+const DEFAULT_RENDER_CONCURRENCY: usize = 4;
+static RENDER_SLOTS: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
 static RENDERER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
 /// Office and CSV conversions running at once. Each is CPU-bound.
 static DOCUMENT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+fn clamp_render_concurrency(slots: usize) -> usize {
+    slots.clamp(1, 16)
+}
+
+pub fn set_render_concurrency(slots: usize) {
+    let _ = RENDER_SLOTS.set(tokio::sync::Semaphore::new(clamp_render_concurrency(slots)));
+}
+
+fn render_slots() -> &'static tokio::sync::Semaphore {
+    RENDER_SLOTS.get_or_init(|| tokio::sync::Semaphore::new(DEFAULT_RENDER_CONCURRENCY))
+}
 
 pub fn set_proxy(proxy: Option<String>) {
     let _ = PROXY_URL.set(proxy);
@@ -217,7 +231,7 @@ fn pdf_enabled() -> bool {
     PDF_SUPPORT.get().copied().unwrap_or(false)
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct Source {
     pub content: String,
     pub metadata: Metadata,
@@ -231,6 +245,9 @@ impl Source {
     }
 
     fn full(url: Url, title: String, text: &str) -> Result<Self, PageError> {
+        if let Some(error) = quality::text_error(text) {
+            return Err(error);
+        }
         if text.trim().is_empty() {
             return Err(PageError::Unreadable);
         }
@@ -248,7 +265,7 @@ impl Source {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Metadata {
     pub title: String,
@@ -263,6 +280,10 @@ pub struct Metadata {
 
 #[derive(Clone, Copy, Debug)]
 pub enum PageError {
+    NotFound,
+    Unauthorized,
+    RateLimited,
+    Upstream,
     Target,
     Transport,
     Blocked,
@@ -278,6 +299,10 @@ pub enum PageError {
 impl PageError {
     pub fn code(self) -> &'static str {
         match self {
+            Self::NotFound => "not_found",
+            Self::Unauthorized => "authentication_required",
+            Self::RateLimited => "rate_limited",
+            Self::Upstream => "upstream_error",
             Self::Target => "target",
             Self::Transport => "transport",
             Self::Blocked => "blocked",
@@ -288,6 +313,17 @@ impl PageError {
             Self::NoTextLayer => "no_text_layer",
             Self::NeedsJs => "needs_js",
         }
+    }
+}
+
+fn status_error(status: u16) -> Option<PageError> {
+    match status {
+        200..=299 => None,
+        404 | 410 => Some(PageError::NotFound),
+        401 | 407 => Some(PageError::Unauthorized),
+        429 => Some(PageError::RateLimited),
+        500..=599 => Some(PageError::Upstream),
+        _ => Some(PageError::Blocked),
     }
 }
 
@@ -382,6 +418,15 @@ pub fn public_url(mut url: Url) -> Result<Url, PageError> {
     }
     url.set_fragment(None);
     Ok(url)
+}
+
+/// Evidence links retain their section target. Fetch/cache keys still use
+/// `public_url`, and both paths enforce the same scheme and address policy.
+fn evidence_url(url: Url) -> Result<Url, PageError> {
+    let fragment = url.fragment().map(str::to_owned);
+    let mut clean = public_url(url)?;
+    clean.set_fragment(fragment.as_deref());
+    Ok(clean)
 }
 
 /// An operator-supplied network that neither Quelle nor Lightpanda may
@@ -618,10 +663,11 @@ pub async fn download_raw(
             "text/plain,application/xml,text/xml,*/*;q=0.5",
             true,
         );
-        let response = tokio::time::timeout_at(deadline.min(Instant::now() + PAGE_TIMEOUT), req.send())
-            .await
-            .map_err(|_| PageError::Timeout)?
-            .map_err(|_| PageError::Transport)?;
+        let response =
+            tokio::time::timeout_at(deadline.min(Instant::now() + PAGE_TIMEOUT), req.send())
+                .await
+                .map_err(|_| PageError::Timeout)?
+                .map_err(|_| PageError::Transport)?;
         if matches!(
             response.status(),
             StatusCode::MOVED_PERMANENTLY
@@ -648,11 +694,7 @@ pub async fn download_raw(
             .and_then(|v| v.to_str().ok())
             .map(str::to_ascii_lowercase);
         if !response.status().is_success() {
-            return Err(if status == 404 {
-                PageError::Unreadable
-            } else {
-                PageError::Blocked
-            });
+            return Err(status_error(status).unwrap_or(PageError::Blocked));
         }
         let (bytes, _) = tokio::time::timeout_at(
             deadline.min(Instant::now() + PAGE_TIMEOUT),
@@ -678,11 +720,41 @@ struct Downloaded {
     truncated: bool,
 }
 
+fn same_origin(a: &Url, b: &Url) -> bool {
+    a.scheme() == b.scheme()
+        && a.host_str()
+            .zip(b.host_str())
+            .is_some_and(|(x, y)| x.eq_ignore_ascii_case(y))
+        && a.port_or_known_default() == b.port_or_known_default()
+}
+
+fn retry_html_negotiation(initial: &Url, current: &Url, status: u16, media: Option<&str>) -> bool {
+    let markdown_path = |url: &Url| {
+        let path = url.path().to_ascii_lowercase();
+        path.ends_with(".md") || path.ends_with(".markdown")
+    };
+    !markdown_path(initial)
+        && (status == 406
+            || (matches!(status, 404 | 410)
+                && (media.is_some_and(|m| {
+                    matches!(
+                        m.split(';').next().unwrap_or("").trim(),
+                        "text/markdown" | "text/x-markdown"
+                    )
+                }) || (current != initial && markdown_path(current)))))
+}
+
 async fn download(
     initial_url: Url,
     deadline: Instant,
     cache_max_age: Duration,
 ) -> Result<Downloaded, PageError> {
+    static FLIGHTS: OnceLock<crate::cache::Cache<()>> = OnceLock::new();
+    let _flight = FLIGHTS
+        .get_or_init(|| crate::cache::Cache::new(1, 1))
+        .flight(initial_url.as_str(), deadline)
+        .await
+        .map_err(|_| PageError::Timeout)?;
     if let Some(cached) = politeness::global().cache_get(&initial_url, cache_max_age) {
         return classify_download(
             cached.final_url,
@@ -693,41 +765,104 @@ async fn download(
         );
     }
 
+    let stale = politeness::global().cache_stale(&initial_url);
+
     let jar = Arc::new(Jar::default());
     let mut url = initial_url.clone();
     let mut retries = 0usize;
     let initial_host = initial_url.host_str().unwrap_or_default().to_owned();
-    let mut force_honest =
-        politeness::global().preferred_tier(&initial_host) == Some(politeness::FetchTier::HonestHttp);
+    let mut force_honest = politeness::global().preferred_tier(&initial_host)
+        == Some(politeness::FetchTier::HonestHttp);
     let mut tried_honest = force_honest;
+    let mut html_only = false;
+    let mut redirects = 0;
+    let mut active_host: Option<(String, politeness::HostPermit)> = None;
+    let mut active_client: Option<(Url, reqwest::Client)> = None;
 
-    for step in 0..=(MAX_REDIRECTS + MAX_RETRIES + 1) {
-        let host_key = url.host_str().unwrap_or_default().to_owned();
-        let _host_permit = politeness::global()
-            .acquire(&host_key, deadline)
-            .await
-            .ok_or(PageError::Timeout)?;
-
-        let resolved = resolve_public_addrs(&url).await?;
-        let mut builder = page_client_builder(Arc::clone(&jar))?;
-        if let Some((host, addrs)) = &resolved
-            && configured_proxy().is_none()
+    for _ in 0..=(2 * MAX_REDIRECTS + MAX_RETRIES + 2) {
+        let host_key = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        if active_host
+            .as_ref()
+            .is_none_or(|(held, _)| *held != host_key)
         {
-            builder = builder.resolve_to_addrs(host, addrs);
+            drop(active_host.take());
+            let permit = politeness::global()
+                .acquire(&host_key, deadline)
+                .await
+                .ok_or(PageError::Timeout)?;
+            active_host = Some((host_key.clone(), permit));
         }
-        let client = builder.build().map_err(|_| PageError::Transport)?;
-        let accept = if pdf_enabled() {
+
+        let client = match &active_client {
+            Some((origin, client)) if same_origin(origin, &url) => client.clone(),
+            _ => {
+                let resolved = resolve_public_addrs(&url).await?;
+                let mut builder = page_client_builder(Arc::clone(&jar))?;
+                if let Some((host, addrs)) = &resolved
+                    && configured_proxy().is_none()
+                {
+                    builder = builder.resolve_to_addrs(host, addrs);
+                }
+                let built = builder.build().map_err(|_| PageError::Transport)?;
+                active_client = Some((url.clone(), built.clone()));
+                built
+            }
+        };
+        let accept = if html_only {
+            "text/html,application/xhtml+xml"
+        } else if pdf_enabled() {
             "text/html,application/xhtml+xml,text/markdown;q=0.95,application/xml;q=0.9,application/rss+xml;q=0.8,application/atom+xml;q=0.8,application/pdf;q=0.8,application/json;q=0.7,text/plain;q=0.5,*/*;q=0.1"
         } else {
             "text/html,application/xhtml+xml,text/markdown;q=0.95,application/xml;q=0.9,application/rss+xml;q=0.8,application/atom+xml;q=0.8,application/json;q=0.7,text/plain;q=0.5,*/*;q=0.1"
         };
-        let response = apply_page_headers(client.get(url.clone()), &url, accept, force_honest).send();
+        let mut request = apply_page_headers(client.get(url.clone()), &url, accept, force_honest);
+        // Send validators only to the original validated resource, never to a
+        // different redirect target. DNS is checked and pinned on every step.
+        let conditional = stale
+            .as_ref()
+            .filter(|entry| !html_only && entry.final_url == url);
+        if let Some(entry) = conditional {
+            if let Some(etag) = &entry.etag {
+                request = request.header(header::IF_NONE_MATCH, etag.clone());
+            } else if let Some(modified) = &entry.last_modified {
+                request = request.header(header::IF_MODIFIED_SINCE, modified.clone());
+            }
+        }
+        let response = request.send();
         let step_deadline = deadline.min(Instant::now() + PAGE_TIMEOUT);
         let response = match tokio::time::timeout_at(step_deadline, response).await {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => return Err(PageError::Transport),
             Err(_) => return Err(PageError::Timeout),
         };
+        if response.status() == StatusCode::NOT_MODIFIED
+            && let Some(entry) =
+                conditional.filter(|e| e.etag.is_some() || e.last_modified.is_some())
+        {
+            let mut entry = entry.clone();
+            if let Some(etag) = response.headers().get(header::ETAG) {
+                entry.etag = Some(etag.clone());
+            }
+            if let Some(modified) = response.headers().get(header::LAST_MODIFIED) {
+                entry.last_modified = Some(modified.clone());
+            }
+            if response.headers().contains_key(header::CACHE_CONTROL) {
+                entry.freshness = cache_freshness(response.headers()).unwrap_or(Duration::ZERO);
+            }
+            if cache_freshness(response.headers()).is_some() {
+                politeness::global().cache_put(&initial_url, entry.clone());
+            } else {
+                politeness::global().cache_remove(&initial_url);
+            }
+            tracing::info!(stage = "conditional_refresh", status = 304);
+            return classify_download(
+                entry.final_url,
+                entry.status,
+                entry.content_type,
+                entry.bytes,
+                entry.truncated,
+            );
+        }
         if matches!(
             response.status(),
             StatusCode::MOVED_PERMANENTLY
@@ -736,15 +871,39 @@ async fn download(
                 | StatusCode::TEMPORARY_REDIRECT
                 | StatusCode::PERMANENT_REDIRECT
         ) {
-            if step > MAX_REDIRECTS {
+            if redirects >= MAX_REDIRECTS {
                 return Err(PageError::Blocked);
             }
+            redirects += 1;
             let location = response
                 .headers()
                 .get(header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .ok_or(PageError::Blocked)?;
             url = public_url(url.join(location).map_err(|_| PageError::Target)?)?;
+            continue;
+        }
+        if !html_only
+            && retry_html_negotiation(
+                &initial_url,
+                &url,
+                response.status().as_u16(),
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|h| h.to_str().ok()),
+            )
+        {
+            // Some sites redirect a valid unversioned HTML route to a missing
+            // Markdown variant. Retry the original resource once, under the
+            // same deadline and DNS checks, without invalidating real 404s.
+            tracing::info!(
+                stage = "retry_html_negotiation",
+                host = initial_url.host_str()
+            );
+            html_only = true;
+            redirects = 0;
+            url = initial_url.clone();
             continue;
         }
         if matches!(
@@ -760,7 +919,7 @@ async fn download(
             retries += 1;
             let resume_at = Instant::now() + wait;
             if resume_at < deadline {
-                drop(_host_permit);
+                active_host = None;
                 tokio::time::sleep_until(resume_at).await;
                 continue;
             }
@@ -788,12 +947,19 @@ async fn download(
                 host = url.host_str(),
                 status = response.status().as_u16()
             );
-            return Err(PageError::Blocked);
+            return Err(if is_cf_challenge {
+                PageError::Blocked
+            } else {
+                status_error(response.status().as_u16()).unwrap_or(PageError::Blocked)
+            });
         }
         if force_honest && !is_wikimedia(&url) {
             politeness::global().record_tier(&host_key, politeness::FetchTier::HonestHttp);
         }
         let status = response.status().as_u16();
+        let freshness = cache_freshness(response.headers());
+        let etag = response.headers().get(header::ETAG).cloned();
+        let last_modified = response.headers().get(header::LAST_MODIFIED).cloned();
         let content_type = response
             .headers()
             .get(header::CONTENT_TYPE)
@@ -807,9 +973,9 @@ async fn download(
             Some("text/html" | "application/xhtml+xml") => Some(Kind::Html),
             Some("text/markdown" | "text/x-markdown") => Some(Kind::Markdown),
             Some("application/json") | Some("application/ld+json") => Some(Kind::Json),
-            Some("application/rss+xml" | "application/atom+xml" | "text/xml" | "application/xml") => {
-                Some(Kind::Feed)
-            }
+            Some(
+                "application/rss+xml" | "application/atom+xml" | "text/xml" | "application/xml",
+            ) => Some(Kind::Feed),
             Some("text/plain") => Some(Kind::Text),
             Some("application/pdf" | "application/x-pdf") if pdf_enabled() => Some(Kind::Pdf),
             Some("text/csv") => Some(Kind::Document(Some(anydoc::Format::Csv))),
@@ -844,20 +1010,60 @@ async fn download(
             _ => PageError::Transport,
         })?;
 
-        let result = classify_download(url.clone(), status, content_type.clone(), bytes.clone(), truncated)?;
-        politeness::global().cache_put(
-            &initial_url,
-            politeness::CachedResponse {
-                final_url: url,
-                status,
-                content_type,
-                bytes,
-                truncated,
-            },
-        );
+        let result = classify_download(
+            url.clone(),
+            status,
+            content_type.clone(),
+            bytes.clone(),
+            truncated,
+        )?;
+        if let Some(freshness) = freshness {
+            politeness::global().cache_put(
+                &initial_url,
+                politeness::CachedResponse {
+                    final_url: url,
+                    status,
+                    content_type,
+                    bytes,
+                    truncated,
+                    etag,
+                    last_modified,
+                    freshness,
+                },
+            );
+        } else {
+            politeness::global().cache_remove(&initial_url);
+        }
         return Ok(result);
     }
     Err(PageError::Blocked)
+}
+
+fn cache_freshness(headers: &header::HeaderMap) -> Option<Duration> {
+    let mut age = Duration::from_secs(300);
+    for value in headers.get_all(header::CACHE_CONTROL) {
+        for part in value.to_str().ok()?.split(',') {
+            let part = part.trim().to_ascii_lowercase();
+            if part == "no-store" || part == "private" || part.starts_with("private=") {
+                return None;
+            }
+            if part == "no-cache" || part.starts_with("no-cache=") {
+                age = Duration::ZERO;
+            }
+            if let Some(n) = part
+                .strip_prefix("max-age=")
+                .and_then(|n| n.trim_matches('"').parse::<u64>().ok())
+            {
+                age = age.min(Duration::from_secs(n));
+            }
+        }
+    }
+    let elapsed = headers
+        .get(header::AGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    Some(age.saturating_sub(Duration::from_secs(elapsed)))
 }
 
 fn classify_download(
@@ -902,7 +1108,8 @@ fn classify_download(
         Some(Kind::Text) if matches!(extension.as_str(), "md" | "markdown") => Kind::Markdown,
         Some(Kind::Feed) => {
             // Distinguish RSS/Atom feeds from generic XHTML/HTML served as text/xml.
-            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
+            let head =
+                String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
             if head.contains("<rss") || head.contains("<feed") || head.contains("<rdf:rdf") {
                 Kind::Feed
             } else if head.contains("<html") {
@@ -1000,23 +1207,64 @@ pub async fn fetch(
     permit: OwnedSemaphorePermit,
     deadline: Instant,
 ) -> Result<Source, PageError> {
+    static CACHE: OnceLock<crate::cache::Cache<(Source, u64)>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| crate::cache::Cache::new(128, 16 * 1024 * 1024));
+    let key = crate::selection::url_key(&url);
+    if relevance.is_none() {
+        let _flight = cache
+            .flight(&key, deadline)
+            .await
+            .map_err(|_| PageError::Timeout)?;
+        if let Some((source, fingerprint)) = cache.get(&key, Duration::from_secs(300))
+            && let Some(raw) =
+                politeness::global().cache_get(&export_url(url.clone()), Duration::from_secs(300))
+            && raw.fingerprint() == fingerprint
+        {
+            tracing::info!(stage = "extracted_cache", hit = true);
+            return Ok(source);
+        }
+        let target = export_url(url.clone());
+        let source = fetch_uncached(url, relevance, permit, deadline).await?;
+        if let Some(raw) = politeness::global().cache_get(&target, Duration::from_secs(300)) {
+            cache.put(
+                key,
+                (source.clone(), raw.fingerprint()),
+                source.content.len(),
+            );
+        }
+        return Ok(source);
+    }
+    fetch_uncached(url, relevance, permit, deadline).await
+}
+
+async fn fetch_uncached(
+    url: Url,
+    relevance: Option<&Relevance>,
+    permit: OwnedSemaphorePermit,
+    deadline: Instant,
+) -> Result<Source, PageError> {
     let _permit = permit;
     let deadline = deadline.min(Instant::now() + FETCH_BUDGET);
     tokio::time::timeout_at(deadline, async {
         let target = export_url(url);
         let host_key = target.host_str().unwrap_or_default().to_owned();
-        let preferred = politeness::global().preferred_tier(&host_key);
 
         let rendered = |url: Url, threshold| async move {
-            let (html, cut, tier) = render_with_fallback(&url, threshold, None, deadline).await?;
-            let mut source = parse(
-                url,
-                html,
-                Some("text/html; charset=utf-8".to_owned()),
-                relevance,
-                true,
-            )
-            .await?;
+            let (html, cut, tier, validated) =
+                render_with_fallback(&url, threshold, None, deadline).await?;
+            let mut source = match (validated, relevance) {
+                (Some(source), None) => source,
+                _ => {
+                    parse(
+                        url,
+                        html,
+                        Some("text/html; charset=utf-8".to_owned()),
+                        relevance,
+                        true,
+                    )
+                    .await?
+                }
+            };
             source.metadata.retrieval = Some(match tier {
                 politeness::FetchTier::Sidecar => "sidecar",
                 _ => "rendered",
@@ -1024,16 +1272,6 @@ pub async fn fetch(
             source.mark_truncated(cut);
             Ok::<_, PageError>((source, tier))
         };
-
-        // If this host already required rendering earlier, skip the wasted 403.
-        if matches!(
-            preferred,
-            Some(politeness::FetchTier::Rendered | politeness::FetchTier::Sidecar)
-        ) && any_renderer_enabled()
-            && let Ok((source, _)) = rendered(target.clone(), 300).await
-        {
-            return Ok(source);
-        }
 
         let downloaded = match download(target.clone(), deadline, Duration::from_secs(5 * 60)).await
         {
@@ -1083,18 +1321,12 @@ pub async fn fetch(
             // Script-only pages are rendered. So are pages whose markup holds
             // almost no readable text; the rendered result is kept only when
             // it carries more.
-            Err(error @ (PageError::NeedsJs | PageError::Unreadable))
+            Err(PageError::NeedsJs | PageError::Unreadable)
                 if has_script && any_renderer_enabled() =>
             {
-                let (source, _) = rendered(
-                    url,
-                    if matches!(error, PageError::NeedsJs) {
-                        3000
-                    } else {
-                        300
-                    },
-                )
-                .await?;
+                // Content validation and table readiness decide success. A
+                // 3,000-character wait needlessly stalls legitimate short pages.
+                let (source, _) = rendered(url, 300).await?;
                 Ok(source)
             }
             Err(PageError::NeedsJs) => {
@@ -1145,13 +1377,12 @@ pub async fn scrape(
 
         let target = export_url(requested.clone());
         let host_key = target.host_str().unwrap_or_default().to_owned();
-        let preferred = politeness::global().preferred_tier(&host_key);
 
         let render_to_page = |u: Url, threshold: usize| {
             let req = requested.clone();
             let opts = options.clone();
             async move {
-                let (html_bytes, cut, tier) =
+                let (html_bytes, cut, tier, _) =
                     render_with_fallback(&u, threshold, opts.wait_for_ms, deadline).await?;
                 let retrieval = match tier {
                     politeness::FetchTier::Sidecar => Some("sidecar"),
@@ -1179,17 +1410,6 @@ pub async fn scrape(
         if options.render == RenderMode::Always {
             let clean_target = public_url(requested.clone())?;
             let (page, _) = render_to_page(clean_target, 300).await?;
-            return Ok(page);
-        }
-
-        if options.render == RenderMode::Auto
-            && any_renderer_enabled()
-            && matches!(
-                preferred,
-                Some(politeness::FetchTier::Rendered | politeness::FetchTier::Sidecar)
-            )
-            && let Ok((page, _)) = render_to_page(target.clone(), 300).await
-        {
             return Ok(page);
         }
 
@@ -1260,8 +1480,7 @@ pub async fn scrape(
             }
             Kind::Markdown => {
                 let decoded = decode_bytes(&bytes, content_type.as_deref());
-                let title = first_markdown_heading(&decoded)
-                    .unwrap_or_else(|| pdf_name(&url));
+                let title = first_markdown_heading(&decoded).unwrap_or_else(|| pdf_name(&url));
                 let meta = PageMeta {
                     status_code: Some(status),
                     content_type,
@@ -1374,12 +1593,7 @@ pub async fn scrape(
             Err(error @ (PageError::NeedsJs | PageError::Unreadable | PageError::Blocked))
                 if has_script || matches!(error, PageError::Blocked) =>
             {
-                let threshold = if matches!(error, PageError::NeedsJs) {
-                    3000
-                } else {
-                    300
-                };
-                let (page, tier) = render_to_page(url, threshold).await?;
+                let (page, tier) = render_to_page(url, 300).await?;
                 if matches!(error, PageError::Blocked) {
                     politeness::global().record_tier(&host_key, tier);
                 }
@@ -1438,6 +1652,7 @@ async fn build_scraped_html(
     tokio::task::spawn_blocking(move || {
         let decoded = decode_bytes(&bytes, content_type.as_deref());
         let document = Html::parse_document(&decoded);
+        quality::check(&document)?;
         static TITLE: LazyLock<Selector> =
             LazyLock::new(|| Selector::parse("title").expect("title selector"));
         static CHALLENGE: LazyLock<Selector> = LazyLock::new(|| {
@@ -1461,20 +1676,19 @@ async fn build_scraped_html(
             return Err(PageError::Blocked);
         }
 
-        let mut plain = clean::page_text(document.root_element(), !extract_opts.only_main_content);
+        let mut plain = clean::content_text(&document, &url, !extract_opts.only_main_content);
         if extract_opts.only_main_content && plain.trim().is_empty() {
             plain = clean::page_text(document.root_element(), true);
         }
         let body = std::slice::from_ref(&plain);
         if needs_script(&document, body, plain.len(), rendered)
-            || (!rendered && client_template(&document, body))
+            || (!rendered && client_template(&document))
         {
             return Err(PageError::NeedsJs);
         }
 
-        let md = want_md.then(|| {
-            markdown::html_to_markdown(&document, &url, &extract_opts, FULL_TEXT_BYTES)
-        });
+        let md = want_md
+            .then(|| markdown::html_to_markdown(&document, &url, &extract_opts, FULL_TEXT_BYTES));
         let links = want_links.then(|| markdown::extract_links(&document, &url, 500));
         let mut meta = markdown::extract_meta(&document, &url);
         meta.status_code = Some(status);
@@ -1519,13 +1733,24 @@ fn decode_bytes(bytes: &[u8], media_type: Option<&str>) -> String {
     let charset = media_type.and_then(|media_type| {
         media_type.split(';').skip(1).find_map(|part| {
             let (name, value) = part.trim().split_once('=')?;
-            (name.trim() == "charset").then(|| value.trim().trim_matches(['\'', '"']))
+            name.trim()
+                .eq_ignore_ascii_case("charset")
+                .then(|| value.trim().trim_matches(['\'', '"']))
         })
     });
-    let encoding = charset
-        .and_then(|charset| encoding_rs::Encoding::for_label(charset.as_bytes()))
+    let encoding = encoding_rs::Encoding::for_bom(bytes)
+        .map(|(encoding, _)| encoding)
+        .or_else(|| {
+            charset.and_then(|charset| encoding_rs::Encoding::for_label(charset.as_bytes()))
+        })
         .or_else(|| sniff_encoding(bytes))
-        .unwrap_or(encoding_rs::UTF_8);
+        .unwrap_or_else(|| {
+            if std::str::from_utf8(bytes).is_ok() {
+                encoding_rs::UTF_8
+            } else {
+                encoding_rs::WINDOWS_1252
+            }
+        });
     let (text, _, _) = encoding.decode(bytes);
     text.into_owned()
 }
@@ -1558,28 +1783,59 @@ async fn render_with_fallback(
     threshold: usize,
     wait_for_ms: Option<u64>,
     deadline: Instant,
-) -> Result<(Vec<u8>, bool, politeness::FetchTier), PageError> {
+) -> Result<(Vec<u8>, bool, politeness::FetchTier, Option<Source>), PageError> {
     let host_key = url.host_str().unwrap_or_default();
-    let skip_lightpanda =
-        politeness::global().preferred_tier(host_key) == Some(politeness::FetchTier::Sidecar)
-            && browser_sidecar().is_some();
+    let skip_lightpanda = politeness::global().preferred_tier(host_key)
+        == Some(politeness::FetchTier::Sidecar)
+        && browser_sidecar().is_some();
 
     if !skip_lightpanda && render_enabled() {
-        match render(url, threshold, wait_for_ms).await {
-            Ok((html, cut)) => return Ok((html, cut, politeness::FetchTier::Rendered)),
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let reserve = if browser_sidecar().is_some() {
+            remaining.min(Duration::from_secs(6))
+        } else {
+            Duration::ZERO
+        };
+        let stop = deadline - reserve;
+        match tokio::time::timeout_at(stop, render(url, threshold, wait_for_ms))
+            .await
+            .unwrap_or(Err(PageError::Timeout))
+        {
+            Ok((html, cut)) => {
+                match parse(
+                    url.clone(),
+                    html.clone(),
+                    Some("text/html; charset=utf-8".into()),
+                    None,
+                    true,
+                )
+                .await
+                {
+                    Ok(source) => {
+                        return Ok((html, cut, politeness::FetchTier::Rendered, Some(source)));
+                    }
+                    Err(
+                        error @ (PageError::NotFound
+                        | PageError::Unauthorized
+                        | PageError::RateLimited
+                        | PageError::Upstream),
+                    ) => return Err(error),
+                    Err(error) if browser_sidecar().is_none() => return Err(error),
+                    Err(_) => {
+                        tracing::info!(stage = "escalate_browser_quality", host = url.host_str())
+                    }
+                }
+            }
             Err(err) if browser_sidecar().is_none() => return Err(err),
             Err(_) => {
-                tracing::info!(
-                    stage = "escalate_browser_sidecar",
-                    host = url.host_str()
-                );
+                tracing::info!(stage = "escalate_browser_sidecar", host = url.host_str());
             }
         }
     }
 
     if let Some(sidecar) = browser_sidecar() {
         let (html, cut) = render_sidecar(sidecar, url, wait_for_ms, deadline).await?;
-        return Ok((html, cut, politeness::FetchTier::Sidecar));
+        return Ok((html, cut, politeness::FetchTier::Sidecar, None));
     }
 
     Err(PageError::NeedsJs)
@@ -1596,7 +1852,7 @@ async fn render_sidecar(
 ) -> Result<(Vec<u8>, bool), PageError> {
     let clean = public_url(url.clone())?;
     let _ = resolve_public_addrs(&clean).await?;
-    let _slot = RENDER_SLOTS
+    let _slot = render_slots()
         .acquire()
         .await
         .map_err(|_| PageError::NeedsJs)?;
@@ -1642,8 +1898,8 @@ async fn render_sidecar(
         }
         let parsed: SidecarResponse =
             serde_json::from_slice(&body).map_err(|_| PageError::Unreadable)?;
-        if parsed.page_status_code.is_some_and(|code| code >= 400) {
-            return Err(PageError::Blocked);
+        if let Some(error) = parsed.page_status_code.and_then(status_error) {
+            return Err(error);
         }
         parsed
             .content
@@ -1677,7 +1933,7 @@ async fn render(
     let Some(binary) = RENDERER.get().and_then(Option::as_ref) else {
         return Err(PageError::NeedsJs);
     };
-    let _slot = RENDER_SLOTS
+    let _slot = render_slots()
         .acquire()
         .await
         .map_err(|_| PageError::NeedsJs)?;
@@ -1692,12 +1948,14 @@ async fn render(
             "fetch",
             "--dump",
             "html",
-            // Network quiet, then enough visible text: script-heavy sites
-            // can go quiet before their content has been inserted.
+            // Document completion, not analytics/network quiet, determines
+            // readiness. The expression also waits for a stable main region.
             "--wait-until",
-            "networkalmostidle",
+            "domcontentloaded",
+            "--inject-script",
+            include_str!("pages/readiness-init.js"),
             "--wait-script",
-            &format!("document.body && (document.body.innerText || '').length > {threshold}"),
+            &format!("({})({threshold})", include_str!("pages/readiness.js")),
             "--wait-ms",
             &wait_ms.to_string(),
             "--terminate-ms",
@@ -2046,8 +2304,7 @@ async fn ocr_pdf(
         .await
         .map_err(|_| PageError::Timeout)?
         .map_err(|_| PageError::Unreadable)?;
-    let parsed: OcrResponse =
-        serde_json::from_slice(&body).map_err(|_| PageError::Unreadable)?;
+    let parsed: OcrResponse = serde_json::from_slice(&body).map_err(|_| PageError::Unreadable)?;
     let text = parsed
         .markdown
         .or(parsed.text)
@@ -2071,8 +2328,7 @@ fn text_source(
     retrieval: &'static str,
     relevance: Option<&Relevance>,
 ) -> Result<Source, PageError> {
-    let title = first_markdown_heading(&text)
-        .unwrap_or_else(|| pdf_name(&url));
+    let title = first_markdown_heading(&text).unwrap_or_else(|| pdf_name(&url));
     let Some(relevance) = relevance else {
         let mut src = Source::full(url, title, &text)?;
         src.metadata.retrieval = Some(retrieval);
@@ -2109,19 +2365,26 @@ fn feed_to_markdown(xml: &str, base_url: &Url) -> String {
 
 /// Lightweight RSS 2.0 / Atom 1.0 feed parser -> clean Markdown + links.
 fn parse_feed(xml: &str, base_url: &Url) -> (String, String, Vec<Url>) {
-    static ITEM_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"(?is)<(?:item|entry)\b[^>]*>(.*?)</(?:item|entry)>").unwrap());
+    static ITEM_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<(?:item|entry)\b[^>]*>(.*?)</(?:item|entry)>").unwrap()
+    });
     static TITLE_RE: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>").unwrap());
-    static LINK_TAG_RE: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r#"(?is)<link\b[^>]*href=["']([^"']+)["'][^>]*/?>|<link\b[^>]*>(.*?)</link>"#).unwrap());
-    static DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?is)<(?:pubDate|published|updated)\b[^>]*>(.*?)</(?:pubDate|published|updated)>")
+    static LINK_TAG_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)<link\b[^>]*href=["']([^"']+)["'][^>]*/?>|<link\b[^>]*>(.*?)</link>"#)
             .unwrap()
     });
+    static DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?is)<(?:pubDate|published|updated)\b[^>]*>(.*?)</(?:pubDate|published|updated)>",
+        )
+        .unwrap()
+    });
     static DESC_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?is)<(?:description|summary|content)\b[^>]*>(.*?)</(?:description|summary|content)>")
-            .unwrap()
+        Regex::new(
+            r"(?is)<(?:description|summary|content)\b[^>]*>(.*?)</(?:description|summary|content)>",
+        )
+        .unwrap()
     });
 
     let strip_cdata = |raw: &str| -> String {
@@ -2161,10 +2424,7 @@ fn parse_feed(xml: &str, base_url: &Url) -> (String, String, Vec<Url>) {
                 .and_then(|v| v.strip_suffix("]]>"))
                 .unwrap_or(raw)
                 .trim();
-            base_url
-                .join(raw)
-                .ok()
-                .and_then(|u| public_url(u).ok())
+            base_url.join(raw).ok().and_then(|u| public_url(u).ok())
         });
         let date = DATE_RE
             .captures(block)
@@ -2259,11 +2519,13 @@ async fn pdf(url: Url, bytes: &[u8], relevance: Option<&Relevance>) -> Result<So
         let pages = text.matches('\u{c}').count().max(1);
         let Some(relevance) = relevance else {
             let mut page_text = text.split_terminator('\u{c}');
-            let prefix = page_text
-                .by_ref()
-                .take(150)
-                .collect::<Vec<_>>()
-                .join("\n\n");
+            let prefix = clean::strip_invisible_format_chars(
+                &page_text
+                    .by_ref()
+                    .take(150)
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+            );
             let title = pdf_name(&url);
             let mut source =
                 Source::full(url, title, &prefix).map_err(|_| PageError::NoTextLayer)?;
@@ -2307,7 +2569,7 @@ fn pdf_passages(text: &str) -> Vec<String> {
     };
     for raw in text.split('\n') {
         let page_break = raw.contains('\u{c}');
-        let line = raw.replace('\u{c}', "");
+        let line = clean::strip_invisible_format_chars(&raw.replace('\u{c}', ""));
         let line = LEADER.replace_all(&line, " … ");
         let line = line.split_whitespace().collect::<Vec<_>>().join(" ");
         if page_break || line.is_empty() {
@@ -2376,17 +2638,7 @@ fn extract(
     relevance: Option<&Relevance>,
     rendered: bool,
 ) -> Result<Source, PageError> {
-    let charset = media_type.and_then(|media_type| {
-        media_type.split(';').skip(1).find_map(|part| {
-            let (name, value) = part.trim().split_once('=')?;
-            (name.trim() == "charset").then(|| value.trim().trim_matches(['\'', '"']))
-        })
-    });
-    let encoding = charset
-        .and_then(|charset| encoding_rs::Encoding::for_label(charset.as_bytes()))
-        .or_else(|| sniff_encoding(bytes))
-        .unwrap_or(encoding_rs::UTF_8);
-    let (text, _, _) = encoding.decode(bytes);
+    let text = decode_bytes(bytes, media_type);
     let fallback_title = || url.host_str().unwrap_or("Web source").to_owned();
     if media_type.is_some_and(|media_type| media_type.starts_with("text/plain")) {
         let Some(relevance) = relevance else {
@@ -2415,6 +2667,7 @@ fn extract(
         Selector::parse("#challenge-form, #cf-challenge-running").expect("challenge selector")
     });
     let document = Html::parse_document(&text);
+    quality::check(&document)?;
     let title = document
         .select(&TITLE)
         .next()
@@ -2434,14 +2687,27 @@ fn extract(
     }
 
     let Some(relevance) = relevance else {
-        let mut text = clean::page_text(document.root_element(), false);
+        let mut text = markdown::html_to_markdown(
+            &document,
+            &url,
+            &ExtractOptions::default(),
+            FULL_TEXT_BYTES + 4,
+        );
         // A page made only of navigation, such as a sitemap, keeps it.
         if text.trim().is_empty() {
-            text = clean::page_text(document.root_element(), true);
+            text = markdown::html_to_markdown(
+                &document,
+                &url,
+                &ExtractOptions {
+                    only_main_content: false,
+                    ..ExtractOptions::default()
+                },
+                FULL_TEXT_BYTES + 4,
+            );
         }
         let body = std::slice::from_ref(&text);
         if needs_script(&document, body, text.len(), rendered)
-            || (!rendered && client_template(&document, body))
+            || (!rendered && client_template(&document))
         {
             return Err(PageError::NeedsJs);
         }
@@ -2488,7 +2754,7 @@ fn extract(
     let body = blocks(document.root_element());
     let body_size = size(&body);
     if needs_script(&document, &body, body_size, rendered)
-        || (!rendered && client_template(&document, &body))
+        || (!rendered && client_template(&document))
     {
         return Err(PageError::NeedsJs);
     }
@@ -2664,7 +2930,7 @@ fn sniff_encoding(bytes: &[u8]) -> Option<&'static encoding_rs::Encoding> {
 /// An unrendered client-side template (AngularJS, Vue, Alpine): framework
 /// binding attributes or visible `{{ placeholder }}` expressions. The server
 /// HTML of such pages holds labels but not the content.
-fn client_template(document: &Html, body: &[String]) -> bool {
+fn client_template(document: &Html) -> bool {
     static BINDINGS: LazyLock<Selector> = LazyLock::new(|| {
         Selector::parse(
             "[ng-app], [data-ng-app], [ng-controller], [data-ng-controller], \
@@ -2676,12 +2942,56 @@ fn client_template(document: &Html, body: &[String]) -> bool {
     static PLACEHOLDER: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"\{\{\s*[A-Za-z_][\w.]*\s*\}\}").expect("placeholder pattern")
     });
-    document.select(&BINDINGS).take(5).count() >= 5
-        || body
-            .iter()
-            .map(|block| PLACEHOLDER.find_iter(block).count())
-            .sum::<usize>()
-            >= 3
+    let ignored = |el: scraper::ElementRef<'_>| {
+        matches!(
+            el.value().name(),
+            "head" | "script" | "style" | "template" | "noscript" | "pre" | "code" | "samp" | "kbd"
+        ) || el.attr("hidden").is_some()
+            || el.attr("aria-hidden") == Some("true")
+            || el.attr("style").is_some_and(clean::hidden_style)
+    };
+    if document
+        .select(&BINDINGS)
+        .filter(|el| {
+            !std::iter::once(*el)
+                .chain(el.ancestors().filter_map(scraper::ElementRef::wrap))
+                .any(ignored)
+        })
+        .take(5)
+        .count()
+        >= 5
+    {
+        return true;
+    }
+    // Syntax-highlighted examples contain real-looking template tokens split
+    // across spans. Ignore literal/example subtrees, but join inline text in
+    // the remaining DOM so actual split placeholders are still recognized.
+    let mut text = String::new();
+    let mut skip = None;
+    for edge in document.root_element().traverse() {
+        use ego_tree::iter::Edge;
+        let node = match edge {
+            Edge::Open(node) | Edge::Close(node) => node,
+        };
+        if let Some(id) = skip {
+            if id == node.id() && matches!(edge, Edge::Close(_)) {
+                skip = None;
+            }
+            continue;
+        }
+        if let Some(el) = scraper::ElementRef::wrap(node) {
+            if matches!(edge, Edge::Open(_)) && ignored(el) {
+                skip = Some(node.id());
+            } else if !clean::inline(el.value().name()) {
+                text.push('\n');
+            }
+        } else if let Edge::Open(_) = edge
+            && let Some(value) = node.value().as_text()
+        {
+            text.push_str(value);
+        }
+    }
+    PLACEHOLDER.find_iter(&text).take(3).count() >= 3
 }
 
 /// A short "enable JavaScript" or unsupported-browser message.

@@ -538,10 +538,7 @@ pub async fn status_handle(
     req: Request<Body>,
 ) -> Response {
     if !authorized(&app, &req) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "backend_authentication_required",
-        );
+        return problem(StatusCode::UNAUTHORIZED, "backend_authentication_required");
     }
     let Some(job) = app.crawls.get(&id) else {
         return problem(StatusCode::NOT_FOUND, "crawl_not_found");
@@ -556,10 +553,7 @@ pub async fn cancel_handle(
     req: Request<Body>,
 ) -> Response {
     if !authorized(&app, &req) {
-        return problem(
-            StatusCode::UNAUTHORIZED,
-            "backend_authentication_required",
-        );
+        return problem(StatusCode::UNAUTHORIZED, "backend_authentication_required");
     }
     let Some(job) = app.crawls.get(&id) else {
         return problem(StatusCode::NOT_FOUND, "crawl_not_found");
@@ -663,7 +657,8 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
         }
 
         // Fill up to `config.concurrency` workers from the frontier.
-        while in_flight.len() < config.concurrency && finished_count + in_flight.len() < config.limit
+        while in_flight.len() < config.concurrency
+            && finished_count + in_flight.len() < config.limit
         {
             let Some((url, depth)) = frontier.pop_front() else {
                 break;
@@ -718,23 +713,25 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
                     && seen.len() < config.limit
                     && let Some(links) = &page.links
                 {
-                    for link in links {
+                    // Output links retain evidence fragments; a crawl visits
+                    // each fetched document only once regardless of section.
+                    for link in links
+                        .iter()
+                        .filter_map(|link| pages::public_url(link.clone()).ok())
+                    {
                         if seen.len() >= config.limit {
                             break;
                         }
                         if !host_matches(
-                            link,
+                            &link,
                             &allowed_hosts,
                             config.allow_subdomains,
                             config.allow_external_links,
                         ) {
                             continue;
                         }
-                        if !path_matches(
-                            link.path(),
-                            &config.include_paths,
-                            &config.exclude_paths,
-                        ) {
+                        if !path_matches(link.path(), &config.include_paths, &config.exclude_paths)
+                        {
                             continue;
                         }
                         if seen.insert(link.clone()) {
