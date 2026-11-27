@@ -188,18 +188,22 @@ Common HTTP errors include `400 invalid_search_request` for invalid input, `401 
 
 ### Search engines
 
-Set `QUELLE_SEARCH_ENGINES` to an ordered, comma-separated list. For example, `QUELLE_SEARCH_ENGINES=mwmbl,wikipedia,brave` enables two keyless providers and Brave. With the variable unset, Quelle uses `brave` alone when a Brave key is present and `mwmbl` otherwise. Anonymous Mwmbl access allows about one search per second, so add a keyed engine for more traffic. Use `none` to disable discovery and read supplied URLs directly. Requests requiring discovery then return `503 discovery_not_configured`.
+Set `QUELLE_SEARCH_ENGINES` to a comma-separated list of engines. With the variable unset, Quelle uses `brave` when `BRAVE_SEARCH_API_KEY` is present, and otherwise defaults to keyless parallel meta-search (`duckduckgo,mwmbl,wikipedia,stackexchange,hackernews`). Use `none` to disable discovery and read supplied URLs directly. Requests requiring discovery then return `503 discovery_not_configured`.
 
 | Engine | What it searches | Credential |
 | --- | --- | --- |
 | `brave` | Brave Web Search API | `BRAVE_SEARCH_API_KEY` required |
+| `duckduckgo` | DuckDuckGo HTML web results (with locale `kl=` and desktop headers) | None |
 | `bing` | Bing web results, parsed from the result page. Not enabled by default; check Bing's terms of use before enabling it. | None |
-| `mwmbl` | Mwmbl web index (JSON API) | Anonymous or optional `MWMBL_API_KEY` |
+| `mwmbl` | Mwmbl open web index (JSON API) | Anonymous or optional `MWMBL_API_KEY` |
 | `mojeek` | Mojeek web index (JSON API) | `MOJEEK_API_KEY` required |
-| `duckduckgo` | DuckDuckGo HTML web results | None |
-| `wikipedia` | Wikipedia articles in the query language (German, French, Italian or English), from the planner or the `language` field, or detected | None |
+| `wikipedia` | Wikipedia articles in the query language (`de`, `fr`, `it`, or `en`) | None |
+| `stackexchange` | Stack Overflow Q&A (official Stack Exchange v2.3 API; alias `stackoverflow`) | None |
+| `hackernews` | Primary tech articles & discussions via Hacker News Algolia API (alias `hn`) | None |
+| `arxiv` | Academic preprints via arXiv Atom API | None |
+| `github` | Open-source repositories via GitHub Search API | None |
 
-On each uncached query, Quelle rotates the starting engine by one position. It tries the next configured engine on an empty result, timeout, rate limit, challenge, or upstream error, and stops at the first usable result list. For example, with `mwmbl,wikipedia,brave`, a query starting at Wikipedia can fall back to Brave, then Mwmbl. Every listed engine can take a turn as the first choice. Nonempty results are cached for 15 minutes. Page fetch failures are reported separately.
+By default (`QUELLE_SEARCH_MODE=fuse`), when multiple engines are configured, Quelle queries eligible engines **in parallel**, enforces a 750 ms tail-cut grace window once fast engines respond so slow stragglers never stall latency, deduplicates canonical URLs, and merges results using **weighted Reciprocal Rank Fusion (RRF)** with a cross-engine consensus bonus. Specialized engines (`wikipedia`, `stackexchange`, `hackernews`, `arxiv`, `github`) are skipped automatically when a query targets an unrelated `site:` domain. Set `QUELLE_SEARCH_MODE=rotate` to restore single-engine round-robin fallback. Nonempty results are cached for 15 minutes; rate-limited engines enter cooldown automatically. Page fetch failures are reported separately.
 
 Discovery allows up to six upstream attempts per API request, shared across the planned queries in answer mode. Rate-limited engines enter a cooldown. Mwmbl requests are also spaced to match its anonymous or keyed rate. Invalid engine names, duplicate entries, and missing keys for enabled engines stop startup.
 
