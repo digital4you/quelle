@@ -83,6 +83,12 @@ Supply a finished search query or a list of known URLs. Both forms return page t
 | `selection` | No | With `query`: `engine` (default), `heuristic`, `rerank`, or `chat`. Model failures fall back to heuristic order and are reported in diagnostics. |
 | `preferredDomains` | No | With `query`: up to eight domain names to prioritize, including their subdomains. An explicit preference also overrides engine order. |
 | `followUp` | No | With `query`: default true. At most one extra site-restricted search when a preferred domain has no retrieved evidence. No expansion without preferred domains, or for an existing `site:` query. |
+| `chunks` | No | Boolean, default `false`. Return heading-scoped, section-anchored (`#id`) chunks with breadcrumbs and token counts on each source without splitting code blocks or tables. |
+| `maxTokens` | No | Integer (32–200,000). Distills page Markdown and chunks to fit the token budget while preserving document order. |
+| `chunkTokens` | No | Integer (32–4,096, default 512). Target token size per chunk. |
+| `focusQuery` | No | String (up to 600 chars). Scores and selects the highest-relevance chunks for `maxTokens` distillation (defaults to `query` in search mode when `chunks` or `maxTokens` is set). |
+| `structured` | No | Boolean, default `false`. Return deterministic single-pass `outline` (with `#id` URLs), real data `tables` (excluding layout tables), and `jsonLd` payloads alongside content. |
+| `maxPages` | No | Integer (1–1,000, default `QUELLE_PDF_MAX_PAGES` = 150). Override the PDF page cap for this request. |
 
 To fetch known pages directly, pass `urls`. This makes zero search or model calls.
 
@@ -120,7 +126,7 @@ curl -sS http://127.0.0.1:3000/api/scrape \
   --data '{"url":"https://example.org","formats":["markdown","links"],"onlyMainContent":true}'
 ```
 
-Optional fields: `formats` (`["markdown","text","html","links"]`, default `["markdown"]`), `onlyMainContent` (default `true`), `includeTags` / `excludeTags` (CSS selectors), `render` (`"auto"`, `"always"`, `"never"`), `waitFor` (ms), `maxAge` (cache TTL in seconds, default `300`; set `0` to bypass cache), `limit`, `language`.
+Optional fields: `formats` (`["markdown","text","html","links","chunks","structured"]`, default `["markdown"]`), `onlyMainContent` (default `true`), `includeTags` / `excludeTags` (CSS selectors), `render` (`"auto"`, `"always"`, `"never"`), `waitFor` (ms), `maxAge` (cache TTL in seconds, default `300`; set `0` to bypass cache), `maxTokens` (token-budgeted distillation), `chunkTokens` (default `512`), `focusQuery` (query-focused chunk scoring), `maxPages` (PDF page cap, 1–1,000), `limit`, `language`.
 
 ### Map mode · `POST /api/map`
 
@@ -144,7 +150,7 @@ curl -sS http://127.0.0.1:3000/api/crawl \
   --data '{"urls":["https://example.org/docs","https://example.org/blog"],"maxDepth":2,"limit":30,"formats":["markdown"]}'
 ```
 
-Optional fields: `maxDepth` (0–10, default 2), `limit` (1–1000, default 50), `includePaths` / `excludePaths` (prefix or `*` globs), `allowSubdomains`, `allowExternalLinks`, `useSitemap` (default `true`), `respectRobots` (default `true`), `formats`, `onlyMainContent`, `includeTags`, `excludeTags`, `render`, `waitFor`, `maxAge`, `concurrency` (1–16, default 4; per-host politeness is always enforced), `sync` (default `false`).
+Optional fields: `maxDepth` (0–10, default 2), `limit` (1–1000, default 50), `includePaths` / `excludePaths` (prefix or `*` globs), `allowSubdomains`, `allowExternalLinks`, `useSitemap` (default `true`), `respectRobots` (default `true`), `formats`, `onlyMainContent`, `includeTags`, `excludeTags`, `render`, `waitFor`, `maxAge`, `maxTokens`, `chunkTokens`, `focusQuery`, `maxPages`, `concurrency` (1–16, default 4; per-host politeness is always enforced), `sync` (default `false`), `incremental` (emit deterministic `sha256:` `contentHash`, `changeStatus`, and crawl `changes` summary; defaults `maxAge` to `0` for conditional HTTP revalidation), `sinceCrawlId` (compare against a prior stored crawl job and attach heading-level `diff`s for updated pages), `previousHashes` (stateless `{url: contentHash}` map), `omitUnchangedContent` (omit page bodies when `changeStatus == "unchanged"`).
 
 ### Extract mode · `POST /api/extract`
 
@@ -159,8 +165,8 @@ curl -sS http://127.0.0.1:3000/api/extract \
 ### Page extraction
 
 - **HTML.** `/api/content` emits clean structured Markdown in document order, including headings, lists, fenced code blocks with preserved indentation, Markdown data tables with captions and expanded row/column spans, flattened layout tables, link destinations with section anchors, collapsed ARIA accordion and tab-panel content, repeated values and footer contacts. It prefers a substantial main/article region and supplements public contact targets outside it. Both extraction APIs share charset decoding, invisible-character cleanup and document-quality checks. It leaves out site navigation, non-semantic sidebars and menus, search forms, the site banner, consent dialogs, language switchers and skip links. A static page that consists only of navigation keeps it. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
-- **JavaScript.** When static HTML looks like a script shell or an unrendered template, Quelle tries Lightpanda and reads the resulting DOM. Template examples inside code, preformatted text and other literal-example elements do not force rendering. The browser waits for populated content and tables, followed by 350 ms of main-content stability. A fully loaded document can use an 80 ms stability window when the activity observer reports no pending timers or asynchronous network work. Pending timers, observed asynchronous network work, modules and async scripts keep the longer window. Background network traffic does not need to stop. The default maximum wait remains seven seconds, followed by document-quality validation. If the page needs rendering and the browser is unavailable, its error code is `needs_js`.
-- **Documents.** Plain text retains line breaks. PDFs return their embedded text layer, up to 150 pages. Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files are converted to Markdown with [anydoc](https://github.com/firecrawl/anydoc).
+- **JavaScript.** When static HTML looks like a script shell or an unrendered template, Quelle renders via a supervised persistent Lightpanda CDP pool over a private 0600 Unix socket (`QUELLE_CDP_POOL=true` by default, with automatic restart and one-shot `lightpanda fetch` fallback). Non-content assets (images, fonts, audio/video streams, ad/analytics beacons) are blocked at the browser layer. Readiness timing starts after navigation finishes so slow origin TTFB does not starve hydration; the browser waits for populated content and tables, followed by 350 ms of main-content stability (or 80 ms when the activity observer reports a fully loaded synchronous page with no pending timers or async network work). When one-shot timers, in-flight requests, or DOM mutations are still active past the 7 s base wait, adaptive wait extends up to 13 s so delayed JS apps complete cleanly while idle pages stop immediately at 7 s. If the page needs rendering and the browser is unavailable, its error code is `needs_js`.
+- **Documents.** Plain text retains line breaks. PDFs return their embedded text layer up to `QUELLE_PDF_MAX_PAGES` (default 150, configurable per request via `maxPages` up to 1,000). Fragmented multi-column/table PDF output automatically retries with `pdftotext -layout` and formats aligned columns as Markdown tables (`retrieval: "pdf-layout"`); garbled CID/replacement text layers escalate automatically to `QUELLE_OCR_URL` when configured. Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files are converted to Markdown with [anydoc](https://github.com/firecrawl/anydoc).
 
 The output limit for `/api/content` is 2 MiB of UTF-8 text per source. `metadata.truncated` flags a byte or PDF page limit reached during extraction. A site can still require scrolling, pagination or a click to reveal additional content.
 
@@ -224,7 +230,9 @@ Set all three connection variables together to enable answer generation. Omit al
 | `QUELLE_OCR_URL` | None | Optional OCRia-nano-1 (LiteParse) CPU OCR sidecar endpoint (e.g. `http://127.0.0.1:3004/ocr`) used automatically for scanned PDFs that have no embedded text layer. |
 | `QUELLE_HOST_CONCURRENCY` | `2` | Maximum simultaneous requests per target host (1–16). |
 | `QUELLE_HOST_SPACING_MS` | `250` | Minimum delay in milliseconds between requests to the same host (0–10000). |
-| `QUELLE_RENDER_CONCURRENCY` | `4` | Maximum simultaneous browser render processes (Lightpanda or sidecar, 1–16). |
+| `QUELLE_RENDER_CONCURRENCY` | `4` | Maximum simultaneous browser renders (Lightpanda or sidecar, 1–16). |
+| `QUELLE_CDP_POOL` | `true` | Keep a supervised persistent Lightpanda CDP server over a private Unix socket with asset blocking (`false` falls back to one-shot `lightpanda fetch`). |
+| `QUELLE_PDF_MAX_PAGES` | `150` | Default maximum pages extracted per PDF document (1–1,000; overridable per request via `maxPages`). |
 
 ### Optional sidecars (`QUELLE_BROWSER_URL` & `QUELLE_OCR_URL`)
 
