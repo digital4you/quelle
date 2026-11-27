@@ -11,6 +11,8 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     read_only: true
+    tmpfs:
+      - /tmp:size=64m,noexec,nosuid,nodev
     cap_drop:
       - ALL
     security_opt:
@@ -20,6 +22,7 @@ services:
     profiles: ["browser", "full"]
     build: ./browser-sidecar
     environment:
+      HOST: "0.0.0.0"
       PORT: "3003"
       MAX_CONCURRENT_PAGES: "4"
       BLOCK_MEDIA: "true"
@@ -37,6 +40,7 @@ services:
     profiles: ["ocr", "full"]
     build: ./ocr-sidecar
     environment:
+      HOST: "0.0.0.0"
       PORT: "3004"
       OCR_BACKEND: "ocria-nano"
       MAX_CONCURRENT_OCR: "2"

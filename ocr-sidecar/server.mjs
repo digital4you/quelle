@@ -21,7 +21,7 @@ import crypto from "node:crypto";
 const execFileAsync = promisify(execFile);
 
 const PORT = Number(process.env.PORT || 3004);
-const HOST = process.env.HOST || "0.0.0.0";
+const HOST = process.env.HOST || "127.0.0.1";
 const MAX_PDF_BYTES = 12 * 1024 * 1024;
 const MAX_CONCURRENT = Math.max(1, Math.min(8, Number(process.env.MAX_CONCURRENT_OCR || 2)));
 const OCR_TIMEOUT_MS = Number(process.env.OCR_TIMEOUT_MS || 45_000);

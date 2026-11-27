@@ -834,3 +834,56 @@ fn format_pdf_layout_text_dedents_and_converts_aligned_rows_to_markdown_tables()
     assert!(formatted.contains("| Q1 2026 | 120.4 | 18.2% |"));
     assert!(formatted.contains("| Q3 2026 | 142.1 | 20.1% |"));
 }
+
+#[test]
+fn public_url_and_blocked_ranges_reject_all_local_and_reserved_targets() {
+    let blocked_urls = [
+        "http://127.0.0.1/",
+        "http://0.0.0.0/",
+        "http://localhost/",
+        "http://api.localhost/",
+        "http://printer.local/",
+        "http://db.default.svc.cluster.local/",
+        "http://metadata.google.internal/",
+        "http://router.home.arpa/",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.1/",
+        "http://172.16.0.1/",
+        "http://192.168.1.1/",
+        "http://100.64.0.1/",
+        "http://[::1]/",
+        "http://[::ffff:127.0.0.1]/",
+        "http://[::ffff:169.254.169.254]/",
+        "http://[fc00::1]/",
+        "http://[fe80::1]/",
+        "http://[64:ff9b::127.0.0.1]/",
+        "http://[2001:0:4136:e378::1]/",
+        "http://[2001:0db8::1]/",
+        "http://[2002:7f00:0001::1]/",
+        "http://[3fff::1]/",
+        "file:///etc/passwd",
+        "gopher://127.0.0.1:6379/_INFO",
+        "ftp://example.com/file",
+        "http://user:pass@example.com/",
+        "https://example.com:8443/",
+        "http://redis/",
+        "http://2130706433/",
+        "http://0x7f000001/",
+        "http://127.1/",
+    ];
+    for raw in blocked_urls {
+        let parsed = Url::parse(raw);
+        assert!(
+            parsed.is_err() || public_url(parsed.unwrap()).is_err(),
+            "expected {raw} to be rejected by public_url"
+        );
+    }
+
+    // Lightpanda's BLOCKED_RANGES must stay in parity with Rust's globally_routable IPv6 exclusions.
+    for cidr in ["64:ff9b:1::/48", "2001::/23", "2002::/16", "3fff::/20"] {
+        assert!(
+            BLOCKED_RANGES.contains(&cidr),
+            "missing {cidr} in Lightpanda BLOCKED_RANGES"
+        );
+    }
+}

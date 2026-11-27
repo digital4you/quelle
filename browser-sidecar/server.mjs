@@ -21,7 +21,7 @@ import net from "node:net";
 import { chromium } from "playwright";
 
 const PORT = Number(process.env.PORT || 3003);
-const HOST = process.env.HOST || "0.0.0.0";
+const HOST = process.env.HOST || "127.0.0.1";
 const MAX_CONCURRENT = Math.max(1, Math.min(16, Number(process.env.MAX_CONCURRENT_PAGES || 4)));
 const BLOCK_MEDIA = (process.env.BLOCK_MEDIA || "true").toLowerCase() !== "false";
 const DEFAULT_LOCALE = process.env.BROWSER_LOCALE || "de-CH";
@@ -141,16 +141,15 @@ function isAllowedIp(ip) {
     return isGloballyRoutableIpv4(ip) && !matchesBlockedCidr(ip);
   }
   if (net.isIPv6(ip)) {
-    const lower = ip.toLowerCase();
-    if (lower.startsWith("::ffff:")) {
-      const v4 = lower.slice(7);
-      return net.isIPv4(v4) && isAllowedIp(v4);
-    }
-    const firstHex = parseInt(lower.split(":")[0] || "0", 16);
-    if (Number.isNaN(firstHex) || firstHex < 0x2000 || firstHex > 0x3fff) return false;
-    if (lower.startsWith("2001:db8:") || lower.startsWith("2002:") || lower.startsWith("3fff:")) {
-      return false;
-    }
+    const val = ipv6ToBigInt(ip);
+    if (val === null) return false;
+    const seg0 = Number((val >> 112n) & 0xffffn);
+    const seg1 = Number((val >> 96n) & 0xffffn);
+    // Only global unicast (2000::/3), excluding Teredo/IETF (2001:0000::/23),
+    // documentation (2001:db8::/32), 6to4 (2002::/16), and 3fff::/16.
+    if (seg0 < 0x2000 || seg0 > 0x3fff) return false;
+    if (seg0 === 0x2001 && (seg1 <= 0x01ff || seg1 === 0x0db8)) return false;
+    if (seg0 === 0x2002 || seg0 === 0x3fff) return false;
     return !matchesBlockedCidr(ip);
   }
   return false;
@@ -160,10 +159,12 @@ function isBlockedHostname(host) {
   const h = host.toLowerCase().replace(/\.$/, "");
   return (
     !h ||
+    !h.includes(".") ||
     h === "localhost" ||
     h.endsWith(".localhost") ||
     h.endsWith(".local") ||
-    h.endsWith(".internal")
+    h.endsWith(".internal") ||
+    h.endsWith(".home.arpa")
   );
 }
 
@@ -182,12 +183,7 @@ async function resolveAllowedIp(host) {
     return cleanHost;
   }
   const absolute = cleanHost.endsWith(".") ? cleanHost : `${cleanHost}.`;
-  let records;
-  try {
-    records = await dns.lookup(absolute, { all: true });
-  } catch {
-    records = await dns.lookup(cleanHost, { all: true });
-  }
+  const records = await dns.lookup(absolute, { all: true });
   if (!records.length || !records.every((r) => isAllowedIp(r.address))) {
     throw new Error("blocked_ip");
   }
@@ -413,8 +409,16 @@ async function scrapeUrl(rawUrl, waitAfterLoadMs) {
         } catch {
           return route.abort();
         }
+        return route.continue();
       }
-      return route.continue();
+      if (
+        reqUrl.startsWith("data:") ||
+        reqUrl.startsWith("blob:") ||
+        reqUrl === "about:blank"
+      ) {
+        return route.continue();
+      }
+      return route.abort();
     });
 
     let pageStatusCode = 200;

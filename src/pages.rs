@@ -140,8 +140,12 @@ const BLOCKED_RANGES: &[&str] = &[
     "203.0.113.0/24",
     "224.0.0.0/3",
     "64:ff9b::/96",
+    "64:ff9b:1::/48",
     "100::/64",
+    "2001::/23",
     "2001:db8::/32",
+    "2002::/16",
+    "3fff::/20",
 ];
 const HONEST_AGENT: &str = concat!(
     "Quelle/",
@@ -432,7 +436,8 @@ pub fn public_url(mut url: Url) -> Result<Url, PageError> {
                 && !host.ends_with('.')
                 && !host.ends_with(".localhost")
                 && !host.ends_with(".local")
-                && !host.ends_with(".internal") => {}
+                && !host.ends_with(".internal")
+                && !host.ends_with(".home.arpa") => {}
         Some(Host::Ipv4(ip)) if public_address(ip.into()) => {}
         Some(Host::Ipv6(ip)) if public_address(ip.into()) => {}
         _ => return Err(PageError::Target),
@@ -2175,6 +2180,8 @@ async fn render(
     wait_for_ms: Option<u64>,
     deadline: Instant,
 ) -> Result<(Vec<u8>, bool), PageError> {
+    let url = public_url(url.clone())?;
+    let url = &url;
     let Some(binary) = RENDERER.get().and_then(Option::as_ref) else {
         return Err(PageError::NeedsJs);
     };

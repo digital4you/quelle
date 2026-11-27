@@ -434,14 +434,39 @@ mod unix_pool {
 
     struct ServerHandle {
         child: Child,
+        socket_dir: PathBuf,
         socket_path: PathBuf,
     }
 
     impl Drop for ServerHandle {
         fn drop(&mut self) {
             let _ = self.child.start_kill();
-            let _ = std::fs::remove_file(&self.socket_path);
+            let _ = std::fs::remove_dir_all(&self.socket_dir);
         }
+    }
+
+    /// Creates an unpredictable, owner-only (`0700`) directory for the CDP Unix
+    /// socket so other local users on a shared host cannot traverse or pre-create
+    /// the socket path.
+    pub(super) fn create_private_socket_dir() -> Result<(PathBuf, PathBuf), PageError> {
+        use std::os::unix::fs::DirBuilderExt;
+        let base = std::env::temp_dir();
+        let pid = std::process::id();
+        for _ in 0..8 {
+            let mut entropy = [0u8; 16];
+            for chunk in entropy.chunks_exact_mut(4) {
+                chunk.copy_from_slice(&next_mask());
+            }
+            let suffix: String = entropy.iter().map(|b| format!("{b:02x}")).collect();
+            let dir = base.join(format!("quelle-cdp-{pid}-{suffix}"));
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            if builder.create(&dir).is_ok() {
+                let sock = dir.join("cdp.sock");
+                return Ok((dir, sock));
+            }
+        }
+        Err(PageError::NeedsJs)
     }
 
     struct CdpPool {
@@ -473,10 +498,7 @@ mod unix_pool {
         }
         *guard = None;
 
-        let seq = NONCE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let socket_path =
-            std::env::temp_dir().join(format!("quelle-lp-{}-{seq}.sock", std::process::id()));
-        let _ = std::fs::remove_file(&socket_path);
+        let (socket_dir, socket_path) = create_private_socket_dir()?;
 
         let mut command = Command::new(binary);
         command
@@ -527,7 +549,7 @@ mod unix_pool {
         let ready_deadline = Instant::now() + Duration::from_secs(3);
         loop {
             if let Ok(Some(_)) = child.try_wait() {
-                let _ = std::fs::remove_file(&socket_path);
+                let _ = std::fs::remove_dir_all(&socket_dir);
                 return Err(PageError::NeedsJs);
             }
             if socket_path.exists() && UnixStream::connect(&socket_path).await.is_ok() {
@@ -535,7 +557,7 @@ mod unix_pool {
             }
             if Instant::now() >= ready_deadline {
                 let _ = child.start_kill();
-                let _ = std::fs::remove_file(&socket_path);
+                let _ = std::fs::remove_dir_all(&socket_dir);
                 return Err(PageError::NeedsJs);
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -544,6 +566,7 @@ mod unix_pool {
         tracing::info!(stage = "cdp_pool_started", socket = %socket_path.display());
         *guard = Some(ServerHandle {
             child,
+            socket_dir,
             socket_path: socket_path.clone(),
         });
         Ok(socket_path)
@@ -924,5 +947,20 @@ mod tests {
             wait.decide(Duration::from_millis(13_000), false, true),
             WaitDecision::Stop
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cdp_socket_dir_is_private_0700_and_unpredictable() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir1, sock1) = unix_pool::create_private_socket_dir().expect("dir1");
+        let (dir2, sock2) = unix_pool::create_private_socket_dir().expect("dir2");
+        assert_ne!(dir1, dir2);
+        assert_eq!(sock1.parent(), Some(dir1.as_path()));
+        assert_eq!(sock2.parent(), Some(dir2.as_path()));
+        let mode1 = std::fs::metadata(&dir1).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode1, 0o700, "socket directory must be mode 0700");
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }
