@@ -1,24 +1,32 @@
 use std::{
     collections::HashSet,
     env,
+    sync::LazyLock,
     time::{Duration, SystemTime},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use regex::Regex;
 use reqwest::{Client, Response, StatusCode, header};
 use scraper::{Html, Selector};
 use serde::Deserialize;
 use url::Url;
 
 use super::{
-    Candidate, DiscoveryError, DiscoveryFuture, EnginePool, Language, Query, SearchEngine,
-    SearchOptions,
+    Candidate, DiscoveryError, DiscoveryFuture, DiscoveryMode, EnginePool, Language, Query,
+    SearchEngine, SearchOptions,
 };
 use crate::{endpoint, env_text, pages::public_url, read_body, read_json, secret_header, truncate};
 
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
-const USER_AGENT: &str = "Quelle/0.1 (https://github.com/digital4you/quelle)";
+const HONEST_USER_AGENT: &str = "Quelle/0.1 (+https://github.com/digital4you/quelle)";
+const FIREFOX_USER_AGENT: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0";
+const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
+    (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
+/// Default keyless meta-search engine mix fused via parallel RRF.
+const DEFAULT_KEYLESS_ENGINES: &str = "duckduckgo,mwmbl,wikipedia,stackexchange,hackernews";
 
 #[derive(Clone, Copy)]
 pub(super) enum HtmlEngine {
@@ -40,6 +48,10 @@ enum Provider {
         key: String,
     },
     Wikipedia,
+    StackExchange,
+    HackerNews,
+    Arxiv,
+    GitHub,
 }
 
 struct NativeEngine {
@@ -63,11 +75,20 @@ pub fn configure_engines(client: &Client, service_token: &str) -> Result<EngineP
         {
             "brave".into()
         }
-        Err(env::VarError::NotPresent) => "mwmbl".into(),
+        Err(env::VarError::NotPresent) => DEFAULT_KEYLESS_ENGINES.into(),
         Err(_) => return Err("QUELLE_SEARCH_ENGINES"),
     };
+    let mode = match env::var("QUELLE_SEARCH_MODE") {
+        Ok(val) => match val.trim().to_ascii_lowercase().as_str() {
+            "fuse" | "parallel" => DiscoveryMode::Fuse,
+            "rotate" | "sequential" => DiscoveryMode::Rotate,
+            _ => return Err("QUELLE_SEARCH_MODE"),
+        },
+        Err(env::VarError::NotPresent) => DiscoveryMode::Fuse,
+        Err(_) => return Err("QUELLE_SEARCH_MODE"),
+    };
     if setting.trim() == "none" {
-        return Ok(EnginePool::new(vec![]));
+        return Ok(EnginePool::with_mode(vec![], mode));
     }
     let mut keys = HashSet::from([service_token.to_owned()]);
     if let Ok(key) = env::var("QUELLE_MODEL_API_KEY") {
@@ -107,6 +128,10 @@ pub fn configure_engines(client: &Client, service_token: &str) -> Result<EngineP
                 key: load_key("MOJEEK_API_KEY")?,
             },
             "wikipedia" => Provider::Wikipedia,
+            "stackexchange" | "stackoverflow" => Provider::StackExchange,
+            "hackernews" | "hn" => Provider::HackerNews,
+            "arxiv" => Provider::Arxiv,
+            "github" => Provider::GitHub,
             _ => return Err("QUELLE_SEARCH_ENGINES"),
         };
         engines.push(Box::new(NativeEngine {
@@ -114,7 +139,7 @@ pub fn configure_engines(client: &Client, service_token: &str) -> Result<EngineP
             provider,
         }));
     }
-    Ok(EnginePool::new(engines))
+    Ok(EnginePool::with_mode(engines, mode))
 }
 
 impl SearchEngine for NativeEngine {
@@ -122,7 +147,37 @@ impl SearchEngine for NativeEngine {
         match &self.provider {
             Provider::Mwmbl { key: Some(_) } => Duration::from_millis(200),
             Provider::Mwmbl { key: None } => Duration::from_secs(1),
+            Provider::Html(HtmlEngine::DuckDuckGo) => Duration::from_millis(850),
+            Provider::GitHub => Duration::from_millis(1200),
             _ => Duration::ZERO,
+        }
+    }
+
+    fn weight(&self) -> f64 {
+        match &self.provider {
+            Provider::Brave { .. } => 1.6,
+            Provider::Html(HtmlEngine::DuckDuckGo) => 1.5,
+            Provider::Mojeek { .. } => 1.2,
+            Provider::Html(HtmlEngine::Bing) => 1.0,
+            Provider::Mwmbl { .. } => 0.9,
+            Provider::Wikipedia => 0.85,
+            Provider::StackExchange => 0.75,
+            Provider::HackerNews => 0.75,
+            Provider::GitHub => 0.65,
+            Provider::Arxiv => 0.65,
+        }
+    }
+
+    fn supports_query(&self, query: &Query) -> bool {
+        match &self.provider {
+            Provider::Wikipedia => site_filter_allows(&query.text, &["wikipedia.org"]),
+            Provider::StackExchange => {
+                site_filter_allows(&query.text, &["stackoverflow.com", "stackexchange.com"])
+            }
+            Provider::HackerNews => site_filter_allows(&query.text, &["news.ycombinator.com"]),
+            Provider::Arxiv => site_filter_allows(&query.text, &["arxiv.org"]),
+            Provider::GitHub => site_filter_allows(&query.text, &["github.com"]),
+            _ => true,
         }
     }
 
@@ -134,6 +189,10 @@ impl SearchEngine for NativeEngine {
             Provider::Mwmbl { .. } => "mwmbl",
             Provider::Mojeek { .. } => "mojeek",
             Provider::Wikipedia => "wikipedia",
+            Provider::StackExchange => "stackexchange",
+            Provider::HackerNews => "hackernews",
+            Provider::Arxiv => "arxiv",
+            Provider::GitHub => "github",
         }
     }
 
@@ -142,13 +201,64 @@ impl SearchEngine for NativeEngine {
     }
 }
 
+pub(super) fn ddg_locale(language: Language) -> &'static str {
+    match language {
+        Language::De => "ch-de",
+        Language::Fr => "ch-fr",
+        Language::It => "ch-it",
+        Language::En => "wt-wt",
+    }
+}
+
+/// Specialized engines (Wikipedia, StackExchange, HackerNews, arXiv, GitHub) do
+/// not execute general web `site:<domain>` operators. Skip them whenever the
+/// query explicitly targets an unrelated `site:` domain.
+pub(super) fn site_filter_allows(query: &str, allowed_domains: &[&str]) -> bool {
+    static SITE_OP: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?i)\bsite:([^\s)]+)").expect("site operator regex"));
+    let mut saw_site = false;
+    for cap in SITE_OP.captures_iter(query) {
+        saw_site = true;
+        let domain = cap[1].trim_matches('"').to_ascii_lowercase();
+        if allowed_domains
+            .iter()
+            .any(|allowed| domain == *allowed || domain.ends_with(&format!(".{allowed}")))
+        {
+            return true;
+        }
+    }
+    !saw_site
+}
+
+fn accept_language_for(language: Language) -> &'static str {
+    match language {
+        Language::De => "de-CH,de;q=0.9,en-US;q=0.5,en;q=0.3",
+        Language::Fr => "fr-CH,fr;q=0.9,en-US;q=0.5,en;q=0.3",
+        Language::It => "it-CH,it;q=0.9,en-US;q=0.5,en;q=0.3",
+        Language::En => "en-US,en;q=0.9,de-CH;q=0.4",
+    }
+}
+
 impl NativeEngine {
-    fn request(&self, q: &str, lang: &str, options: SearchOptions) -> reqwest::RequestBuilder {
+    fn request(
+        &self,
+        q: &str,
+        language: Language,
+        options: SearchOptions,
+    ) -> reqwest::RequestBuilder {
+        let lang = match language {
+            Language::De => "de",
+            Language::Fr => "fr",
+            Language::It => "it",
+            Language::En => "en",
+        };
         let count = options.count.to_string();
         match &self.provider {
             Provider::Brave { endpoint, key } => self
                 .client
                 .get(endpoint.clone())
+                .header(header::USER_AGENT, HONEST_USER_AGENT)
+                .header(header::ACCEPT, "application/json")
                 .header("X-Subscription-Token", key.clone())
                 .header("X-Loc-Country", "CH")
                 .header(header::CACHE_CONTROL, "no-cache")
@@ -166,23 +276,52 @@ impl NativeEngine {
                     ("result_filter", "web"),
                     ("text_decorations", "false"),
                 ]),
-            Provider::Html(HtmlEngine::Bing) => {
-                self.client.get("https://www.bing.com/search").query(&[
+            Provider::Html(HtmlEngine::Bing) => self
+                .client
+                .get("https://www.bing.com/search")
+                .header(header::USER_AGENT, CHROME_USER_AGENT)
+                .header(
+                    header::ACCEPT,
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                .header(header::ACCEPT_LANGUAGE, accept_language_for(language))
+                .header(header::REFERER, "https://www.bing.com/")
+                .header("Sec-Fetch-Dest", "document")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header("Sec-Fetch-Site", "same-origin")
+                .header("Sec-Fetch-User", "?1")
+                .query(&[
                     ("q", q),
                     ("count", &count),
                     ("cc", "ch"),
                     ("setlang", lang),
                     ("adlt", "strict"),
-                ])
+                ]),
+            Provider::Html(HtmlEngine::DuckDuckGo) => {
+                let kl = ddg_locale(language);
+                self.client
+                    .post("https://html.duckduckgo.com/html/")
+                    .header(header::USER_AGENT, FIREFOX_USER_AGENT)
+                    .header(
+                        header::ACCEPT,
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    )
+                    .header(header::ACCEPT_LANGUAGE, accept_language_for(language))
+                    .header(header::REFERER, "https://html.duckduckgo.com/")
+                    .header(header::ORIGIN, "https://html.duckduckgo.com")
+                    .header(header::COOKIE, format!("kl={kl}"))
+                    .header("Sec-Fetch-Dest", "document")
+                    .header("Sec-Fetch-Mode", "navigate")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .header("Sec-Fetch-User", "?1")
+                    .form(&[("q", q), ("b", ""), ("kl", kl), ("kp", "1")])
             }
-            Provider::Html(HtmlEngine::DuckDuckGo) => self
-                .client
-                .post("https://html.duckduckgo.com/html/")
-                .form(&[("q", q), ("kp", "1")]),
             Provider::Mwmbl { key } => {
                 let request = self
                     .client
                     .get("https://api.mwmbl.org/api/v2/search/")
+                    .header(header::USER_AGENT, HONEST_USER_AGENT)
+                    .header(header::ACCEPT, "application/json")
                     .query(&[("q", q)]);
                 if let Some(key) = key {
                     request.query(&[("api_key", key)])
@@ -190,18 +329,25 @@ impl NativeEngine {
                     request
                 }
             }
-            Provider::Mojeek { endpoint, key } => self.client.get(endpoint.clone()).query(&[
-                ("q", q),
-                ("api_key", key),
-                ("fmt", "json"),
-                ("t", &count),
-                ("lb", &lang.to_ascii_uppercase()),
-                ("rb", "CH"),
-                ("safe", "1"),
-            ]),
+            Provider::Mojeek { endpoint, key } => self
+                .client
+                .get(endpoint.clone())
+                .header(header::USER_AGENT, HONEST_USER_AGENT)
+                .header(header::ACCEPT, "application/json")
+                .query(&[
+                    ("q", q),
+                    ("api_key", key),
+                    ("fmt", "json"),
+                    ("t", &count),
+                    ("lb", &lang.to_ascii_uppercase()),
+                    ("rb", "CH"),
+                    ("safe", "1"),
+                ]),
             Provider::Wikipedia => self
                 .client
                 .get(format!("https://{lang}.wikipedia.org/w/api.php"))
+                .header(header::USER_AGENT, HONEST_USER_AGENT)
+                .header(header::ACCEPT, "application/json")
                 .query(&[
                     ("action", "query"),
                     ("list", "search"),
@@ -211,6 +357,52 @@ impl NativeEngine {
                     ("format", "json"),
                     ("formatversion", "2"),
                 ]),
+            Provider::StackExchange => {
+                let pagesize = options.count.min(10).to_string();
+                self.client
+                    .get("https://api.stackexchange.com/2.3/search/advanced")
+                    .header(header::USER_AGENT, HONEST_USER_AGENT)
+                    .header(header::ACCEPT, "application/json")
+                    .query(&[
+                        ("order", "desc"),
+                        ("sort", "relevance"),
+                        ("site", "stackoverflow"),
+                        ("pagesize", pagesize.as_str()),
+                        ("q", q),
+                    ])
+            }
+            Provider::HackerNews => {
+                let hits = options.count.min(10).to_string();
+                self.client
+                    .get("https://hn.algolia.com/api/v1/search")
+                    .header(header::USER_AGENT, HONEST_USER_AGENT)
+                    .header(header::ACCEPT, "application/json")
+                    .query(&[
+                        ("query", q),
+                        ("hitsPerPage", hits.as_str()),
+                        ("tags", "story"),
+                    ])
+            }
+            Provider::Arxiv => {
+                let max_results = options.count.min(10).to_string();
+                let search_query = format!("all:{q}");
+                self.client
+                    .get("https://export.arxiv.org/api/query")
+                    .header(header::USER_AGENT, HONEST_USER_AGENT)
+                    .header(header::ACCEPT, "application/atom+xml,application/xml")
+                    .query(&[
+                        ("search_query", search_query.as_str()),
+                        ("max_results", max_results.as_str()),
+                    ])
+            }
+            Provider::GitHub => {
+                let per_page = options.count.min(10).to_string();
+                self.client
+                    .get("https://api.github.com/search/repositories")
+                    .header(header::USER_AGENT, HONEST_USER_AGENT)
+                    .header(header::ACCEPT, "application/vnd.github+json")
+                    .query(&[("q", q), ("per_page", per_page.as_str())])
+            }
         }
     }
 
@@ -227,16 +419,7 @@ impl NativeEngine {
         };
         let html = matches!(self.provider, Provider::Html(_));
         let response = self
-            .request(&query.text, lang, options)
-            .header(header::USER_AGENT, USER_AGENT)
-            .header(
-                header::ACCEPT,
-                if html {
-                    "text/html"
-                } else {
-                    "application/json"
-                },
-            )
+            .request(&query.text, query.language, options)
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -247,6 +430,8 @@ impl NativeEngine {
                     response.status(),
                     StatusCode::ACCEPTED | StatusCode::FORBIDDEN
                 ))
+            || (matches!(self.provider, Provider::GitHub)
+                && response.status() == StatusCode::FORBIDDEN)
         {
             return Err(DiscoveryError::RateLimited(retry_after(&response)));
         }
@@ -297,6 +482,30 @@ impl NativeEngine {
                         }
                     })
                     .collect()
+            }
+            Provider::StackExchange => {
+                let bytes = read_body(response, BODY_LIMIT)
+                    .await
+                    .map_err(|_| DiscoveryError::Unavailable)?;
+                return parse_stackexchange_json(&bytes, options.count);
+            }
+            Provider::HackerNews => {
+                let bytes = read_body(response, BODY_LIMIT)
+                    .await
+                    .map_err(|_| DiscoveryError::Unavailable)?;
+                return parse_hackernews_json(&bytes, options.count);
+            }
+            Provider::Arxiv => {
+                let bytes = read_body(response, BODY_LIMIT)
+                    .await
+                    .map_err(|_| DiscoveryError::Unavailable)?;
+                return parse_arxiv_xml(&String::from_utf8_lossy(&bytes), options.count);
+            }
+            Provider::GitHub => {
+                let bytes = read_body(response, BODY_LIMIT)
+                    .await
+                    .map_err(|_| DiscoveryError::Unavailable)?;
+                return parse_github_json(&bytes, options.count);
             }
         };
         Ok(candidates(rows, options.count))
@@ -364,6 +573,162 @@ struct WikiPage {
 struct WikiHit {
     title: String,
     snippet: String,
+}
+
+fn decode_html_text(raw: &str) -> String {
+    Html::parse_fragment(raw)
+        .root_element()
+        .text()
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub(super) fn parse_stackexchange_json(
+    bytes: &[u8],
+    count: usize,
+) -> Result<Vec<Candidate>, DiscoveryError> {
+    #[derive(Deserialize)]
+    struct SeResponse {
+        #[serde(default)]
+        items: Vec<SeItem>,
+    }
+    #[derive(Deserialize)]
+    struct SeItem {
+        link: String,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        tags: Vec<String>,
+        #[serde(default)]
+        score: i64,
+        #[serde(default)]
+        answer_count: u64,
+    }
+    let parsed: SeResponse =
+        serde_json::from_slice(bytes).map_err(|_| DiscoveryError::Unavailable)?;
+    let rows = parsed.items.into_iter().map(|item| {
+        let tags = if item.tags.is_empty() {
+            String::new()
+        } else {
+            format!("Tags: {}. ", item.tags.join(", "))
+        };
+        Row {
+            url: item.link,
+            title: decode_html_text(&item.title),
+            description: format!(
+                "{tags}Stack Overflow ({} answers, score {})",
+                item.answer_count, item.score
+            ),
+        }
+    });
+    Ok(candidates(rows, count))
+}
+
+pub(super) fn parse_hackernews_json(
+    bytes: &[u8],
+    count: usize,
+) -> Result<Vec<Candidate>, DiscoveryError> {
+    #[derive(Deserialize)]
+    struct HnResponse {
+        #[serde(default)]
+        hits: Vec<HnHit>,
+    }
+    #[derive(Deserialize)]
+    struct HnHit {
+        url: Option<String>,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        points: Option<i64>,
+        #[serde(default)]
+        num_comments: Option<i64>,
+    }
+    let parsed: HnResponse =
+        serde_json::from_slice(bytes).map_err(|_| DiscoveryError::Unavailable)?;
+    let rows = parsed.hits.into_iter().filter_map(|hit| {
+        let url = hit.url.filter(|u| !u.trim().is_empty())?;
+        let points = hit.points.unwrap_or(0);
+        let comments = hit.num_comments.unwrap_or(0);
+        Some(Row {
+            url,
+            title: decode_html_text(&hit.title),
+            description: format!("Hacker News discussion ({points} points, {comments} comments)"),
+        })
+    });
+    Ok(candidates(rows, count))
+}
+
+pub(super) fn parse_arxiv_xml(xml: &str, count: usize) -> Result<Vec<Candidate>, DiscoveryError> {
+    static ENTRY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<entry\b[^>]*>(.*?)</entry>").unwrap());
+    static ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?is)<id>(.*?)</id>").unwrap());
+    static TITLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>").unwrap());
+    static SUMMARY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<summary\b[^>]*>(.*?)</summary>").unwrap());
+
+    let rows = ENTRY.captures_iter(xml).filter_map(|cap| {
+        let block = &cap[1];
+        let id_cap = ID.captures(block)?;
+        let raw_id = id_cap[1].trim();
+        let url = raw_id
+            .strip_prefix("http://arxiv.org/")
+            .map(|rest| format!("https://arxiv.org/{rest}"))
+            .unwrap_or_else(|| raw_id.to_owned());
+        let title = TITLE
+            .captures(block)
+            .map(|c| decode_html_text(&c[1]))
+            .unwrap_or_default();
+        let description = SUMMARY
+            .captures(block)
+            .map(|c| decode_html_text(&c[1]))
+            .unwrap_or_default();
+        Some(Row {
+            url,
+            title,
+            description,
+        })
+    });
+    Ok(candidates(rows, count))
+}
+
+pub(super) fn parse_github_json(
+    bytes: &[u8],
+    count: usize,
+) -> Result<Vec<Candidate>, DiscoveryError> {
+    #[derive(Deserialize)]
+    struct GhResponse {
+        #[serde(default)]
+        items: Vec<GhRepo>,
+    }
+    #[derive(Deserialize)]
+    struct GhRepo {
+        html_url: String,
+        #[serde(default)]
+        full_name: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        stargazers_count: u64,
+    }
+    let parsed: GhResponse =
+        serde_json::from_slice(bytes).map_err(|_| DiscoveryError::Unavailable)?;
+    let rows = parsed.items.into_iter().map(|repo| {
+        let desc = repo.description.unwrap_or_default();
+        let description = if desc.trim().is_empty() {
+            format!("GitHub repository ({} stars)", repo.stargazers_count)
+        } else {
+            format!("{} ({} stars)", desc.trim(), repo.stargazers_count)
+        };
+        Row {
+            url: repo.html_url,
+            title: repo.full_name,
+            description,
+        }
+    });
+    Ok(candidates(rows, count))
 }
 
 fn candidates(rows: impl IntoIterator<Item = Row>, count: usize) -> Vec<Candidate> {

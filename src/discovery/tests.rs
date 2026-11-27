@@ -128,3 +128,222 @@ fn html_results_unwrap_destinations_and_reject_challenges() {
         assert!(parse_search_html(kind, "<title>Please verify</title>", 3).is_err());
     }
 }
+
+struct RichFake {
+    id: &'static str,
+    weight: f64,
+    delay: Duration,
+    hits: Result<Vec<(&'static str, &'static str, &'static str)>, DiscoveryError>,
+}
+
+impl SearchEngine for RichFake {
+    fn name(&self) -> &'static str {
+        self.id
+    }
+
+    fn weight(&self) -> f64 {
+        self.weight
+    }
+
+    fn search<'a>(&'a self, _: &'a Query, _: SearchOptions) -> DiscoveryFuture<'a> {
+        let delay = self.delay;
+        let hits = self.hits.clone();
+        Box::pin(async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            let rows = hits?;
+            Ok(rows
+                .into_iter()
+                .map(|(u, t, d)| Candidate {
+                    url: Url::parse(u).unwrap(),
+                    title: t.to_owned(),
+                    description: d.to_owned(),
+                })
+                .collect())
+        })
+    }
+}
+
+#[tokio::test]
+async fn fuse_mode_fans_out_in_parallel_and_boosts_consensus_results_via_rrf() {
+    let engines: Vec<Box<dyn SearchEngine>> = vec![
+        Box::new(RichFake {
+            id: "alpha",
+            weight: 1.4,
+            delay: Duration::from_millis(10),
+            hits: Ok(vec![
+                (
+                    "https://alpha-only.example.org/a",
+                    "Alpha Solo",
+                    "Solo result",
+                ),
+                ("https://consensus.example.org/doc", "Consensus", ""),
+            ]),
+        }),
+        Box::new(RichFake {
+            id: "beta",
+            weight: 1.0,
+            delay: Duration::from_millis(20),
+            hits: Ok(vec![
+                ("https://beta-only.example.org/b", "Beta Solo", "Beta"),
+                (
+                    "https://consensus.example.org/doc?utm_source=test",
+                    "Consensus Guide",
+                    "Authoritative description from beta",
+                ),
+            ]),
+        }),
+        Box::new(RichFake {
+            id: "broken",
+            weight: 1.0,
+            delay: Duration::ZERO,
+            hits: Err(DiscoveryError::RateLimited(Duration::from_secs(60))),
+        }),
+    ];
+    let pool = EnginePool::with_mode(engines, DiscoveryMode::Fuse);
+    let hits = pool
+        .lookup(
+            &Query {
+                text: "consensus test".into(),
+                language: Language::En,
+            },
+            SearchOptions {
+                count: 5,
+                spellcheck: false,
+            },
+            &AtomicUsize::new(6),
+        )
+        .await
+        .unwrap();
+
+    // Consensus URL appeared #2 on both alpha & beta (with tracking param on beta),
+    // so RRF + consensus boost must rank it #1 and keep beta's non-empty description!
+    assert_eq!(hits.len(), 3);
+    assert_eq!(hits[0].url.as_str(), "https://consensus.example.org/doc");
+    assert_eq!(hits[0].description, "Authoritative description from beta");
+}
+
+#[tokio::test]
+async fn fuse_mode_cuts_off_slow_straggler_after_grace_window() {
+    let engines: Vec<Box<dyn SearchEngine>> = vec![
+        Box::new(RichFake {
+            id: "fast",
+            weight: 1.4,
+            delay: Duration::from_millis(15),
+            hits: Ok(vec![("https://fast.example.org/1", "Fast Hit", "Quick")]),
+        }),
+        Box::new(RichFake {
+            id: "straggler",
+            weight: 1.0,
+            delay: Duration::from_secs(4),
+            hits: Ok(vec![("https://slow.example.org/1", "Slow Hit", "Late")]),
+        }),
+    ];
+    let pool = EnginePool::with_mode(engines, DiscoveryMode::Fuse);
+    let started = Instant::now();
+    let hits = pool
+        .lookup(
+            &Query {
+                text: "straggler test".into(),
+                language: Language::En,
+            },
+            SearchOptions {
+                count: 5,
+                spellcheck: false,
+            },
+            &AtomicUsize::new(6),
+        )
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].url.as_str(), "https://fast.example.org/1");
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "fuse mode waited too long for straggler: {elapsed:?}"
+    );
+}
+
+#[test]
+fn ddg_handles_direct_links_and_locale_mapping() {
+    assert_eq!(ddg_locale(Language::De), "ch-de");
+    assert_eq!(ddg_locale(Language::Fr), "ch-fr");
+    assert_eq!(ddg_locale(Language::It), "ch-it");
+    assert_eq!(ddg_locale(Language::En), "wt-wt");
+
+    let direct = r#"<div class="result"><a class="result__a" href="https://www.estv.admin.ch/de/mwst">MWST</a><a class="result__snippet">8.1% Normalsatz</a></div>"#;
+    let hits = parse_search_html(Kind::DuckDuckGo, direct, 5).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].url.as_str(), "https://www.estv.admin.ch/de/mwst");
+    assert_eq!(hits[0].description, "8.1% Normalsatz");
+}
+
+#[test]
+fn parses_stackexchange_hackernews_arxiv_and_github_keyless_apis() {
+    let se = br#"{"items":[{"title":"Handling HTTP 429 &amp; Retry-After","link":"https://stackoverflow.com/questions/123/http-429","tags":["http","rust"],"answer_count":5,"score":42}]}"#;
+    let se_hits = parse_stackexchange_json(se, 5).unwrap();
+    assert_eq!(se_hits.len(), 1);
+    assert_eq!(
+        se_hits[0].url.as_str(),
+        "https://stackoverflow.com/questions/123/http-429"
+    );
+    assert_eq!(se_hits[0].title, "Handling HTTP 429 & Retry-After");
+    assert!(se_hits[0].description.contains("rust"));
+
+    let hn = br#"{"hits":[{"title":"SQLite WAL Internals","url":"https://sqlite.org/wal.html","points":310,"num_comments":84,"objectID":"999"},{"title":"Ask HN: No external URL","url":null,"points":10,"objectID":"1000"}]}"#;
+    let hn_hits = parse_hackernews_json(hn, 5).unwrap();
+    assert_eq!(hn_hits.len(), 1);
+    assert_eq!(hn_hits[0].url.as_str(), "https://sqlite.org/wal.html");
+    assert!(hn_hits[0].description.contains("310"));
+
+    let arxiv = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>http://arxiv.org/abs/1706.03762v7</id>
+        <title>Attention Is All You Need</title>
+        <summary>The dominant sequence transduction models are based on complex recurrent networks.</summary>
+      </entry>
+    </feed>"#;
+    let ax_hits = parse_arxiv_xml(arxiv, 5).unwrap();
+    assert_eq!(ax_hits.len(), 1);
+    assert_eq!(
+        ax_hits[0].url.as_str(),
+        "https://arxiv.org/abs/1706.03762v7"
+    );
+    assert_eq!(ax_hits[0].title, "Attention Is All You Need");
+    assert!(ax_hits[0].description.contains("sequence transduction"));
+
+    let gh = br#"{"items":[{"full_name":"lightpanda-io/browser","html_url":"https://github.com/lightpanda-io/browser","description":"Headless browser designed for AI and automation","stargazers_count":9000}]}"#;
+    let gh_hits = parse_github_json(gh, 5).unwrap();
+    assert_eq!(gh_hits.len(), 1);
+    assert_eq!(
+        gh_hits[0].url.as_str(),
+        "https://github.com/lightpanda-io/browser"
+    );
+    assert!(gh_hits[0].description.contains("Headless browser"));
+}
+
+#[test]
+fn site_filter_skips_specialized_engines_for_unrelated_site_queries() {
+    assert!(site_filter_allows(
+        "SQLite WAL mode",
+        &["stackoverflow.com"]
+    ));
+    assert!(site_filter_allows(
+        "site:stackoverflow.com rust async",
+        &["stackoverflow.com"]
+    ));
+    assert!(!site_filter_allows(
+        "site:estv.admin.ch MWST 2024",
+        &["stackoverflow.com"]
+    ));
+    assert!(!site_filter_allows(
+        "site:fedlex.admin.ch DSG",
+        &["wikipedia.org"]
+    ));
+    assert!(site_filter_allows(
+        "site:en.wikipedia.org HTTP 429",
+        &["wikipedia.org"]
+    ));
+}
