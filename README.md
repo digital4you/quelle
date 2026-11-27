@@ -77,8 +77,12 @@ Supply a finished search query or a list of known URLs. Both forms return page t
 | --- | --- | --- |
 | `query` | One of `query` or `urls` | Nonblank string containing the finished search query, up to 600 characters and 75 words. |
 | `urls` | One of `query` or `urls` | Array of 1–20 public HTTP(S) URL strings on standard ports to read directly. |
-| `limit` | No | Integer from 1 to 20, default 20. Caps the number of distinct search results or supplied URLs to read. |
+| `limit` | No | Integer from 1 to 20, default 20. Caps returned unique documents. Failed and duplicate candidates are replaced from the remaining pool. |
 | `language` | No | With `query` only: `de`, `fr`, `it` or `en`. The language hint for engines that take one, such as Brave or Wikipedia. Without it, Quelle guesses from common words and spelling and falls back to `de`. |
+| `candidateLimit` | No | With `query`: discovery pool size, from `limit` to 20, default 20. |
+| `selection` | No | With `query`: `engine` (default), `heuristic`, `rerank`, or `chat`. Model failures fall back to heuristic order and are reported in diagnostics. |
+| `preferredDomains` | No | With `query`: up to eight domain names to prioritize, including their subdomains. An explicit preference also overrides engine order. |
+| `followUp` | No | With `query`: default true. At most one extra site-restricted search when a preferred domain has no retrieved evidence. No expansion without preferred domains, or for an existing `site:` query. |
 
 To fetch known pages directly, pass `urls`. This makes zero search or model calls.
 
@@ -96,9 +100,15 @@ curl -sS http://127.0.0.1:3000/api/content \
   --data '{"query":"site:iana.org \"example domains\"","limit":3}'
 ```
 
-Quelle preserves case, whitespace, quoted phrases and search operators outside privacy redactions. Each engine interprets its own query syntax. For Brave, Quelle also disables spellcheck. Quelle reads distinct public URLs in the successful engine's result order, up to four at a time.
+Quelle preserves case, whitespace, quoted phrases and search operators outside privacy redactions. Each engine interprets its own query syntax. For Brave, Quelle also disables spellcheck. The default `selection: "engine"` preserves discovery order. Optional heuristic ordering uses engine rank as a prior, then query terms, requested dates/versions, matching language paths and preferred domains, with a modest host-diversity adjustment. Optional model and heuristic ranking both prioritize preferred domains, requested documentation versions, current documentation for unversioned requests and stable releases over unsolicited previews. These metadata preferences do not discard candidates or prove freshness. Quelle reads up to four candidates at a time and deduplicates tracking variants, redirect targets and near-identical extracted text.
 
-Read `sources[].content` for the page text and `sources[].metadata.url` for the final URL. Each source also has `metadata.title` and `metadata.truncated`. When the final URL differs, `requestedUrl` records the original. Successful sources follow input or search-result order. Individual failures appear in `errors` as objects with `url` and `error`. Partial success returns HTTP 200. If every read fails or discovery finds nothing, HTTP 422 includes `error: "no_readable_sources"` alongside both arrays.
+Read `sources[].content` for the page text and `sources[].metadata.url` for the final URL. Each source also has `metadata.title` and `metadata.truncated`. When the final URL differs, `requestedUrl` records the original. Successful sources follow input or selected candidate order; a recovered preferred source may replace the last result. Individual failures appear in `errors` as objects with `url` and `error`. `diagnostics` reports pool size, completed fetch attempts, duplicates, ranking time/fallback, follow-up and total time. Up to three speculative fetches may be cancelled once the result limit is reached. Partial success returns HTTP 200. If every read fails or discovery finds nothing, HTTP 422 includes `error: "no_readable_sources"` alongside both arrays.
+
+Hard failures have distinct codes: `not_found` (404/410), `authentication_required` (401/407), `rate_limited` (429) and `upstream_error` (5xx). They do not trigger browser escalation. A failed negotiated Markdown variant gets one HTML-only retry of the original URL; explicit Markdown URLs and ordinary HTML 404s remain failures. Renderable blocks can escalate through Lightpanda and the optional Chromium sidecar. Both extraction APIs reject recognized error documents, empty app shells, loading screens and unpopulated table components; short text alone is not proof of failure.
+
+For dedicated ranking, configure `QUELLE_RERANK_URL` with the complete `/rerank` endpoint and `QUELLE_RERANK_MODEL`. `QUELLE_RERANK_API_KEY` is optional; `QUELLE_RERANK_TIMEOUT_MS` defaults to 3000 (100–30000). The endpoint accepts public query text and bounded title/URL/snippet documents in the vLLM/Jina-style rerank contract. Content requests opt in using `selection: "rerank"`; answer requests use it instead of chat ranking when configured. `selection: "chat"` uses the configured answer model, bounded to five seconds. Malformed indices, duplicate indices, network failures and timeouts preserve every candidate in heuristic order. Rank scores are selection signals, not evidence.
+
+Identical concurrent discovery and page reads are coalesced. Full-text extraction has a bounded 16 MiB cache, tied to the raw response fingerprint and freshness. HTTP caches honor `no-store`, `private`, `no-cache` and `max-age`; expired bodies with ETag/Last-Modified can be conditionally refreshed. Redirects and fresh requests still undergo public-address validation and DNS pinning.
 
 ### Scrape mode · `POST /api/scrape`
 
@@ -148,8 +158,8 @@ curl -sS http://127.0.0.1:3000/api/extract \
 
 ### Page extraction
 
-- **HTML.** `/api/content` keeps readable text in document order, including headings, repeated values and footer contacts. It leaves out site navigation, search forms, the site banner, language switchers and skip links. A page that consists only of navigation keeps it. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
-- **JavaScript.** When static HTML looks like a script shell or an unrendered template, Quelle tries Lightpanda and reads the resulting DOM. If the page needs rendering and the browser is unavailable, its error code is `needs_js`.
+- **HTML.** `/api/content` emits clean structured Markdown in document order, including headings, lists, fenced code blocks with preserved indentation, Markdown data tables with captions and expanded row/column spans, flattened layout tables, link destinations with section anchors, collapsed ARIA accordion and tab-panel content, repeated values and footer contacts. It prefers a substantial main/article region and supplements public contact targets outside it. Both extraction APIs share charset decoding, invisible-character cleanup and document-quality checks. It leaves out site navigation, non-semantic sidebars and menus, search forms, the site banner, consent dialogs, language switchers and skip links. A static page that consists only of navigation keeps it. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
+- **JavaScript.** When static HTML looks like a script shell or an unrendered template, Quelle tries Lightpanda and reads the resulting DOM. Template examples inside code, preformatted text and other literal-example elements do not force rendering. The browser waits for populated content and tables, followed by 350 ms of main-content stability. A fully loaded document can use an 80 ms stability window when the activity observer reports no pending timers or asynchronous network work. Pending timers, observed asynchronous network work, modules and async scripts keep the longer window. Background network traffic does not need to stop. The default maximum wait remains seven seconds, followed by document-quality validation. If the page needs rendering and the browser is unavailable, its error code is `needs_js`.
 - **Documents.** Plain text retains line breaks. PDFs return their embedded text layer, up to 150 pages. Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files are converted to Markdown with [anydoc](https://github.com/firecrawl/anydoc).
 
 The output limit for `/api/content` is 2 MiB of UTF-8 text per source. `metadata.truncated` flags a byte or PDF page limit reached during extraction. A site can still require scrolling, pagination or a click to reveal additional content.
@@ -214,6 +224,7 @@ Set all three connection variables together to enable answer generation. Omit al
 | `QUELLE_OCR_URL` | None | Optional OCRia-nano-1 (LiteParse) CPU OCR sidecar endpoint (e.g. `http://127.0.0.1:3004/ocr`) used automatically for scanned PDFs that have no embedded text layer. |
 | `QUELLE_HOST_CONCURRENCY` | `2` | Maximum simultaneous requests per target host (1–16). |
 | `QUELLE_HOST_SPACING_MS` | `250` | Minimum delay in milliseconds between requests to the same host (0–10000). |
+| `QUELLE_RENDER_CONCURRENCY` | `4` | Maximum simultaneous browser render processes (Lightpanda or sidecar, 1–16). |
 
 ### Optional sidecars (`QUELLE_BROWSER_URL` & `QUELLE_OCR_URL`)
 
