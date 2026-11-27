@@ -2,14 +2,14 @@ use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
     process::Stdio,
-    sync::{LazyLock, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
     time::Duration,
 };
 
 use regex::Regex;
-use reqwest::{StatusCode, header};
+use reqwest::{StatusCode, cookie::Jar, header};
 use scraper::{Html, Selector};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::lookup_host,
@@ -19,11 +19,14 @@ use tokio::{
 };
 use url::{Host, Url};
 
-use crate::{client_builder, read_body, truncate};
+use crate::{politeness, read_body, truncate};
 
 mod clean;
+pub mod markdown;
 #[cfg(test)]
 mod tests;
+
+pub use markdown::{ExtractOptions, PageMeta};
 
 /// HTML beyond this is cut off and the prefix is parsed; long pages keep
 /// their opening content instead of failing.
@@ -32,13 +35,14 @@ const MAX_BLOCKS: usize = 3000;
 /// Candidate passages ranked per source; a spreadsheet or CSV can have
 /// thousands of rows.
 const MAX_PASSAGES: usize = 20_000;
-const MAX_REDIRECTS: usize = 3;
-const PAGE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REDIRECTS: usize = 8;
+const MAX_RETRIES: usize = 2;
+const PAGE_TIMEOUT: Duration = Duration::from_secs(10);
 const PASSAGE_BUDGET: usize = 6500;
 /// Official PDFs are larger and slower than HTML pages but often the
 /// primary source, so they get a bigger byte and time budget.
 const PDF_BYTES: usize = 12 * 1024 * 1024;
-const PDF_TIMEOUT: Duration = Duration::from_secs(8);
+const PDF_TIMEOUT: Duration = Duration::from_secs(12);
 const PDF_EXTRACT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Search answers rarely need more than the opening pages; this bounds
 /// extraction time for long reports.
@@ -46,10 +50,13 @@ const PDF_PAGES: &str = "150";
 const PDF_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
 static PDF_SUPPORT: OnceLock<bool> = OnceLock::new();
+static PROXY_URL: OnceLock<Option<String>> = OnceLock::new();
+static BROWSER_SIDECAR_URL: OnceLock<Option<Url>> = OnceLock::new();
+static OCR_SIDECAR_URL: OnceLock<Option<Url>> = OnceLock::new();
 
 /// Whole budget for one page: download, optional rendering and parsing.
-const FETCH_BUDGET: Duration = Duration::from_secs(15);
-const RENDER_TIMEOUT: Duration = Duration::from_secs(14);
+const FETCH_BUDGET: Duration = Duration::from_secs(25);
+const RENDER_TIMEOUT: Duration = Duration::from_secs(18);
 const FULL_TEXT_BYTES: usize = PAGE_BYTES;
 /// Pages with less readable text than this also get a rendering attempt.
 const THIN_PAGE: usize = 800;
@@ -58,6 +65,34 @@ static RENDER_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(
 static RENDERER: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
 /// Office and CSV conversions running at once. Each is CPU-bound.
 static DOCUMENT_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+
+pub fn set_proxy(proxy: Option<String>) {
+    let _ = PROXY_URL.set(proxy);
+}
+
+fn configured_proxy() -> Option<&'static str> {
+    PROXY_URL.get().and_then(Option::as_deref)
+}
+
+pub fn set_browser_sidecar(url: Option<Url>) {
+    let _ = BROWSER_SIDECAR_URL.set(url);
+}
+
+fn browser_sidecar() -> Option<&'static Url> {
+    BROWSER_SIDECAR_URL.get().and_then(Option::as_ref)
+}
+
+pub fn set_ocr_sidecar(url: Option<Url>) {
+    let _ = OCR_SIDECAR_URL.set(url);
+}
+
+fn ocr_sidecar() -> Option<&'static Url> {
+    OCR_SIDECAR_URL.get().and_then(Option::as_ref)
+}
+
+fn any_renderer_enabled() -> bool {
+    render_enabled() || browser_sidecar().is_some()
+}
 /// Reserved ranges blocked in addition to Lightpanda's private networks.
 const BLOCKED_RANGES: &[&str] = &[
     "0.0.0.0/8",
@@ -116,7 +151,9 @@ fn render_enabled() -> bool {
 /// A current desktop browser identity. Many sites serve reduced or blocked
 /// pages to unknown clients; explicit bot challenges are still respected.
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-     (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36";
+     (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
+const DEFAULT_SEC_CH_UA: &str =
+    r#""Chromium";v="136", "Google Chrome";v="136", "Not.A/Brand";v="99""#;
 static USER_AGENT: OnceLock<header::HeaderValue> = OnceLock::new();
 
 pub fn set_user_agent(value: header::HeaderValue) {
@@ -125,8 +162,8 @@ pub fn set_user_agent(value: header::HeaderValue) {
 
 /// Wikimedia asks automated clients to identify themselves and throttles
 /// browser-like ones (HTTP 429), so its sites get an honest identity.
-fn user_agent_for(url: &Url) -> header::HeaderValue {
-    let wikimedia = url.host_str().is_some_and(|host| {
+fn is_wikimedia(url: &Url) -> bool {
+    url.host_str().is_some_and(|host| {
         [
             "wikipedia.org",
             "wikimedia.org",
@@ -142,11 +179,18 @@ fn user_agent_for(url: &Url) -> header::HeaderValue {
         ]
         .iter()
         .any(|domain| host == *domain || host.ends_with(&format!(".{domain}")))
-    });
-    if wikimedia {
-        header::HeaderValue::from_static(HONEST_AGENT)
+    })
+}
+
+fn user_agent_for(url: &Url) -> (header::HeaderValue, bool) {
+    if is_wikimedia(url) {
+        (header::HeaderValue::from_static(HONEST_AGENT), false)
     } else {
-        user_agent()
+        let ua = user_agent();
+        let browser_like = ua
+            .to_str()
+            .is_ok_and(|s| s.contains("Chrome/") && s.contains("Mozilla/5.0"));
+        (ua, browser_like)
     }
 }
 
@@ -306,6 +350,9 @@ fn matches_keyword(word: &str, keyword: &str) -> bool {
 enum Kind {
     Html,
     Text,
+    Markdown,
+    Json,
+    Feed,
     Pdf,
     /// Office, OpenDocument, RTF, EPUB or CSV, converted with anydoc. The
     /// format is named for CSV, which has no signature, and otherwise
@@ -476,44 +523,102 @@ async fn read_page(
     Ok((data, false))
 }
 
-async fn download(mut url: Url) -> Result<(Url, Vec<u8>, Option<String>, Kind, bool), PageError> {
-    let started = Instant::now();
+fn page_client_builder(jar: Arc<Jar>) -> Result<reqwest::ClientBuilder, PageError> {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .connect_timeout(Duration::from_secs(5))
+        .cookie_provider(jar);
+    if let Some(proxy_url) = configured_proxy() {
+        let proxy = reqwest::Proxy::all(proxy_url).map_err(|_| PageError::Transport)?;
+        builder = builder.proxy(proxy);
+    } else {
+        builder = builder.no_proxy();
+    }
+    Ok(builder)
+}
+
+fn apply_page_headers(
+    mut req: reqwest::RequestBuilder,
+    url: &Url,
+    accept: &'static str,
+    force_honest: bool,
+) -> reqwest::RequestBuilder {
+    let (ua, browser_like) = if force_honest {
+        (header::HeaderValue::from_static(HONEST_AGENT), false)
+    } else {
+        user_agent_for(url)
+    };
+    req = req
+        .header(header::ACCEPT, accept)
+        .header(
+            header::ACCEPT_LANGUAGE,
+            "de-CH,de;q=0.9,fr-CH;q=0.8,fr;q=0.7,it;q=0.6,en;q=0.5",
+        )
+        .header(header::USER_AGENT, ua);
+    if browser_like {
+        req = req
+            .header("sec-ch-ua", DEFAULT_SEC_CH_UA)
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", r#""Windows""#)
+            .header("sec-fetch-dest", "document")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-site", "none")
+            .header("sec-fetch-user", "?1")
+            .header("upgrade-insecure-requests", "1");
+    }
+    req
+}
+
+async fn resolve_public_addrs(url: &Url) -> Result<Option<(String, Vec<SocketAddr>)>, PageError> {
+    let Some(Host::Domain(host)) = url.host() else {
+        return Ok(None);
+    };
+    let port = url.port_or_known_default().ok_or(PageError::Target)?;
+    // The trailing dot makes the name absolute, so resolver search
+    // domains (Kubernetes adds `<namespace>.svc.cluster.local` and
+    // others) cannot turn a public-looking name into a cluster one.
+    let absolute = format!("{}.", host.trim_end_matches('.'));
+    let addresses: Vec<SocketAddr> = lookup_host((absolute.as_str(), port))
+        .await
+        .map_err(|_| PageError::Transport)?
+        .collect();
+    if addresses.is_empty() || !addresses.iter().all(|addr| public_address(addr.ip())) {
+        return Err(PageError::Target);
+    }
+    Ok(Some((host.to_owned(), addresses)))
+}
+
+/// Lightweight raw download (used by robots.txt and sitemap.xml discovery)
+/// using the same SSRF checks, HTTP/2, cookie jar, and per-host politeness.
+pub async fn download_raw(
+    mut url: Url,
+    max_bytes: usize,
+    deadline: Instant,
+) -> Result<(Url, u16, Option<String>, Vec<u8>), PageError> {
+    url = public_url(url)?;
+    let jar = Arc::new(Jar::default());
     for step in 0..=MAX_REDIRECTS {
-        let mut client = client_builder();
-        if let Some(Host::Domain(host)) = url.host() {
-            let port = url.port_or_known_default().ok_or(PageError::Target)?;
-            // The trailing dot makes the name absolute, so resolver search
-            // domains (Kubernetes adds `<namespace>.svc.cluster.local` and
-            // others) cannot turn a public-looking name into a cluster one.
-            let absolute = format!("{}.", host.trim_end_matches('.'));
-            let addresses: Vec<SocketAddr> = lookup_host((absolute.as_str(), port))
-                .await
-                .map_err(|_| PageError::Transport)?
-                .collect();
-            if addresses.is_empty() || !addresses.iter().all(|addr| public_address(addr.ip())) {
-                return Err(PageError::Target);
-            }
-            client = client.resolve_to_addrs(host, &addresses);
+        let host_key = url.host_str().unwrap_or_default().to_owned();
+        let _host_permit = politeness::global()
+            .acquire(&host_key, deadline)
+            .await
+            .ok_or(PageError::Timeout)?;
+        let resolved = resolve_public_addrs(&url).await?;
+        let mut builder = page_client_builder(Arc::clone(&jar))?;
+        if let Some((host, addrs)) = &resolved
+            && configured_proxy().is_none()
+        {
+            builder = builder.resolve_to_addrs(host, addrs);
         }
-        let response = client
-            .build()
-            .map_err(|_| PageError::Transport)?
-            .get(url.clone())
-            .header(
-                header::ACCEPT,
-                if pdf_enabled() {
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf;q=0.8,text/plain;q=0.5,*/*;q=0.1"
-                } else {
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.5,*/*;q=0.1"
-                },
-            )
-            .header(
-                header::ACCEPT_LANGUAGE,
-                "de-CH,de;q=0.9,fr-CH;q=0.8,fr;q=0.7,it;q=0.6,en;q=0.5",
-            )
-            .header(header::USER_AGENT, user_agent_for(&url))
-            .send();
-        let response = tokio::time::timeout_at(started + PAGE_TIMEOUT, response)
+        let client = builder.build().map_err(|_| PageError::Transport)?;
+        let req = apply_page_headers(
+            client.get(url.clone()),
+            &url,
+            "text/plain,application/xml,text/xml,*/*;q=0.5",
+            true,
+        );
+        let response = tokio::time::timeout_at(deadline.min(Instant::now() + PAGE_TIMEOUT), req.send())
             .await
             .map_err(|_| PageError::Timeout)?
             .map_err(|_| PageError::Transport)?;
@@ -531,32 +636,180 @@ async fn download(mut url: Url) -> Result<(Url, Vec<u8>, Option<String>, Kind, b
             let location = response
                 .headers()
                 .get(header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or(PageError::Blocked)?;
+            url = public_url(url.join(location).map_err(|_| PageError::Target)?)?;
+            continue;
+        }
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_ascii_lowercase);
+        if !response.status().is_success() {
+            return Err(if status == 404 {
+                PageError::Unreadable
+            } else {
+                PageError::Blocked
+            });
+        }
+        let (bytes, _) = tokio::time::timeout_at(
+            deadline.min(Instant::now() + PAGE_TIMEOUT),
+            read_page(response, max_bytes, false),
+        )
+        .await
+        .map_err(|_| PageError::Timeout)?
+        .map_err(|e| match e {
+            crate::BodyError::TooLarge => PageError::TooLarge,
+            _ => PageError::Transport,
+        })?;
+        return Ok((url, status, content_type, bytes));
+    }
+    Err(PageError::Blocked)
+}
+
+struct Downloaded {
+    url: Url,
+    status: u16,
+    bytes: Vec<u8>,
+    content_type: Option<String>,
+    kind: Kind,
+    truncated: bool,
+}
+
+async fn download(
+    initial_url: Url,
+    deadline: Instant,
+    cache_max_age: Duration,
+) -> Result<Downloaded, PageError> {
+    if let Some(cached) = politeness::global().cache_get(&initial_url, cache_max_age) {
+        return classify_download(
+            cached.final_url,
+            cached.status,
+            cached.content_type,
+            cached.bytes,
+            cached.truncated,
+        );
+    }
+
+    let jar = Arc::new(Jar::default());
+    let mut url = initial_url.clone();
+    let mut retries = 0usize;
+    let initial_host = initial_url.host_str().unwrap_or_default().to_owned();
+    let mut force_honest =
+        politeness::global().preferred_tier(&initial_host) == Some(politeness::FetchTier::HonestHttp);
+    let mut tried_honest = force_honest;
+
+    for step in 0..=(MAX_REDIRECTS + MAX_RETRIES + 1) {
+        let host_key = url.host_str().unwrap_or_default().to_owned();
+        let _host_permit = politeness::global()
+            .acquire(&host_key, deadline)
+            .await
+            .ok_or(PageError::Timeout)?;
+
+        let resolved = resolve_public_addrs(&url).await?;
+        let mut builder = page_client_builder(Arc::clone(&jar))?;
+        if let Some((host, addrs)) = &resolved
+            && configured_proxy().is_none()
+        {
+            builder = builder.resolve_to_addrs(host, addrs);
+        }
+        let client = builder.build().map_err(|_| PageError::Transport)?;
+        let accept = if pdf_enabled() {
+            "text/html,application/xhtml+xml,text/markdown;q=0.95,application/xml;q=0.9,application/rss+xml;q=0.8,application/atom+xml;q=0.8,application/pdf;q=0.8,application/json;q=0.7,text/plain;q=0.5,*/*;q=0.1"
+        } else {
+            "text/html,application/xhtml+xml,text/markdown;q=0.95,application/xml;q=0.9,application/rss+xml;q=0.8,application/atom+xml;q=0.8,application/json;q=0.7,text/plain;q=0.5,*/*;q=0.1"
+        };
+        let response = apply_page_headers(client.get(url.clone()), &url, accept, force_honest).send();
+        let step_deadline = deadline.min(Instant::now() + PAGE_TIMEOUT);
+        let response = match tokio::time::timeout_at(step_deadline, response).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(_)) => return Err(PageError::Transport),
+            Err(_) => return Err(PageError::Timeout),
+        };
+        if matches!(
+            response.status(),
+            StatusCode::MOVED_PERMANENTLY
+                | StatusCode::FOUND
+                | StatusCode::SEE_OTHER
+                | StatusCode::TEMPORARY_REDIRECT
+                | StatusCode::PERMANENT_REDIRECT
+        ) {
+            if step > MAX_REDIRECTS {
+                return Err(PageError::Blocked);
+            }
+            let location = response
+                .headers()
+                .get(header::LOCATION)
                 .and_then(|value| value.to_str().ok())
                 .ok_or(PageError::Blocked)?;
             url = public_url(url.join(location).map_err(|_| PageError::Target)?)?;
             continue;
         }
-        if !response.status().is_success()
-            || response
-                .headers()
-                .get("cf-mitigated")
-                .is_some_and(|value| value == "challenge")
+        if matches!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        ) && retries < MAX_RETRIES
         {
-            tracing::info!(stage = "page_refused", status = response.status().as_u16());
+            let wait = politeness::jitter(politeness::parse_retry_after(
+                response.headers(),
+                Duration::from_secs(2u64 << retries),
+            ));
+            politeness::global().record_throttle(&host_key, wait);
+            retries += 1;
+            let resume_at = Instant::now() + wait;
+            if resume_at < deadline {
+                drop(_host_permit);
+                tokio::time::sleep_until(resume_at).await;
+                continue;
+            }
+        }
+        let is_cf_challenge = response
+            .headers()
+            .get("cf-mitigated")
+            .is_some_and(|value| value == "challenge");
+        // Escalation step 1: Akamai/Fastly/gov WAFs often reject non-Chrome TLS
+        // claiming to be Chrome (`sec-ch-ua` + `rustls`), while allowing honest
+        // HTTP clients. Retry once with an honest identity before escalating.
+        if response.status() == StatusCode::FORBIDDEN && !is_cf_challenge && !tried_honest {
+            tracing::info!(
+                stage = "escalate_honest_http",
+                host = url.host_str(),
+                status = 403
+            );
+            force_honest = true;
+            tried_honest = true;
+            continue;
+        }
+        if !response.status().is_success() || is_cf_challenge {
+            tracing::info!(
+                stage = "page_refused",
+                host = url.host_str(),
+                status = response.status().as_u16()
+            );
             return Err(PageError::Blocked);
         }
+        if force_honest && !is_wikimedia(&url) {
+            politeness::global().record_tier(&host_key, politeness::FetchTier::HonestHttp);
+        }
+        let status = response.status().as_u16();
         let content_type = response
             .headers()
             .get(header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_ascii_lowercase);
         let pdf_path = url.path().to_ascii_lowercase().ends_with(".pdf");
-        // `None` means sniff the body: missing or generic binary types.
         let declared = match content_type
             .as_deref()
             .map(|value| value.split(';').next().unwrap_or_default().trim())
         {
             Some("text/html" | "application/xhtml+xml") => Some(Kind::Html),
+            Some("text/markdown" | "text/x-markdown") => Some(Kind::Markdown),
+            Some("application/json") | Some("application/ld+json") => Some(Kind::Json),
+            Some("application/rss+xml" | "application/atom+xml" | "text/xml" | "application/xml") => {
+                Some(Kind::Feed)
+            }
             Some("text/plain") => Some(Kind::Text),
             Some("application/pdf" | "application/x-pdf") if pdf_enabled() => Some(Kind::Pdf),
             Some("text/csv") => Some(Kind::Document(Some(anydoc::Format::Csv))),
@@ -581,7 +834,7 @@ async fn download(mut url: Url) -> Result<(Url, Vec<u8>, Option<String>, Kind, b
             (PAGE_BYTES, PAGE_TIMEOUT)
         };
         let (bytes, truncated) = tokio::time::timeout_at(
-            started + budget,
+            deadline.min(Instant::now() + budget),
             read_page(response, limit, !maybe_pdf && !maybe_document),
         )
         .await
@@ -590,23 +843,155 @@ async fn download(mut url: Url) -> Result<(Url, Vec<u8>, Option<String>, Kind, b
             crate::BodyError::TooLarge => PageError::TooLarge,
             _ => PageError::Transport,
         })?;
-        let is_pdf = bytes.starts_with(b"%PDF-");
-        let kind = match declared {
-            Some(Kind::Pdf) if !is_pdf => return Err(PageError::Unreadable),
-            Some(kind) => kind,
-            None if is_pdf && pdf_enabled() => Kind::Pdf,
-            None if maybe_pdf => return Err(PageError::Unsupported),
-            None => match anydoc::Format::from_bytes(&bytes) {
-                Some(anydoc::Format::Pdf) => return Err(PageError::Unsupported),
-                Some(format) => Kind::Document(Some(format)),
-                None if extension == "csv" => Kind::Document(Some(anydoc::Format::Csv)),
-                None if maybe_document => return Err(PageError::Unsupported),
-                None => Kind::Html,
+
+        let result = classify_download(url.clone(), status, content_type.clone(), bytes.clone(), truncated)?;
+        politeness::global().cache_put(
+            &initial_url,
+            politeness::CachedResponse {
+                final_url: url,
+                status,
+                content_type,
+                bytes,
+                truncated,
             },
-        };
-        return Ok((url, bytes, content_type, kind, truncated));
+        );
+        return Ok(result);
     }
     Err(PageError::Blocked)
+}
+
+fn classify_download(
+    url: Url,
+    status: u16,
+    content_type: Option<String>,
+    bytes: Vec<u8>,
+    truncated: bool,
+) -> Result<Downloaded, PageError> {
+    let pdf_path = url.path().to_ascii_lowercase().ends_with(".pdf");
+    let declared = match content_type
+        .as_deref()
+        .map(|value| value.split(';').next().unwrap_or_default().trim())
+    {
+        Some("text/html" | "application/xhtml+xml") => Some(Kind::Html),
+        Some("text/markdown" | "text/x-markdown") => Some(Kind::Markdown),
+        Some("application/json") | Some("application/ld+json") => Some(Kind::Json),
+        Some("application/rss+xml" | "application/atom+xml" | "text/xml" | "application/xml") => {
+            Some(Kind::Feed)
+        }
+        Some("text/plain") => Some(Kind::Text),
+        Some("application/pdf" | "application/x-pdf") if pdf_enabled() => Some(Kind::Pdf),
+        Some("text/csv") => Some(Kind::Document(Some(anydoc::Format::Csv))),
+        Some(media) if document_media(media) => Some(Kind::Document(None)),
+        None | Some("application/octet-stream" | "binary/octet-stream") => None,
+        _ => return Err(PageError::Unsupported),
+    };
+    let extension = url
+        .path()
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    let document_path = anydoc::Format::from_extension(&extension)
+        .is_some_and(|format| format != anydoc::Format::Pdf);
+    let maybe_pdf =
+        matches!(declared, Some(Kind::Pdf)) || (declared.is_none() && pdf_enabled() && pdf_path);
+    let maybe_document =
+        matches!(declared, Some(Kind::Document(_))) || (declared.is_none() && document_path);
+    let is_pdf = bytes.starts_with(b"%PDF-");
+    let kind = match declared {
+        Some(Kind::Pdf) if !is_pdf => return Err(PageError::Unreadable),
+        Some(Kind::Text) if matches!(extension.as_str(), "md" | "markdown") => Kind::Markdown,
+        Some(Kind::Feed) => {
+            // Distinguish RSS/Atom feeds from generic XHTML/HTML served as text/xml.
+            let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]).to_ascii_lowercase();
+            if head.contains("<rss") || head.contains("<feed") || head.contains("<rdf:rdf") {
+                Kind::Feed
+            } else if head.contains("<html") {
+                Kind::Html
+            } else {
+                Kind::Text
+            }
+        }
+        Some(kind) => kind,
+        None if is_pdf && pdf_enabled() => Kind::Pdf,
+        None if maybe_pdf => return Err(PageError::Unsupported),
+        None => match anydoc::Format::from_bytes(&bytes) {
+            Some(anydoc::Format::Pdf) => return Err(PageError::Unsupported),
+            Some(format) => Kind::Document(Some(format)),
+            None if extension == "csv" => Kind::Document(Some(anydoc::Format::Csv)),
+            None if matches!(extension.as_str(), "md" | "markdown") => Kind::Markdown,
+            None if extension == "json" => Kind::Json,
+            None if maybe_document => return Err(PageError::Unsupported),
+            None => Kind::Html,
+        },
+    };
+    Ok(Downloaded {
+        url,
+        status,
+        bytes,
+        content_type,
+        kind,
+        truncated,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RenderMode {
+    #[default]
+    Auto,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    Markdown,
+    Text,
+    Html,
+    Links,
+}
+
+#[derive(Clone, Debug)]
+pub struct ScrapeOptions {
+    pub formats: Vec<OutputFormat>,
+    pub extract: ExtractOptions,
+    pub render: RenderMode,
+    pub wait_for_ms: Option<u64>,
+    pub cache_max_age: Duration,
+}
+
+impl Default for ScrapeOptions {
+    fn default() -> Self {
+        Self {
+            formats: vec![OutputFormat::Markdown],
+            extract: ExtractOptions::default(),
+            render: RenderMode::Auto,
+            wait_for_ms: None,
+            cache_max_age: Duration::from_secs(5 * 60),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrapedPage {
+    pub url: Url,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_url: Option<Url>,
+    pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub html: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub links: Option<Vec<Url>>,
+    pub metadata: PageMeta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retrieval: Option<&'static str>,
+    pub truncated: bool,
 }
 
 pub async fn fetch(
@@ -618,15 +1003,12 @@ pub async fn fetch(
     let _permit = permit;
     let deadline = deadline.min(Instant::now() + FETCH_BUDGET);
     tokio::time::timeout_at(deadline, async {
-        let (url, bytes, content_type, kind, cut) = download(export_url(url)).await?;
-        match kind {
-            Kind::Pdf => return pdf(url, &bytes, relevance).await,
-            Kind::Document(format) => return document(url, bytes, format, relevance).await,
-            Kind::Html | Kind::Text => {}
-        }
-        let is_html = matches!(kind, Kind::Html);
+        let target = export_url(url);
+        let host_key = target.host_str().unwrap_or_default().to_owned();
+        let preferred = politeness::global().preferred_tier(&host_key);
+
         let rendered = |url: Url, threshold| async move {
-            let (html, cut) = render(&url, threshold).await?;
+            let (html, cut, tier) = render_with_fallback(&url, threshold, None, deadline).await?;
             let mut source = parse(
                 url,
                 html,
@@ -635,10 +1017,65 @@ pub async fn fetch(
                 true,
             )
             .await?;
-            source.metadata.retrieval = Some("rendered");
+            source.metadata.retrieval = Some(match tier {
+                politeness::FetchTier::Sidecar => "sidecar",
+                _ => "rendered",
+            });
             source.mark_truncated(cut);
-            Ok::<_, PageError>(source)
+            Ok::<_, PageError>((source, tier))
         };
+
+        // If this host already required rendering earlier, skip the wasted 403.
+        if matches!(
+            preferred,
+            Some(politeness::FetchTier::Rendered | politeness::FetchTier::Sidecar)
+        ) && any_renderer_enabled()
+            && let Ok((source, _)) = rendered(target.clone(), 300).await
+        {
+            return Ok(source);
+        }
+
+        let downloaded = match download(target.clone(), deadline, Duration::from_secs(5 * 60)).await
+        {
+            Ok(d) => d,
+            Err(PageError::Blocked) if any_renderer_enabled() => {
+                tracing::info!(
+                    stage = "escalate_browser_on_block",
+                    host = target.host_str()
+                );
+                let (source, tier) = rendered(target, 300).await?;
+                politeness::global().record_tier(&host_key, tier);
+                return Ok(source);
+            }
+            Err(e) => return Err(e),
+        };
+        let Downloaded {
+            url,
+            bytes,
+            content_type,
+            kind,
+            truncated: cut,
+            ..
+        } = downloaded;
+        match kind {
+            Kind::Pdf => return pdf_or_ocr(url, &bytes, relevance, deadline).await,
+            Kind::Document(format) => return document(url, bytes, format, relevance).await,
+            Kind::Markdown => {
+                let decoded = decode_bytes(&bytes, content_type.as_deref());
+                return text_source(url, decoded, "markdown", relevance);
+            }
+            Kind::Json => {
+                let decoded = pretty_json_bytes(&bytes, content_type.as_deref());
+                return text_source(url, decoded, "json", relevance);
+            }
+            Kind::Feed => {
+                let decoded = decode_bytes(&bytes, content_type.as_deref());
+                let md = feed_to_markdown(&decoded, &url);
+                return text_source(url, md, "feed", relevance);
+            }
+            Kind::Html | Kind::Text => {}
+        }
+        let is_html = matches!(kind, Kind::Html);
         static SCRIPT: LazyLock<regex::bytes::Regex> =
             LazyLock::new(|| regex::bytes::Regex::new(r"(?i)<script[\s>]").expect("script tag"));
         let has_script = is_html && SCRIPT.is_match(&bytes);
@@ -647,9 +1084,9 @@ pub async fn fetch(
             // almost no readable text; the rendered result is kept only when
             // it carries more.
             Err(error @ (PageError::NeedsJs | PageError::Unreadable))
-                if has_script && render_enabled() =>
+                if has_script && any_renderer_enabled() =>
             {
-                rendered(
+                let (source, _) = rendered(
                     url,
                     if matches!(error, PageError::NeedsJs) {
                         3000
@@ -657,7 +1094,8 @@ pub async fn fetch(
                         300
                     },
                 )
-                .await
+                .await?;
+                Ok(source)
             }
             Err(PageError::NeedsJs) => {
                 tracing::info!(stage = "needs_js", host = url.host_str());
@@ -666,13 +1104,13 @@ pub async fn fetch(
             Ok(mut source) => {
                 source.mark_truncated(cut);
                 let length = source.content.chars().count();
-                if has_script && render_enabled() && length < THIN_PAGE {
+                if has_script && any_renderer_enabled() && length < THIN_PAGE {
                     // Give back the static text even if the speculative render stalls.
                     let mut stop = deadline - Duration::from_millis(150);
                     if length >= 300 {
                         stop = stop.min(Instant::now() + Duration::from_secs(2));
                     }
-                    if let Ok(Ok(better)) =
+                    if let Ok(Ok((better, _))) =
                         tokio::time::timeout_at(stop, rendered(url, length + 120)).await
                         && better.content.chars().count() > length
                     {
@@ -686,6 +1124,410 @@ pub async fn fetch(
     })
     .await
     .map_err(|_| PageError::Timeout)?
+}
+
+/// Firecrawl/Crawl4AI-style rich scrape: returns clean Markdown, plain text,
+/// raw HTML, extracted links, and metadata in a single pass.
+pub async fn scrape(
+    requested: Url,
+    options: &ScrapeOptions,
+    permit: OwnedSemaphorePermit,
+    deadline: Instant,
+) -> Result<ScrapedPage, PageError> {
+    let _permit = permit;
+    let deadline = deadline.min(Instant::now() + FETCH_BUDGET);
+    let options = options.clone();
+    tokio::time::timeout_at(deadline, async move {
+        let want_md = options.formats.contains(&OutputFormat::Markdown);
+        let want_text = options.formats.contains(&OutputFormat::Text);
+        let want_html = options.formats.contains(&OutputFormat::Html);
+        let want_links = options.formats.contains(&OutputFormat::Links);
+
+        let target = export_url(requested.clone());
+        let host_key = target.host_str().unwrap_or_default().to_owned();
+        let preferred = politeness::global().preferred_tier(&host_key);
+
+        let render_to_page = |u: Url, threshold: usize| {
+            let req = requested.clone();
+            let opts = options.clone();
+            async move {
+                let (html_bytes, cut, tier) =
+                    render_with_fallback(&u, threshold, opts.wait_for_ms, deadline).await?;
+                let retrieval = match tier {
+                    politeness::FetchTier::Sidecar => Some("sidecar"),
+                    _ => Some("rendered"),
+                };
+                let page = build_scraped_html(
+                    u,
+                    req,
+                    200,
+                    Some("text/html; charset=utf-8".to_owned()),
+                    html_bytes,
+                    cut,
+                    retrieval,
+                    &opts,
+                    want_md,
+                    want_text,
+                    want_html,
+                    want_links,
+                )
+                .await?;
+                Ok::<_, PageError>((page, tier))
+            }
+        };
+
+        if options.render == RenderMode::Always {
+            let clean_target = public_url(requested.clone())?;
+            let (page, _) = render_to_page(clean_target, 300).await?;
+            return Ok(page);
+        }
+
+        if options.render == RenderMode::Auto
+            && any_renderer_enabled()
+            && matches!(
+                preferred,
+                Some(politeness::FetchTier::Rendered | politeness::FetchTier::Sidecar)
+            )
+            && let Ok((page, _)) = render_to_page(target.clone(), 300).await
+        {
+            return Ok(page);
+        }
+
+        let downloaded = match download(target.clone(), deadline, options.cache_max_age).await {
+            Ok(d) => d,
+            Err(PageError::Blocked)
+                if options.render != RenderMode::Never && any_renderer_enabled() =>
+            {
+                tracing::info!(
+                    stage = "escalate_browser_on_block",
+                    host = target.host_str()
+                );
+                let (page, tier) = render_to_page(target, 300).await?;
+                politeness::global().record_tier(&host_key, tier);
+                return Ok(page);
+            }
+            Err(e) => return Err(e),
+        };
+        let Downloaded {
+            url,
+            status,
+            bytes,
+            content_type,
+            kind,
+            truncated: cut,
+        } = downloaded;
+
+        match kind {
+            Kind::Pdf => {
+                let src = pdf_or_ocr(url.clone(), &bytes, None, deadline).await?;
+                let meta = PageMeta {
+                    status_code: Some(status),
+                    content_type,
+                    ..Default::default()
+                };
+                return Ok(ScrapedPage {
+                    requested_url: (url != requested).then_some(requested),
+                    url,
+                    title: src.metadata.title,
+                    markdown: want_md.then(|| src.content.clone()),
+                    text: want_text.then_some(src.content),
+                    html: None,
+                    links: want_links.then(Vec::new),
+                    metadata: meta,
+                    retrieval: src.metadata.retrieval.or(Some("pdf")),
+                    truncated: src.metadata.truncated.unwrap_or(false),
+                });
+            }
+            Kind::Document(format) => {
+                let src = document(url.clone(), bytes, format, None).await?;
+                let meta = PageMeta {
+                    status_code: Some(status),
+                    content_type,
+                    ..Default::default()
+                };
+                return Ok(ScrapedPage {
+                    requested_url: (url != requested).then_some(requested),
+                    url,
+                    title: src.metadata.title,
+                    markdown: want_md.then(|| src.content.clone()),
+                    text: want_text.then_some(src.content),
+                    html: None,
+                    links: want_links.then(Vec::new),
+                    metadata: meta,
+                    retrieval: Some("document"),
+                    truncated: src.metadata.truncated.unwrap_or(false),
+                });
+            }
+            Kind::Markdown => {
+                let decoded = decode_bytes(&bytes, content_type.as_deref());
+                let title = first_markdown_heading(&decoded)
+                    .unwrap_or_else(|| pdf_name(&url));
+                let meta = PageMeta {
+                    status_code: Some(status),
+                    content_type,
+                    ..Default::default()
+                };
+                return Ok(ScrapedPage {
+                    requested_url: (url != requested).then_some(requested),
+                    url,
+                    title,
+                    markdown: want_md.then(|| decoded.clone()),
+                    text: want_text.then_some(decoded),
+                    html: None,
+                    links: want_links.then(Vec::new),
+                    metadata: meta,
+                    retrieval: Some("markdown"),
+                    truncated: cut,
+                });
+            }
+            Kind::Json => {
+                let decoded = pretty_json_bytes(&bytes, content_type.as_deref());
+                let title = url.host_str().unwrap_or("JSON document").to_owned();
+                let meta = PageMeta {
+                    status_code: Some(status),
+                    content_type,
+                    ..Default::default()
+                };
+                return Ok(ScrapedPage {
+                    requested_url: (url != requested).then_some(requested),
+                    url,
+                    title,
+                    markdown: want_md.then(|| format!("```json\n{decoded}\n```")),
+                    text: want_text.then_some(decoded),
+                    html: None,
+                    links: want_links.then(Vec::new),
+                    metadata: meta,
+                    retrieval: Some("json"),
+                    truncated: cut,
+                });
+            }
+            Kind::Feed => {
+                let decoded = decode_bytes(&bytes, content_type.as_deref());
+                let (title, md, feed_links) = parse_feed(&decoded, &url);
+                let meta = PageMeta {
+                    status_code: Some(status),
+                    content_type,
+                    ..Default::default()
+                };
+                return Ok(ScrapedPage {
+                    requested_url: (url != requested).then_some(requested),
+                    url,
+                    title,
+                    markdown: want_md.then(|| md.clone()),
+                    text: want_text.then_some(md),
+                    html: None,
+                    links: want_links.then_some(feed_links),
+                    metadata: meta,
+                    retrieval: Some("feed"),
+                    truncated: cut,
+                });
+            }
+            Kind::Text => {
+                let decoded = decode_bytes(&bytes, content_type.as_deref());
+                let title = url.host_str().unwrap_or("Text document").to_owned();
+                let meta = PageMeta {
+                    status_code: Some(status),
+                    content_type,
+                    ..Default::default()
+                };
+                return Ok(ScrapedPage {
+                    requested_url: (url != requested).then_some(requested),
+                    url,
+                    title,
+                    markdown: want_md.then(|| decoded.clone()),
+                    text: want_text.then_some(decoded),
+                    html: None,
+                    links: want_links.then(Vec::new),
+                    metadata: meta,
+                    retrieval: Some("text"),
+                    truncated: cut,
+                });
+            }
+            Kind::Html => {}
+        }
+
+        static SCRIPT: LazyLock<regex::bytes::Regex> =
+            LazyLock::new(|| regex::bytes::Regex::new(r"(?i)<script[\s>]").expect("script tag"));
+        let has_script = SCRIPT.is_match(&bytes);
+
+        let static_res = build_scraped_html(
+            url.clone(),
+            requested.clone(),
+            status,
+            content_type.clone(),
+            bytes,
+            cut,
+            None,
+            &options,
+            want_md,
+            want_text,
+            want_html,
+            want_links,
+        )
+        .await;
+
+        if options.render == RenderMode::Never || !any_renderer_enabled() {
+            return static_res;
+        }
+
+        match static_res {
+            Err(error @ (PageError::NeedsJs | PageError::Unreadable | PageError::Blocked))
+                if has_script || matches!(error, PageError::Blocked) =>
+            {
+                let threshold = if matches!(error, PageError::NeedsJs) {
+                    3000
+                } else {
+                    300
+                };
+                let (page, tier) = render_to_page(url, threshold).await?;
+                if matches!(error, PageError::Blocked) {
+                    politeness::global().record_tier(&host_key, tier);
+                }
+                Ok(page)
+            }
+            Ok(page) if has_script => {
+                let primary_len = page
+                    .markdown
+                    .as_deref()
+                    .or(page.text.as_deref())
+                    .map_or(0, |s| s.chars().count());
+                if primary_len < THIN_PAGE {
+                    let mut stop = deadline - Duration::from_millis(150);
+                    if primary_len >= 300 {
+                        stop = stop.min(Instant::now() + Duration::from_secs(3));
+                    }
+                    if let Ok(Ok((better, _))) =
+                        tokio::time::timeout_at(stop, render_to_page(url, primary_len + 120)).await
+                    {
+                        let better_len = better
+                            .markdown
+                            .as_deref()
+                            .or(better.text.as_deref())
+                            .map_or(0, |s| s.chars().count());
+                        if better_len > primary_len {
+                            return Ok(better);
+                        }
+                    }
+                }
+                Ok(page)
+            }
+            other => other,
+        }
+    })
+    .await
+    .map_err(|_| PageError::Timeout)?
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn build_scraped_html(
+    url: Url,
+    requested: Url,
+    status: u16,
+    content_type: Option<String>,
+    bytes: Vec<u8>,
+    cut: bool,
+    retrieval: Option<&'static str>,
+    options: &ScrapeOptions,
+    want_md: bool,
+    want_text: bool,
+    want_html: bool,
+    want_links: bool,
+) -> Result<ScrapedPage, PageError> {
+    let extract_opts = options.extract.clone();
+    let rendered = retrieval == Some("rendered");
+    tokio::task::spawn_blocking(move || {
+        let decoded = decode_bytes(&bytes, content_type.as_deref());
+        let document = Html::parse_document(&decoded);
+        static TITLE: LazyLock<Selector> =
+            LazyLock::new(|| Selector::parse("title").expect("title selector"));
+        static CHALLENGE: LazyLock<Selector> = LazyLock::new(|| {
+            Selector::parse("#challenge-form, #cf-challenge-running").expect("challenge selector")
+        });
+        let title = document
+            .select(&TITLE)
+            .next()
+            .map(|el| normalize(el.text(), 300))
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| url.host_str().unwrap_or("Web source").to_owned());
+        if document.select(&CHALLENGE).next().is_some()
+            || matches!(
+                title.to_lowercase().as_str(),
+                "just a moment..."
+                    | "access denied"
+                    | "attention required! | cloudflare"
+                    | "robot check"
+            )
+        {
+            return Err(PageError::Blocked);
+        }
+
+        let mut plain = clean::page_text(document.root_element(), !extract_opts.only_main_content);
+        if extract_opts.only_main_content && plain.trim().is_empty() {
+            plain = clean::page_text(document.root_element(), true);
+        }
+        let body = std::slice::from_ref(&plain);
+        if needs_script(&document, body, plain.len(), rendered)
+            || (!rendered && client_template(&document, body))
+        {
+            return Err(PageError::NeedsJs);
+        }
+
+        let md = want_md.then(|| {
+            markdown::html_to_markdown(&document, &url, &extract_opts, FULL_TEXT_BYTES)
+        });
+        let links = want_links.then(|| markdown::extract_links(&document, &url, 500));
+        let mut meta = markdown::extract_meta(&document, &url);
+        meta.status_code = Some(status);
+        meta.content_type = content_type;
+
+        let text = want_text.then(|| {
+            let trimmed = plain.trim_matches(['\n', '\r']);
+            let end = trimmed.floor_char_boundary(FULL_TEXT_BYTES.min(trimmed.len()));
+            trimmed[..end].to_owned()
+        });
+        let html = want_html.then(|| {
+            let end = decoded.floor_char_boundary(FULL_TEXT_BYTES.min(decoded.len()));
+            decoded[..end].to_owned()
+        });
+
+        let has_content = md.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || text.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || html.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || links.as_ref().is_some_and(|l| !l.is_empty());
+        if !has_content && plain.trim().is_empty() {
+            return Err(PageError::Unreadable);
+        }
+
+        Ok(ScrapedPage {
+            requested_url: (url != requested).then_some(requested),
+            url,
+            title,
+            markdown: md,
+            text,
+            html,
+            links,
+            metadata: meta,
+            retrieval,
+            truncated: cut,
+        })
+    })
+    .await
+    .map_err(|_| PageError::Unreadable)?
+}
+
+fn decode_bytes(bytes: &[u8], media_type: Option<&str>) -> String {
+    let charset = media_type.and_then(|media_type| {
+        media_type.split(';').skip(1).find_map(|part| {
+            let (name, value) = part.trim().split_once('=')?;
+            (name.trim() == "charset").then(|| value.trim().trim_matches(['\'', '"']))
+        })
+    });
+    let encoding = charset
+        .and_then(|charset| encoding_rs::Encoding::for_label(charset.as_bytes()))
+        .or_else(|| sniff_encoding(bytes))
+        .unwrap_or(encoding_rs::UTF_8);
+    let (text, _, _) = encoding.decode(bytes);
+    text.into_owned()
 }
 
 async fn parse(
@@ -709,12 +1551,129 @@ async fn parse(
     .map_err(|_| PageError::Unreadable)?
 }
 
+/// Escalates from Tier 2 (Lightpanda) to Tier 3 (optional Playwright/Chromium
+/// sidecar configured via `QUELLE_BROWSER_URL`).
+async fn render_with_fallback(
+    url: &Url,
+    threshold: usize,
+    wait_for_ms: Option<u64>,
+    deadline: Instant,
+) -> Result<(Vec<u8>, bool, politeness::FetchTier), PageError> {
+    let host_key = url.host_str().unwrap_or_default();
+    let skip_lightpanda =
+        politeness::global().preferred_tier(host_key) == Some(politeness::FetchTier::Sidecar)
+            && browser_sidecar().is_some();
+
+    if !skip_lightpanda && render_enabled() {
+        match render(url, threshold, wait_for_ms).await {
+            Ok((html, cut)) => return Ok((html, cut, politeness::FetchTier::Rendered)),
+            Err(err) if browser_sidecar().is_none() => return Err(err),
+            Err(_) => {
+                tracing::info!(
+                    stage = "escalate_browser_sidecar",
+                    host = url.host_str()
+                );
+            }
+        }
+    }
+
+    if let Some(sidecar) = browser_sidecar() {
+        let (html, cut) = render_sidecar(sidecar, url, wait_for_ms, deadline).await?;
+        return Ok((html, cut, politeness::FetchTier::Sidecar));
+    }
+
+    Err(PageError::NeedsJs)
+}
+
+/// Calls an external Playwright/Chromium sidecar (compatible with Firecrawl's
+/// `playwright-service` JSON contract: `POST { url, wait_after_load }` ->
+/// `{ content, pageStatusCode }`, or raw HTML). Validates public DNS first.
+async fn render_sidecar(
+    sidecar: &Url,
+    url: &Url,
+    wait_for_ms: Option<u64>,
+    deadline: Instant,
+) -> Result<(Vec<u8>, bool), PageError> {
+    let clean = public_url(url.clone())?;
+    let _ = resolve_public_addrs(&clean).await?;
+    let _slot = RENDER_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| PageError::NeedsJs)?;
+    let started = Instant::now();
+    let client = crate::client_builder()
+        .build()
+        .map_err(|_| PageError::Transport)?;
+    let payload = serde_json::json!({
+        "url": clean.as_str(),
+        "wait_after_load": wait_for_ms.unwrap_or(1000).min(15_000),
+    });
+    let step_deadline = deadline.min(Instant::now() + RENDER_TIMEOUT);
+    let response = tokio::time::timeout_at(
+        step_deadline,
+        client.post(sidecar.clone()).json(&payload).send(),
+    )
+    .await
+    .map_err(|_| PageError::Timeout)?
+    .map_err(|_| PageError::Transport)?;
+    if !response.status().is_success() {
+        return Err(PageError::Blocked);
+    }
+    let is_json = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.to_ascii_lowercase().contains("application/json"));
+    let (body, cut) = tokio::time::timeout_at(
+        step_deadline,
+        read_page(response, PAGE_BYTES + 64 * 1024, !is_json),
+    )
+    .await
+    .map_err(|_| PageError::Timeout)?
+    .map_err(|_| PageError::Transport)?;
+
+    let mut html = if is_json {
+        #[derive(Deserialize)]
+        struct SidecarResponse {
+            content: Option<String>,
+            html: Option<String>,
+            #[serde(rename = "pageStatusCode")]
+            page_status_code: Option<u16>,
+        }
+        let parsed: SidecarResponse =
+            serde_json::from_slice(&body).map_err(|_| PageError::Unreadable)?;
+        if parsed.page_status_code.is_some_and(|code| code >= 400) {
+            return Err(PageError::Blocked);
+        }
+        parsed
+            .content
+            .or(parsed.html)
+            .ok_or(PageError::Unreadable)?
+            .into_bytes()
+    } else {
+        body
+    };
+    let truncated = cut || html.len() > PAGE_BYTES;
+    html.truncate(PAGE_BYTES);
+    tracing::info!(
+        stage = "sidecar_render",
+        host = url.host_str(),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        ok = true
+    );
+    Ok((html, truncated))
+}
+
 /// Renders a script-only page with Lightpanda and returns the resulting
 /// DOM as HTML. Lightpanda checks every connection, including scripts and
 /// XHR, against private and reserved ranges after DNS resolution, so page
 /// scripts cannot reach internal services. Telemetry is disabled, the
 /// environment is cleared, and the process is killed when the request ends.
-async fn render(url: &Url, threshold: usize) -> Result<(Vec<u8>, bool), PageError> {
+async fn render(
+    url: &Url,
+    threshold: usize,
+    wait_for_ms: Option<u64>,
+) -> Result<(Vec<u8>, bool), PageError> {
     let Some(binary) = RENDERER.get().and_then(Option::as_ref) else {
         return Err(PageError::NeedsJs);
     };
@@ -723,6 +1682,8 @@ async fn render(url: &Url, threshold: usize) -> Result<(Vec<u8>, bool), PageErro
         .await
         .map_err(|_| PageError::NeedsJs)?;
     let started = Instant::now();
+    let wait_ms = wait_for_ms.unwrap_or(7_000).clamp(500, 15_000);
+    let terminate_ms = (wait_ms + 1500).min(17_000);
     let mut command = Command::new(binary);
     command
         .env_clear()
@@ -738,11 +1699,11 @@ async fn render(url: &Url, threshold: usize) -> Result<(Vec<u8>, bool), PageErro
             "--wait-script",
             &format!("document.body && (document.body.innerText || '').length > {threshold}"),
             "--wait-ms",
-            "12000",
+            &wait_ms.to_string(),
             "--terminate-ms",
-            "13000",
+            &terminate_ms.to_string(),
             "--http-timeout",
-            "6000",
+            "8000",
             "--http-max-response-size",
             "10485760",
             "--v8-max-heap-mb",
@@ -752,8 +1713,6 @@ async fn render(url: &Url, threshold: usize) -> Result<(Vec<u8>, bool), PageErro
             "de-CH",
             "--log-level",
             "fatal",
-            "--user-agent-suffix",
-            HONEST_AGENT,
         ]);
     for range in BLOCKED_RANGES {
         command.args(["--block-cidrs", range]);
@@ -1025,6 +1984,222 @@ fn table_passages(rows: &[Vec<String>], context: &str) -> Vec<String> {
         }
     }
     passages
+}
+
+/// Extracts PDF text via `pdftotext` first; when the PDF has no embedded text
+/// layer (scanned PDF) and `QUELLE_OCR_URL` (OCRia-nano-1 / LiteParse sidecar)
+/// is configured, escalates to OCR automatically.
+async fn pdf_or_ocr(
+    url: Url,
+    bytes: &[u8],
+    relevance: Option<&Relevance>,
+    deadline: Instant,
+) -> Result<Source, PageError> {
+    match pdf(url.clone(), bytes, relevance).await {
+        Ok(src) => Ok(src),
+        Err(PageError::NoTextLayer) if ocr_sidecar().is_some() => {
+            ocr_pdf(url, bytes, relevance, deadline).await
+        }
+        Err(err) => Err(err),
+    }
+}
+
+async fn ocr_pdf(
+    url: Url,
+    bytes: &[u8],
+    relevance: Option<&Relevance>,
+    deadline: Instant,
+) -> Result<Source, PageError> {
+    let Some(endpoint) = ocr_sidecar() else {
+        return Err(PageError::NoTextLayer);
+    };
+    let _slot = DOCUMENT_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| PageError::Unreadable)?;
+    let started = Instant::now();
+    let client = crate::client_builder()
+        .build()
+        .map_err(|_| PageError::Transport)?;
+    let step_deadline = deadline.min(Instant::now() + Duration::from_secs(45));
+    let response = tokio::time::timeout_at(
+        step_deadline,
+        client
+            .post(endpoint.clone())
+            .header(header::CONTENT_TYPE, "application/pdf")
+            .body(bytes.to_vec())
+            .send(),
+    )
+    .await
+    .map_err(|_| PageError::Timeout)?
+    .map_err(|_| PageError::Transport)?;
+    if !response.status().is_success() {
+        return Err(PageError::NoTextLayer);
+    }
+    #[derive(Deserialize)]
+    struct OcrResponse {
+        markdown: Option<String>,
+        text: Option<String>,
+        pages: Option<usize>,
+    }
+    let body = tokio::time::timeout_at(step_deadline, read_body(response, PDF_TEXT_BYTES))
+        .await
+        .map_err(|_| PageError::Timeout)?
+        .map_err(|_| PageError::Unreadable)?;
+    let parsed: OcrResponse =
+        serde_json::from_slice(&body).map_err(|_| PageError::Unreadable)?;
+    let text = parsed
+        .markdown
+        .or(parsed.text)
+        .filter(|t| !t.trim().is_empty())
+        .ok_or(PageError::NoTextLayer)?;
+    tracing::info!(
+        stage = "pdf_ocr",
+        host = url.host_str(),
+        pages = parsed.pages.unwrap_or(0),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        ok = true
+    );
+    let mut src = text_source(url, text, "pdf-ocr", relevance)?;
+    src.metadata.pages_read = parsed.pages;
+    Ok(src)
+}
+
+fn text_source(
+    url: Url,
+    text: String,
+    retrieval: &'static str,
+    relevance: Option<&Relevance>,
+) -> Result<Source, PageError> {
+    let title = first_markdown_heading(&text)
+        .unwrap_or_else(|| pdf_name(&url));
+    let Some(relevance) = relevance else {
+        let mut src = Source::full(url, title, &text)?;
+        src.metadata.retrieval = Some(retrieval);
+        return Ok(src);
+    };
+    let passages = markdown_passages(&text);
+    let mut src = source(url, title, passages.into_iter(), relevance)?;
+    src.metadata.retrieval = Some(retrieval);
+    Ok(src)
+}
+
+fn first_markdown_heading(md: &str) -> Option<String> {
+    md.lines().take(20).find_map(|line| {
+        let t = line.trim();
+        t.starts_with('#')
+            .then(|| t.trim_start_matches('#').trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| shorten(s, 160))
+    })
+}
+
+fn pretty_json_bytes(bytes: &[u8], content_type: Option<&str>) -> String {
+    if let Ok(val) = serde_json::from_slice::<serde_json::Value>(bytes)
+        && let Ok(pretty) = serde_json::to_string_pretty(&val)
+    {
+        return pretty;
+    }
+    decode_bytes(bytes, content_type)
+}
+
+fn feed_to_markdown(xml: &str, base_url: &Url) -> String {
+    parse_feed(xml, base_url).1
+}
+
+/// Lightweight RSS 2.0 / Atom 1.0 feed parser -> clean Markdown + links.
+fn parse_feed(xml: &str, base_url: &Url) -> (String, String, Vec<Url>) {
+    static ITEM_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<(?:item|entry)\b[^>]*>(.*?)</(?:item|entry)>").unwrap());
+    static TITLE_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>").unwrap());
+    static LINK_TAG_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?is)<link\b[^>]*href=["']([^"']+)["'][^>]*/?>|<link\b[^>]*>(.*?)</link>"#).unwrap());
+    static DATE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<(?:pubDate|published|updated)\b[^>]*>(.*?)</(?:pubDate|published|updated)>")
+            .unwrap()
+    });
+    static DESC_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?is)<(?:description|summary|content)\b[^>]*>(.*?)</(?:description|summary|content)>")
+            .unwrap()
+    });
+
+    let strip_cdata = |raw: &str| -> String {
+        let s = raw.trim();
+        let s = s
+            .strip_prefix("<![CDATA[")
+            .and_then(|v| v.strip_suffix("]]>"))
+            .unwrap_or(s);
+        // Strip basic HTML tags inside feed descriptions
+        let frag = Html::parse_fragment(s);
+        let text: String = frag.root_element().text().collect();
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    };
+
+    // Feed title is the first <title> before the first <item>/<entry>
+    let head_end = ITEM_RE.find(xml).map_or(xml.len(), |m| m.start());
+    let feed_title = TITLE_RE
+        .captures(&xml[..head_end])
+        .map(|c| strip_cdata(&c[1]))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| base_url.host_str().unwrap_or("Feed").to_owned());
+
+    let mut md = format!("# {feed_title}\n\n");
+    let mut links = Vec::new();
+    let mut seen = HashSet::new();
+
+    for cap in ITEM_RE.captures_iter(xml).take(100) {
+        let block = &cap[1];
+        let title = TITLE_RE
+            .captures(block)
+            .map(|c| strip_cdata(&c[1]))
+            .unwrap_or_default();
+        let link = LINK_TAG_RE.captures(block).and_then(|c| {
+            let raw = c.get(1).or_else(|| c.get(2))?.as_str().trim();
+            let raw = raw
+                .strip_prefix("<![CDATA[")
+                .and_then(|v| v.strip_suffix("]]>"))
+                .unwrap_or(raw)
+                .trim();
+            base_url
+                .join(raw)
+                .ok()
+                .and_then(|u| public_url(u).ok())
+        });
+        let date = DATE_RE
+            .captures(block)
+            .map(|c| strip_cdata(&c[1]))
+            .filter(|s| !s.is_empty());
+        let summary = DESC_RE
+            .captures(block)
+            .map(|c| strip_cdata(&c[1]))
+            .filter(|s| !s.is_empty());
+
+        if let Some(ref u) = link
+            && seen.insert(u.clone())
+        {
+            links.push(u.clone());
+        }
+
+        if !title.is_empty() {
+            if let Some(ref u) = link {
+                md.push_str(&format!("## [{title}]({u})\n"));
+            } else {
+                md.push_str(&format!("## {title}\n"));
+            }
+        }
+        if let Some(d) = date {
+            md.push_str(&format!("*{d}*\n\n"));
+        }
+        if let Some(s) = summary {
+            md.push_str(&shorten(&s, 600));
+            md.push_str("\n\n");
+        } else {
+            md.push('\n');
+        }
+    }
+
+    (feed_title, md.trim().to_owned(), links)
 }
 
 /// Reads the PDF text layer with poppler's `pdftotext`. This covers both

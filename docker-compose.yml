@@ -1,0 +1,47 @@
+services:
+  quelle:
+    build: .
+    env_file:
+      - .env
+    environment:
+      QUELLE_LISTEN: "0.0.0.0:3000"
+      # Uncomment or pass via .env when running with `--profile browser` / `ocr` / `full`:
+      # QUELLE_BROWSER_URL: "http://browser-sidecar:3003/scrape"
+      # QUELLE_OCR_URL: "http://ocr-sidecar:3004/ocr"
+    ports:
+      - "127.0.0.1:3000:3000"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  browser-sidecar:
+    profiles: ["browser", "full"]
+    build: ./browser-sidecar
+    environment:
+      PORT: "3003"
+      MAX_CONCURRENT_PAGES: "4"
+      BLOCK_MEDIA: "true"
+      BROWSER_LOCALE: "de-CH"
+      BROWSER_TIMEZONE: "Europe/Zurich"
+      BLOCKED_NETWORKS: "${QUELLE_BLOCKED_NETWORKS:-}"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    shm_size: "1gb"
+    mem_limit: "2g"
+
+  ocr-sidecar:
+    profiles: ["ocr", "full"]
+    build: ./ocr-sidecar
+    environment:
+      PORT: "3004"
+      OCR_BACKEND: "ocria-nano"
+      MAX_CONCURRENT_OCR: "2"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: "2g"

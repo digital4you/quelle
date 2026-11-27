@@ -6,6 +6,10 @@ Quelle is a Rust service that retrieves web pages for agents. It can answer a qu
 | --- | --- | --- | --- |
 | Answer | `POST /api/answer` | An answer with numbered citations and supporting passages | Yes |
 | Content | `POST /api/content` | Page text in document order for the caller's exact search query or supplied URLs | No |
+| Scrape | `POST /api/scrape` | Clean Markdown, text, HTML, links, and metadata for a `url`, batch `urls`, or search `query` | No |
+| Map | `POST /api/map` | Fast site URL discovery from `robots.txt`, `sitemap.xml`, and page links | No |
+| Crawl | `POST /api/crawl` (`GET`/`DELETE /api/crawl/{id}`) | Async or sync recursive crawl starting from a single `url` or a set of `urls` | No |
+| Extract | `POST /api/extract` | Structured JSON extracted from `url`, `urls`, or `query` using a prompt/schema | Yes |
 
 ## Quick start
 
@@ -96,6 +100,52 @@ Quelle preserves case, whitespace, quoted phrases and search operators outside p
 
 Read `sources[].content` for the page text and `sources[].metadata.url` for the final URL. Each source also has `metadata.title` and `metadata.truncated`. When the final URL differs, `requestedUrl` records the original. Successful sources follow input or search-result order. Individual failures appear in `errors` as objects with `url` and `error`. Partial success returns HTTP 200. If every read fails or discovery finds nothing, HTTP 422 includes `error: "no_readable_sources"` alongside both arrays.
 
+### Scrape mode · `POST /api/scrape`
+
+Scrape a single `url`, a batch of `urls` (1–50), or discover-and-scrape via a search `query`. Returns clean LLM-ready Markdown, plain text, raw HTML, extracted links, and metadata (`description`, `language`, `canonicalUrl`, `og:*`, `statusCode`, `contentType`).
+
+```sh
+curl -sS http://127.0.0.1:3000/api/scrape \
+  -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
+  --data '{"url":"https://example.org","formats":["markdown","links"],"onlyMainContent":true}'
+```
+
+Optional fields: `formats` (`["markdown","text","html","links"]`, default `["markdown"]`), `onlyMainContent` (default `true`), `includeTags` / `excludeTags` (CSS selectors), `render` (`"auto"`, `"always"`, `"never"`), `waitFor` (ms), `maxAge` (cache TTL in seconds, default `300`; set `0` to bypass cache), `limit`, `language`.
+
+### Map mode · `POST /api/map`
+
+Discover URLs on a site (or set of seed `urls`) via `robots.txt`, `sitemap.xml` (including sitemap indexes), and link extraction.
+
+```sh
+curl -sS http://127.0.0.1:3000/api/map \
+  -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
+  --data '{"url":"https://example.org","limit":100}'
+```
+
+Optional fields: `urls` (multiple seeds), `search` (URL substring filter), `includeSubdomains`, `useSitemap` (default `true`), `includePaths`, `excludePaths`, `limit` (1–5000, default 200).
+
+### Crawl mode · `POST /api/crawl`
+
+Recursively crawl starting from a single `url` **or** a list of `urls` (1–100 seeds). By default returns HTTP 202 with `{"id":"...","status":"running","url":"/api/crawl/<id>"}`; poll `GET /api/crawl/{id}` for progress and results or cancel with `DELETE /api/crawl/{id}`. Set `"sync": true` for small crawls that should return results directly in one request.
+
+```sh
+curl -sS http://127.0.0.1:3000/api/crawl \
+  -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
+  --data '{"urls":["https://example.org/docs","https://example.org/blog"],"maxDepth":2,"limit":30,"formats":["markdown"]}'
+```
+
+Optional fields: `maxDepth` (0–10, default 2), `limit` (1–1000, default 50), `includePaths` / `excludePaths` (prefix or `*` globs), `allowSubdomains`, `allowExternalLinks`, `useSitemap` (default `true`), `respectRobots` (default `true`), `formats`, `onlyMainContent`, `includeTags`, `excludeTags`, `render`, `waitFor`, `maxAge`, `concurrency` (1–16, default 4; per-host politeness is always enforced), `sync` (default `false`).
+
+### Extract mode · `POST /api/extract`
+
+Scrape `url`, `urls` (1–20), or a search `query` and extract structured JSON matching `prompt` and/or JSON `schema` using the configured model.
+
+```sh
+curl -sS http://127.0.0.1:3000/api/extract \
+  -H "Authorization: Bearer $QUELLE_TOKEN" -H 'Content-Type: application/json' \
+  --data '{"url":"https://example.org","prompt":"Extract the page title and main topics"}'
+```
+
 ### Page extraction
 
 - **HTML.** `/api/content` keeps readable text in document order, including headings, repeated values and footer contacts. It leaves out site navigation, search forms, the site banner, language switchers and skip links. A page that consists only of navigation keeps it. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
@@ -159,6 +209,31 @@ Set all three connection variables together to enable answer generation. Omit al
 | `QUELLE_USER_AGENT` | Built-in desktop Chrome user agent | User agent for ordinary page fetches. |
 | `QUELLE_LIGHTPANDA` | `lightpanda` on `PATH` | Path to the browser executable for JavaScript rendering. |
 | `QUELLE_BLOCKED_NETWORKS` | None | Comma-separated CIDR ranges or addresses, such as `34.118.224.0/20,2600:1f14::/56`, that page fetches and the browser must not reach, in addition to the built-in reserved ranges. Invalid entries stop startup. |
+| `QUELLE_PROXY_URL` | None | Optional HTTP/HTTPS/SOCKS proxy URL for outbound page fetches. |
+| `QUELLE_BROWSER_URL` | None | Optional external Playwright/Chromium sidecar endpoint (e.g. `http://127.0.0.1:3003/scrape`) used as Tier 3 fallback when Lightpanda fails or is unavailable. |
+| `QUELLE_OCR_URL` | None | Optional OCRia-nano-1 (LiteParse) CPU OCR sidecar endpoint (e.g. `http://127.0.0.1:3004/ocr`) used automatically for scanned PDFs that have no embedded text layer. |
+| `QUELLE_HOST_CONCURRENCY` | `2` | Maximum simultaneous requests per target host (1–16). |
+| `QUELLE_HOST_SPACING_MS` | `250` | Minimum delay in milliseconds between requests to the same host (0–10000). |
+
+### Optional sidecars (`QUELLE_BROWSER_URL` & `QUELLE_OCR_URL`)
+
+- **Playwright/Chromium sidecar (`browser-sidecar/`):** For heavy SPAs that Lightpanda cannot render, using a realistic desktop Chrome profile, smooth scrolling, WebRTC lockdown, and an embedded DNS-pinning proxy that blocks private/reserved ranges and `QUELLE_BLOCKED_NETWORKS`.
+- **OCRia-nano-1 sidecar (`ocr-sidecar/`):** Runs LlamaIndex's 8.1M-parameter `ocria-nano` CPU model via LiteParse (`@llamaindex/liteparse`) for scanned PDFs without an embedded text layer.
+
+```sh
+# Playwright sidecar only:
+QUELLE_BROWSER_URL=http://browser-sidecar:3003/scrape \
+  docker compose --profile browser up -d --build
+
+# OCRia-nano-1 sidecar only:
+QUELLE_OCR_URL=http://ocr-sidecar:3004/ocr \
+  docker compose --profile ocr up -d --build
+
+# Full stack (Quelle + Playwright + OCRia-nano-1):
+QUELLE_BROWSER_URL=http://browser-sidecar:3003/scrape \
+QUELLE_OCR_URL=http://ocr-sidecar:3004/ocr \
+  docker compose --profile full up -d --build
+```
 
 ## Deployment hardening
 

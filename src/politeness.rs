@@ -1,0 +1,303 @@
+//! Per-host politeness, adaptive rate limiting, and bounded response caching.
+//!
+//! Parallelizing across different hosts is fast and safe, while hitting the
+//! same host with bursts trips WAF/load-balancer token buckets. This module
+//! caps concurrent requests per host, enforces minimum spacing + adaptive
+//! cooldowns on 429/503 responses, and caches recent successful downloads.
+
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime},
+};
+
+use reqwest::header;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use url::Url;
+
+const DEFAULT_HOST_CONCURRENCY: usize = 2;
+const DEFAULT_HOST_SPACING: Duration = Duration::from_millis(250);
+const MAX_HOST_ENTRIES: usize = 2048;
+const CACHE_ENTRIES: usize = 256;
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+const MAX_CACHED_BODY: usize = 512 * 1024;
+
+static HOST_CONCURRENCY: OnceLock<usize> = OnceLock::new();
+static HOST_SPACING: OnceLock<Duration> = OnceLock::new();
+
+pub fn configure(host_concurrency: usize, host_spacing_ms: u64) {
+    let _ = HOST_CONCURRENCY.set(host_concurrency.clamp(1, 16));
+    let _ = HOST_SPACING.set(Duration::from_millis(host_spacing_ms.min(10_000)));
+}
+
+fn host_concurrency() -> usize {
+    HOST_CONCURRENCY
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_HOST_CONCURRENCY)
+}
+
+fn host_spacing() -> Duration {
+    HOST_SPACING
+        .get()
+        .copied()
+        .unwrap_or(DEFAULT_HOST_SPACING)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchTier {
+    HonestHttp,
+    Rendered,
+    Sidecar,
+}
+
+#[derive(Clone)]
+pub struct CachedResponse {
+    pub final_url: Url,
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+    pub truncated: bool,
+}
+
+struct HostState {
+    semaphore: Arc<Semaphore>,
+    next_allowed: tokio::sync::Mutex<tokio::time::Instant>,
+    cooldown_until: Mutex<Option<Instant>>,
+    crawl_delay: Mutex<Option<Duration>>,
+    preferred_tier: Mutex<Option<(Instant, FetchTier)>>,
+    last_used: Mutex<Instant>,
+}
+
+impl HostState {
+    fn new() -> Self {
+        Self {
+            semaphore: Arc::new(Semaphore::new(host_concurrency())),
+            next_allowed: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+            cooldown_until: Mutex::new(None),
+            crawl_delay: Mutex::new(None),
+            preferred_tier: Mutex::new(None),
+            last_used: Mutex::new(Instant::now()),
+        }
+    }
+
+    fn touch(&self) {
+        if let Ok(mut last) = self.last_used.lock() {
+            *last = Instant::now();
+        }
+    }
+
+    fn effective_spacing(&self) -> Duration {
+        let base = host_spacing();
+        let robot = self.crawl_delay.lock().ok().and_then(|d| *d);
+        match robot {
+            Some(delay) => base.max(delay.min(Duration::from_secs(10))),
+            None => base,
+        }
+    }
+}
+
+pub struct HostPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+pub struct Politeness {
+    hosts: Mutex<HashMap<String, Arc<HostState>>>,
+    cache: Mutex<HashMap<String, (Instant, CachedResponse)>>,
+}
+
+static GLOBAL: OnceLock<Politeness> = OnceLock::new();
+
+pub fn global() -> &'static Politeness {
+    GLOBAL.get_or_init(Politeness::new)
+}
+
+impl Politeness {
+    pub fn new() -> Self {
+        Self {
+            hosts: Mutex::new(HashMap::new()),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn host_state(&self, host: &str) -> Arc<HostState> {
+        let key = host.to_ascii_lowercase();
+        let mut map = self.hosts.lock().expect("host map");
+        if let Some(state) = map.get(&key) {
+            state.touch();
+            return Arc::clone(state);
+        }
+        if map.len() >= MAX_HOST_ENTRIES {
+            // Evict entries that haven't been touched recently.
+            let cutoff = Instant::now() - Duration::from_secs(300);
+            map.retain(|_, v| {
+                v.last_used
+                    .lock()
+                    .map(|t| *t >= cutoff)
+                    .unwrap_or(false)
+            });
+            if map.len() >= MAX_HOST_ENTRIES
+                && let Some(oldest) = map
+                    .iter()
+                    .min_by_key(|(_, v)| {
+                        v.last_used
+                            .lock()
+                            .map(|t| *t)
+                            .unwrap_or_else(|_| Instant::now())
+                    })
+                    .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        let state = Arc::new(HostState::new());
+        map.insert(key, Arc::clone(&state));
+        state
+    }
+
+    /// Records a robots.txt Crawl-delay for a host so subsequent requests
+    /// respect it automatically.
+    pub fn set_crawl_delay(&self, host: &str, delay: Duration) {
+        let state = self.host_state(host);
+        if let Ok(mut slot) = state.crawl_delay.lock() {
+            *slot = Some(delay.min(Duration::from_secs(10)));
+        }
+    }
+
+    /// Returns the last winning fetch tier for `host` (cached for 30 minutes)
+    /// so subsequent requests skip wasted 403 escalations.
+    pub fn preferred_tier(&self, host: &str) -> Option<FetchTier> {
+        let state = self.host_state(host);
+        let guard = state.preferred_tier.lock().ok()?;
+        guard
+            .filter(|(stored, _)| stored.elapsed() <= Duration::from_secs(30 * 60))
+            .map(|(_, tier)| tier)
+    }
+
+    pub fn record_tier(&self, host: &str, tier: FetchTier) {
+        let state = self.host_state(host);
+        if let Ok(mut guard) = state.preferred_tier.lock() {
+            *guard = Some((Instant::now(), tier));
+        }
+    }
+
+    /// Acquires a per-host concurrency slot and waits for any active spacing
+    /// or rate-limit cooldown, bounded by `deadline`.
+    pub async fn acquire(
+        &self,
+        host: &str,
+        deadline: tokio::time::Instant,
+    ) -> Option<HostPermit> {
+        let state = self.host_state(host);
+        let permit = tokio::time::timeout_at(deadline, Arc::clone(&state.semaphore).acquire_owned())
+            .await
+            .ok()?
+            .ok()?;
+
+        // Honor any active cooldown from a previous 429/503.
+        let cooldown_wait = state
+            .cooldown_until
+            .lock()
+            .ok()
+            .and_then(|guard| *guard)
+            .and_then(|until| until.checked_duration_since(Instant::now()));
+        if let Some(wait) = cooldown_wait {
+            let target = tokio::time::Instant::now() + wait;
+            if target >= deadline {
+                return None;
+            }
+            tokio::time::sleep_until(target).await;
+        }
+
+        // Enforce per-host request spacing.
+        let spacing = state.effective_spacing();
+        if !spacing.is_zero() {
+            let wait_result = tokio::time::timeout_at(deadline, async {
+                let mut next = state.next_allowed.lock().await;
+                let now = tokio::time::Instant::now();
+                if *next > now {
+                    tokio::time::sleep_until(*next).await;
+                }
+                *next = tokio::time::Instant::now() + spacing;
+            })
+            .await;
+            if wait_result.is_err() {
+                return None;
+            }
+        }
+
+        Some(HostPermit { _permit: permit })
+    }
+
+    /// Records a throttle event (429 / 503) for a host so other workers back
+    /// off cleanly.
+    pub fn record_throttle(&self, host: &str, wait: Duration) {
+        let state = self.host_state(host);
+        let bounded = wait.clamp(Duration::from_millis(500), Duration::from_secs(60));
+        let until = Instant::now() + bounded;
+        if let Ok(mut guard) = state.cooldown_until.lock() {
+            *guard = Some(guard.map_or(until, |prior| prior.max(until)));
+        }
+    }
+
+    pub fn cache_get(&self, url: &Url, max_age: Duration) -> Option<CachedResponse> {
+        if max_age.is_zero() {
+            return None;
+        }
+        let cache = self.cache.lock().ok()?;
+        let (stored, entry) = cache.get(url.as_str())?;
+        (stored.elapsed() <= max_age).then(|| entry.clone())
+    }
+
+    pub fn cache_put(&self, url: &Url, entry: CachedResponse) {
+        if entry.bytes.len() > MAX_CACHED_BODY {
+            return;
+        }
+        let Ok(mut cache) = self.cache.lock() else {
+            return;
+        };
+        cache.retain(|_, (stored, _)| stored.elapsed() <= DEFAULT_CACHE_TTL);
+        if cache.len() >= CACHE_ENTRIES
+            && let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, (stored, _))| *stored)
+                .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest);
+        }
+        cache.insert(url.as_str().to_owned(), (Instant::now(), entry));
+    }
+}
+
+/// Parses an HTTP `Retry-After` header (delta-seconds or HTTP-date), bounded
+/// to a sensible retry window.
+pub fn parse_retry_after(headers: &header::HeaderMap, default: Duration) -> Duration {
+    headers
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| {
+            s.trim()
+                .parse::<u64>()
+                .ok()
+                .map(Duration::from_secs)
+                .or_else(|| {
+                    httpdate::parse_http_date(s.trim())
+                        .ok()?
+                        .duration_since(SystemTime::now())
+                        .ok()
+                })
+        })
+        .unwrap_or(default)
+        .clamp(Duration::from_millis(500), Duration::from_secs(30))
+}
+
+/// Deterministic small jitter derived from the current subsec nanos to avoid
+/// thundering herds without pulling in an RNG crate.
+pub fn jitter(base: Duration) -> Duration {
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let extra_ms = u64::from(nanos % 350);
+    base + Duration::from_millis(extra_ms)
+}

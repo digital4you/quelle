@@ -97,6 +97,10 @@ pub(super) fn page_text(root: ElementRef<'_>, keep_chrome: bool) -> String {
 /// Page chrome: navigation, search, the site banner, language switchers and
 /// skip links. Headers inside the main content or holding the page heading
 /// stay, and so do footers, which carry addresses and contact details.
+pub(super) fn is_chrome(el: ElementRef<'_>) -> bool {
+    chrome(el)
+}
+
 fn chrome(el: ElementRef<'_>) -> bool {
     static SKIP_LINK: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
@@ -131,7 +135,7 @@ fn chrome(el: ElementRef<'_>) -> bool {
     }
 }
 
-fn hidden_style(style: &str) -> bool {
+pub(super) fn hidden_style(style: &str) -> bool {
     style
         .split(';')
         .filter_map(|rule| rule.split_once(':'))

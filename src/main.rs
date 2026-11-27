@@ -1,8 +1,12 @@
 mod content;
+mod crawl;
 mod discovery;
 mod model;
 mod pages;
+mod politeness;
 mod privacy;
+mod robots;
+mod scrape;
 mod search;
 
 use std::{
@@ -18,7 +22,7 @@ use axum::{
         IntoResponse, Response, Sse,
         sse::{Event, KeepAlive},
     },
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use reqwest::header::HeaderValue;
 use serde::{Serialize, de::DeserializeOwned};
@@ -137,6 +141,7 @@ struct App {
     authorization: HeaderValue,
     slots: Arc<Semaphore>,
     search: Search,
+    crawls: crawl::CrawlManager,
 }
 
 #[derive(Serialize)]
@@ -331,6 +336,22 @@ fn endpoint(value: &str, name: &'static str) -> Result<Url, &'static str> {
     Ok(url)
 }
 
+fn sidecar_endpoint(value: &str, name: &'static str) -> Result<Url, &'static str> {
+    let mut url = Url::parse(value).map_err(|_| name)?;
+    if url.host().is_none()
+        || !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(name);
+    }
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&path);
+    Ok(url)
+}
+
 fn positive_env(
     name: &'static str,
     default: usize,
@@ -425,6 +446,34 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
         Err(_) => return Err("QUELLE_BLOCKED_NETWORKS"),
     };
     pages::set_blocked_networks(blocked);
+    let proxy = env::var("QUELLE_PROXY_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    if let Some(ref proxy_url) = proxy
+        && reqwest::Proxy::all(proxy_url).is_err()
+    {
+        return Err("QUELLE_PROXY_URL");
+    }
+    pages::set_proxy(proxy);
+    let sidecar = match env::var("QUELLE_BROWSER_URL") {
+        Ok(value) if !value.trim().is_empty() => {
+            Some(sidecar_endpoint(value.trim(), "QUELLE_BROWSER_URL")?)
+        }
+        Ok(_) | Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err("QUELLE_BROWSER_URL"),
+    };
+    pages::set_browser_sidecar(sidecar);
+    let ocr = match env::var("QUELLE_OCR_URL") {
+        Ok(value) if !value.trim().is_empty() => {
+            Some(sidecar_endpoint(value.trim(), "QUELLE_OCR_URL")?)
+        }
+        Ok(_) | Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err("QUELLE_OCR_URL"),
+    };
+    pages::set_ocr_sidecar(ocr);
+    let host_concurrency = positive_env("QUELLE_HOST_CONCURRENCY", 2, 1, 16)?;
+    let host_spacing_ms = positive_env("QUELLE_HOST_SPACING_MS", 250, 0, 10_000)? as u64;
+    politeness::configure(host_concurrency, host_spacing_ms);
     let concurrent = positive_env("QUELLE_CONCURRENCY", 8, 1, 64)?;
     let app = App {
         authorization,
@@ -434,6 +483,7 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
             engines,
             page_slots: Arc::new(Semaphore::new(concurrent * 4)),
         },
+        crawls: crawl::CrawlManager::new(),
     };
     Ok((listen, Arc::new(app)))
 }
@@ -485,6 +535,12 @@ async fn main() -> ExitCode {
     let router = Router::new()
         .route("/api/answer", post(answer))
         .route("/api/content", post(content::handle))
+        .route("/api/scrape", post(scrape::scrape_handle))
+        .route("/api/extract", post(scrape::extract_handle))
+        .route("/api/map", post(crawl::map_handle))
+        .route("/api/crawl", post(crawl::start_handle))
+        .route("/api/crawl/{id}", get(crawl::status_handle))
+        .route("/api/crawl/{id}", delete(crawl::cancel_handle))
         .route("/healthz", get(health))
         .route("/api/providers", get(health))
         .with_state(app)
