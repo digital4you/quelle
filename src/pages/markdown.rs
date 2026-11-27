@@ -594,8 +594,8 @@ fn render_element(
     let mut pending_space = false;
 
     let mut heading_open: Option<usize> = None;
-    let mut bold_open: HashMap<NodeId, bool> = HashMap::new();
-    let mut italic_open: HashMap<NodeId, bool> = HashMap::new();
+    let mut bold_open: HashMap<NodeId, usize> = HashMap::new();
+    let mut italic_open: HashMap<NodeId, usize> = HashMap::new();
 
     for edge in root.traverse() {
         let node = match edge {
@@ -633,6 +633,10 @@ fn render_element(
                 if pre_depth > 0 {
                     if name == "pre" {
                         pre_depth += 1;
+                    } else if is_pre_ui_chrome(el) {
+                        skip = Some(node.id());
+                    } else if name == "br" {
+                        out.push('\n');
                     }
                     continue;
                 }
@@ -693,7 +697,7 @@ fn render_element(
                     "dt" => {
                         ensure_blank_line(&mut out);
                         out.push_str("**");
-                        bold_open.insert(node.id(), true);
+                        bold_open.insert(node.id(), out.len());
                         pending_space = false;
                     }
                     "dd" => {
@@ -711,12 +715,12 @@ fn render_element(
                     "strong" | "b" => {
                         flush_space(&mut out, &mut pending_space, '*');
                         out.push_str("**");
-                        bold_open.insert(node.id(), true);
+                        bold_open.insert(node.id(), out.len());
                     }
                     "em" | "i" => {
                         flush_space(&mut out, &mut pending_space, '*');
                         out.push('*');
-                        italic_open.insert(node.id(), true);
+                        italic_open.insert(node.id(), out.len());
                     }
                     "ul" => {
                         if lists.is_empty() {
@@ -769,7 +773,7 @@ fn render_element(
                             } else {
                                 "tel"
                             };
-                            if out.ends_with(')') {
+                            if out.ends_with(')') || (out.ends_with("**") && bold_open.is_empty()) {
                                 pending_space = true;
                             }
                             flush_space(&mut out, &mut pending_space, '[');
@@ -790,7 +794,7 @@ fn render_element(
                                 .map(String::from)
                         {
                             // Separate adjacent links like `[A](u1)[B](u2)` -> `[A](u1) [B](u2)`
-                            if out.ends_with(')') {
+                            if out.ends_with(')') || (out.ends_with("**") && bold_open.is_empty()) {
                                 pending_space = true;
                             }
                             flush_space(&mut out, &mut pending_space, '[');
@@ -892,6 +896,12 @@ fn render_element(
                             out.push_str("\n\n");
                             pending_space = false;
                         }
+                    } else if is_pre_line_container(el)
+                        && let Some(frame) = pre_frames.last()
+                        && out.len() > frame.body_start
+                        && !out.ends_with('\n')
+                    {
+                        out.push('\n');
                     }
                     continue;
                 }
@@ -929,27 +939,44 @@ fn render_element(
                         }
                     }
                     "strong" | "b" | "dt" => {
-                        if bold_open.remove(&node.id()).is_some() {
-                            if out.ends_with("**") {
-                                out.truncate(out.len() - 2);
+                        if let Some(start) = bold_open.remove(&node.id()) {
+                            let trailing =
+                                pending_space || out[start..].ends_with(char::is_whitespace);
+                            let inner = out[start..].trim().to_owned();
+                            if inner.is_empty() {
+                                out.truncate(start.saturating_sub(2));
                             } else {
+                                out.truncate(start);
+                                out.push_str(&inner);
                                 out.push_str("**");
+                                if trailing {
+                                    pending_space = true;
+                                }
                             }
                         }
                         if name == "dt" {
                             ensure_newline(&mut out);
+                            pending_space = false;
                         }
                     }
                     "em" | "i" => {
-                        if italic_open.remove(&node.id()).is_some() {
-                            if out.ends_with('*') && !out.ends_with("**") {
-                                out.pop();
+                        if let Some(start) = italic_open.remove(&node.id()) {
+                            let trailing =
+                                pending_space || out[start..].ends_with(char::is_whitespace);
+                            let inner = out[start..].trim().to_owned();
+                            if inner.is_empty() {
+                                out.truncate(start.saturating_sub(1));
                             } else {
+                                out.truncate(start);
+                                out.push_str(&inner);
                                 out.push('*');
+                                if trailing {
+                                    pending_space = true;
+                                }
                             }
                         }
                     }
-                    "span" | "small" | "label" => {
+                    "span" | "small" | "label" | "kbd" => {
                         // Separate adjacent inline containers like `<span>quote</span><span>by Author</span>`
                         if !out.is_empty() && !out.ends_with([' ', '\n', '[', '(', '*', '`']) {
                             pending_space = true;
@@ -1000,6 +1027,11 @@ fn render_element(
                                 out.push_str(&frame.href);
                                 out.push(')');
                             }
+                        } else if name == "button"
+                            && !out.is_empty()
+                            && !out.ends_with([' ', '\n', '[', '(', '*', '`'])
+                        {
+                            pending_space = true;
                         }
                     }
                     "td" | "th" => {
@@ -1107,20 +1139,64 @@ fn max_backtick_run(text: &str) -> usize {
     best
 }
 
+fn is_pre_ui_chrome(el: ElementRef<'_>) -> bool {
+    let name = el.value().name();
+    if name == "button" {
+        return true;
+    }
+    if let Some(cls) = el.attr("class") {
+        let lower = cls.to_ascii_lowercase();
+        if lower.split_whitespace().any(|tok| {
+            matches!(
+                tok,
+                "language-id"
+                    | "playground-link"
+                    | "copy-button"
+                    | "code-copy"
+                    | "twoslash-popup-info"
+            )
+        }) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_pre_line_container(el: ElementRef<'_>) -> bool {
+    matches!(el.value().name(), "div" | "p" | "li")
+        && el.attr("class").is_some_and(|cls| {
+            cls.split_whitespace().any(|tok| {
+                tok.eq_ignore_ascii_case("line") || tok.eq_ignore_ascii_case("code-line")
+            })
+        })
+}
+
+fn clean_lang_token(raw: &str) -> Option<String> {
+    let clean: String = raw
+        .trim()
+        .chars()
+        .take(24)
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '#'))
+        .collect();
+    (!clean.is_empty()).then_some(clean)
+}
+
 fn code_language(pre: ElementRef<'_>) -> Option<String> {
     let extract = |classes: &str| -> Option<String> {
         classes.split_whitespace().find_map(|cls| {
             let lang = cls
                 .strip_prefix("language-")
                 .or_else(|| cls.strip_prefix("lang-"))?;
-            let clean: String = lang
-                .chars()
-                .take(24)
-                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '+' | '#'))
-                .collect();
-            (!clean.is_empty()).then_some(clean)
+            clean_lang_token(lang)
         })
     };
+    for attr in ["data-language", "data-lang"] {
+        if let Some(val) = pre.attr(attr)
+            && let Some(lang) = clean_lang_token(val)
+        {
+            return Some(lang);
+        }
+    }
     if let Some(cls) = pre.attr("class")
         && let Some(lang) = extract(cls)
     {
@@ -1133,8 +1209,118 @@ fn code_language(pre: ElementRef<'_>) -> Option<String> {
         {
             return Some(lang);
         }
+        if child.attr("class").is_some_and(|c| {
+            c.split_whitespace()
+                .any(|t| t.eq_ignore_ascii_case("language-id"))
+        }) {
+            let label: String = child.text().collect();
+            if let Some(lang) = clean_lang_token(&label) {
+                return Some(lang);
+            }
+        }
     }
     None
+}
+
+/// Cleans server-negotiated Markdown/MDX documents (e.g. `react.dev`, Nuxt)
+/// outside fenced code blocks and inline code spans: strips standalone MDX
+/// layout wrapper tags and `{/* ... */}` comments, and resolves root-relative
+/// Markdown links against `base_url`.
+pub(super) fn clean_negotiated_markdown(raw: &str, base_url: &Url) -> String {
+    static STANDALONE_MDX: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(
+            r#"^</?(?:Intro|InlineToc|Note|Pitfall|DeepDive|Sandpack|Recipes|CodeStep|Recap|Challenges|Solution|YouWillLearn|Wip|Canary|Deprecated|Illustration|Diagram|TerminalBlock)(?:\s[^>]*)?/?>$"#,
+        )
+        .expect("standalone mdx tag pattern")
+    });
+    static MDX_COMMENT: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\{/\*.*?\*/\}").expect("mdx comment pattern"));
+    static REL_LINK: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\]\((/[^)\s]+)\)").expect("relative markdown link"));
+
+    let mut out = String::with_capacity(raw.len());
+    let mut fence_len = 0usize;
+    let mut blank_run = 0usize;
+
+    for line in raw.lines() {
+        let trimmed = line.trim_start();
+        let leading_ticks = trimmed.bytes().take_while(|&b| b == b'`').count();
+        let was_in_code = fence_len > 0;
+        if fence_len == 0 {
+            if leading_ticks >= 3 {
+                fence_len = leading_ticks;
+            }
+        } else if leading_ticks >= fence_len && trimmed[leading_ticks..].trim().is_empty() {
+            fence_len = 0;
+        }
+        if was_in_code || fence_len > 0 || leading_ticks >= 3 {
+            blank_run = 0;
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(line);
+            continue;
+        }
+        let line_trim = line.trim();
+        if STANDALONE_MDX.is_match(line_trim) {
+            continue;
+        }
+        let processed = transform_outside_inline_code(line, |seg| {
+            let no_comments = MDX_COMMENT.replace_all(seg, "");
+            REL_LINK
+                .replace_all(&no_comments, |caps: &regex::Captures<'_>| {
+                    let rel = &caps[1];
+                    if rel.starts_with("//") {
+                        return caps[0].to_owned();
+                    }
+                    match base_url.join(rel).ok().and_then(|u| evidence_url(u).ok()) {
+                        Some(abs) => format!("]({abs})"),
+                        None => caps[0].to_owned(),
+                    }
+                })
+                .into_owned()
+        });
+        let cleaned_line = processed.trim_end();
+        if cleaned_line.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 || out.is_empty() {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(cleaned_line);
+    }
+    out.trim().to_owned()
+}
+
+fn transform_outside_inline_code(line: &str, f: impl Fn(&str) -> String) -> String {
+    if !line.contains('`') {
+        return f(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut in_code = false;
+    while let Some(pos) = rest.find('`') {
+        let (before, after) = rest.split_at(pos);
+        if in_code {
+            out.push_str(before);
+        } else {
+            out.push_str(&f(before));
+        }
+        out.push('`');
+        in_code = !in_code;
+        rest = &after[1..];
+    }
+    if in_code {
+        out.push_str(rest);
+    } else {
+        out.push_str(&f(rest));
+    }
+    out
 }
 
 pub(super) fn is_markdown_chrome(el: ElementRef<'_>) -> bool {

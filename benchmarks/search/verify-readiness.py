@@ -60,6 +60,11 @@ def main():
             "<script>setTimeout(() => document.querySelector('[data-component=table]').innerHTML = '<table><tr><td>COMPLETE_RATES</td><td>8.1%</td></tr></table>', 900);</script>",
             "COMPLETE_RATES", 0.85, 3.0,
         ),
+        "delayed-feed": (
+            f"<main><h1>VAT</h1><p>{prose}</p><div identifier='teaser-nnsb-container'><h2>News</h2><span></span></div></main>"
+            "<script>setTimeout(() => document.querySelector('[identifier=teaser-nnsb-container]').innerHTML = '<h2>News</h2><article><p>COMPLETE_NEWS_ITEM</p></article>', 900);</script>",
+            "COMPLETE_NEWS_ITEM", 0.85, 3.0,
+        ),
         "hidden-placeholder": (
             f"<main><p>{prose}</p><div hidden data-component='table'></div>"
             "<div hidden role='status'>Loading application</div></main>",

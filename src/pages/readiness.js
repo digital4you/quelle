@@ -22,8 +22,10 @@ function (threshold) {
     const content = regions.length ? regions.map(text).sort((a, b) => b.length - a.length)[0] : text(document.body);
     const pendingTable = Array.from(document.querySelectorAll("[identifier=table], [data-component=table], [role=table]"))
         .some(el => visible(el) && !text(el));
+    const pendingFeed = Array.from(document.querySelectorAll("[identifier=teaser-nnsb-container], [data-component=news], [data-component=feed]"))
+        .some(el => visible(el) && !el.querySelector("a, article, li, p, td"));
     const loading = /^(loading(?: application| document)?|laden der anwendung|dokument wird geladen|chargement de l[’']application|caricamento dell'applicazione)[.\s…]*$/i.test(content);
-    if (pendingTable || loading || content.length < threshold) {
+    if (pendingTable || pendingFeed || loading || content.length < threshold) {
         delete globalThis.__quelleReadiness;
         return false;
     }

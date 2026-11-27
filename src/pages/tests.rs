@@ -611,3 +611,161 @@ fn nested_layout_tables_do_not_escape_literal_pipes() {
         "escaped pipe leaked in layout table: {content}"
     );
 }
+
+#[test]
+fn shiki_code_blocks_preserve_line_breaks_language_and_strip_ui_controls() {
+    let html = r#"<main>
+        <h1>Narrowing</h1>
+        <pre class="shiki light-plus twoslash"><div class="language-id">ts</div><div class="code-container"><code><div class="line"><span>function</span><span> </span><span>padLeft</span><span>() {</span></div><div class="line"><span>  return 1;</span></div><div class="line"><span>}</span></div></code></div><a class="playground-link" href="/play">Try</a><button type="button">Copy</button></pre>
+        <pre><code>line1<br>line2</code></pre>
+    </main>"#;
+    let content = read(html).content;
+    assert!(
+        content.contains("```ts\nfunction padLeft() {\n  return 1;\n}\n```"),
+        "shiki lines or lang broken: {content}"
+    );
+    assert!(
+        !content.contains("Try"),
+        "playground control leaked: {content}"
+    );
+    assert!(!content.contains("Copy"), "copy button leaked: {content}");
+    assert!(
+        content.contains("```\nline1\nline2\n```"),
+        "br inside pre lost newline: {content}"
+    );
+}
+
+#[test]
+fn negotiated_markdown_normalizes_mdx_wrappers_comments_and_relative_links() {
+    let raw = "---\ntitle: useEffect\n---\n\n<Intro>\n\nRead [effects](/learn/effects#step-1) and see `<InlineToc />`.\n\n</Intro>\n\n<InlineToc />\n\n## Reference {/*reference*/}\n\n```jsx\n<Intro>\n  {/* keep comment inside code */}\n  <ChatRoom />\n</Intro>\n```\n";
+    let base = Url::parse("https://react.dev/reference/react/useEffect").unwrap();
+    let cleaned = markdown::clean_negotiated_markdown(raw, &base);
+    assert!(
+        cleaned.contains("[effects](https://react.dev/learn/effects#step-1)"),
+        "relative link not resolved: {cleaned}"
+    );
+    assert!(
+        cleaned.contains("## Reference\n"),
+        "mdx comment not stripped: {cleaned}"
+    );
+    assert!(!cleaned.contains("{/*reference*/}"), "{cleaned}");
+    let (prose_part, code_part) = cleaned
+        .split_once("```jsx")
+        .expect("fenced jsx block should survive");
+    assert!(
+        !prose_part.contains("<Intro>"),
+        "wrapper tag leaked: {cleaned}"
+    );
+    assert!(
+        !prose_part.contains("</Intro>"),
+        "closing wrapper leaked: {cleaned}"
+    );
+    assert!(
+        !prose_part.contains("\n<InlineToc />"),
+        "self-closing mdx tag leaked: {cleaned}"
+    );
+    assert!(
+        prose_part.contains("`<InlineToc />`"),
+        "inline code altered: {cleaned}"
+    );
+    assert!(
+        code_part
+            .contains("<Intro>\n  {/* keep comment inside code */}\n  <ChatRoom />\n</Intro>\n```"),
+        "fenced code block altered: {cleaned}"
+    );
+}
+
+#[test]
+fn inline_emphasis_and_adjacent_controls_keep_clean_markdown_spacing() {
+    let html = r#"<main>
+        <p><b><a href="/news">Hacker News</a></b><a href="/newest">new</a></p>
+        <p><button><kbd>⌘K</kbd><kbd>Ctrl K</kbd></button><a href="/docs">Docs</a></p>
+        <p><em>
+The term “Microservices” 
+</em>has sprung up.</p>
+        <p><strong>  Important  </strong>detail.</p>
+    </main>"#;
+    let content = read(html).content;
+    assert!(
+        content.contains(
+            "**[Hacker News](https://example.org/news)** [new](https://example.org/newest)"
+        ),
+        "bold link glued to next link: {content}"
+    );
+    assert!(
+        content.contains("⌘K Ctrl K [Docs](https://example.org/docs)"),
+        "kbd/button glued to link: {content}"
+    );
+    assert!(
+        content.contains("*The term “Microservices”* has sprung up."),
+        "leading/trailing space in em broken: {content}"
+    );
+    assert!(
+        content.contains("**Important** detail."),
+        "leading/trailing space in strong broken: {content}"
+    );
+}
+
+#[test]
+fn empty_hydrated_feed_container_triggers_js_render_without_failing_rendered_page() {
+    let prose =
+        "Substantive federal VAT documentation explains tax obligations and rates. ".repeat(12);
+    let html = format!(
+        r#"<script src="/app.js"></script><main><h1>MWST</h1><p>{prose}</p>
+        <div id="doc-news" identifier="teaser-nnsb-container"><h2>News</h2><span></span></div>
+        </main>"#
+    );
+    assert!(
+        matches!(
+            extract(
+                Url::parse("https://example.org/").unwrap(),
+                html.as_bytes(),
+                Some("text/html"),
+                None,
+                false
+            ),
+            Err(PageError::NeedsJs)
+        ),
+        "static empty hydrated feed should request JS rendering"
+    );
+    let rendered = extract(
+        Url::parse("https://example.org/").unwrap(),
+        html.as_bytes(),
+        Some("text/html"),
+        None,
+        true,
+    )
+    .expect("rendered page should still succeed even if feed has no items");
+    assert!(
+        rendered.content.contains("Substantive federal VAT"),
+        "{}",
+        rendered.content
+    );
+}
+
+#[test]
+fn text_plain_frontmatter_markdown_is_classified_as_markdown_while_plain_txt_stays_text() {
+    let md_url = Url::parse("https://react.dev/reference/react/useEffect").unwrap();
+    let md_body = b"---\ntitle: useEffect\n---\n\n<Intro>\n\nRead [effects](/learn/effects).\n\n</Intro>\n\n## Reference {/*ref*/}\n";
+    let classified = classify_download(
+        md_url,
+        200,
+        Some("text/plain; charset=utf-8".to_owned()),
+        md_body.to_vec(),
+        false,
+    )
+    .unwrap();
+    assert!(matches!(classified.kind, Kind::Markdown));
+
+    let txt_url = Url::parse("https://www.rfc-editor.org/rfc/rfc2606.txt").unwrap();
+    let txt_body = b"Network Working Group                                         D. Eastlake\nRequest for Comments: 2606\n\nReserved Top Level DNS Names\n";
+    let plain = classify_download(
+        txt_url,
+        200,
+        Some("text/plain; charset=utf-8".to_owned()),
+        txt_body.to_vec(),
+        false,
+    )
+    .unwrap();
+    assert!(matches!(plain.kind, Kind::Text));
+}

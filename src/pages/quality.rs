@@ -22,7 +22,7 @@ pub(super) fn text_error(text: &str) -> Option<PageError> {
     None
 }
 
-pub(super) fn check(document: &Html) -> Result<(), PageError> {
+pub(super) fn check(document: &Html, rendered: bool) -> Result<(), PageError> {
     static TITLE: LazyLock<Selector> = LazyLock::new(|| Selector::parse("title, h1").unwrap());
     static MAIN: LazyLock<Selector> =
         LazyLock::new(|| Selector::parse("main, article, [role=main]").unwrap());
@@ -35,6 +35,14 @@ pub(super) fn check(document: &Html) -> Result<(), PageError> {
     static TABLES: LazyLock<Selector> = LazyLock::new(|| {
         Selector::parse("[identifier=table], [data-component=table], [role=table]").unwrap()
     });
+    static FEEDS: LazyLock<Selector> = LazyLock::new(|| {
+        Selector::parse(
+            "[identifier=teaser-nnsb-container], [data-component=news], [data-component=feed]",
+        )
+        .unwrap()
+    });
+    static FEED_ITEMS: LazyLock<Selector> =
+        LazyLock::new(|| Selector::parse("a, article, li, p, td").unwrap());
     let plain = clean::page_text(document.root_element(), false);
     if let Some(error) = text_error(&plain) {
         return Err(error);
@@ -70,6 +78,17 @@ pub(super) fn check(document: &Html) -> Result<(), PageError> {
             .select(&TABLES)
             .filter(|table| !hidden(*table))
             .any(|table| clean::page_text(table, false).trim().is_empty())
+        {
+            return Err(PageError::NeedsJs);
+        }
+        // SSR pages can also contain empty client-hydrated news/feed widgets
+        // (e.g. Nuxt containers carrying only a section heading until hydrated).
+        // Escalate once from static HTML, without failing an already-rendered page.
+        if !rendered
+            && document
+                .select(&FEEDS)
+                .filter(|feed| !hidden(*feed))
+                .any(|feed| feed.select(&FEED_ITEMS).next().is_none())
         {
             return Err(PageError::NeedsJs);
         }

@@ -1105,7 +1105,12 @@ fn classify_download(
     let is_pdf = bytes.starts_with(b"%PDF-");
     let kind = match declared {
         Some(Kind::Pdf) if !is_pdf => return Err(PageError::Unreadable),
-        Some(Kind::Text) if matches!(extension.as_str(), "md" | "markdown") => Kind::Markdown,
+        Some(Kind::Text)
+            if matches!(extension.as_str(), "md" | "markdown")
+                || (extension != "txt" && looks_like_markdown(&bytes)) =>
+        {
+            Kind::Markdown
+        }
         Some(Kind::Feed) => {
             // Distinguish RSS/Atom feeds from generic XHTML/HTML served as text/xml.
             let head =
@@ -1139,6 +1144,19 @@ fn classify_download(
         kind,
         truncated,
     })
+}
+
+fn looks_like_markdown(bytes: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+    let trimmed = head.trim_start();
+    let has_frontmatter = trimmed.starts_with("---\n")
+        && trimmed[4..].contains("\n---\n")
+        && trimmed[4..].lines().take(12).any(|l| l.contains(':'));
+    let has_heading = trimmed
+        .lines()
+        .any(|l| l.starts_with("# ") || l.starts_with("## "));
+    let has_md_syntax = head.contains("](") || head.contains("\n```");
+    (has_frontmatter && (has_heading || has_md_syntax)) || (has_heading && has_md_syntax)
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -1300,7 +1318,8 @@ async fn fetch_uncached(
             Kind::Document(format) => return document(url, bytes, format, relevance).await,
             Kind::Markdown => {
                 let decoded = decode_bytes(&bytes, content_type.as_deref());
-                return text_source(url, decoded, "markdown", relevance);
+                let cleaned = markdown::clean_negotiated_markdown(&decoded, &url);
+                return text_source(url, cleaned, "markdown", relevance);
             }
             Kind::Json => {
                 let decoded = pretty_json_bytes(&bytes, content_type.as_deref());
@@ -1480,7 +1499,8 @@ pub async fn scrape(
             }
             Kind::Markdown => {
                 let decoded = decode_bytes(&bytes, content_type.as_deref());
-                let title = first_markdown_heading(&decoded).unwrap_or_else(|| pdf_name(&url));
+                let cleaned = markdown::clean_negotiated_markdown(&decoded, &url);
+                let title = first_markdown_heading(&cleaned).unwrap_or_else(|| pdf_name(&url));
                 let meta = PageMeta {
                     status_code: Some(status),
                     content_type,
@@ -1490,8 +1510,8 @@ pub async fn scrape(
                     requested_url: (url != requested).then_some(requested),
                     url,
                     title,
-                    markdown: want_md.then(|| decoded.clone()),
-                    text: want_text.then_some(decoded),
+                    markdown: want_md.then(|| cleaned.clone()),
+                    text: want_text.then_some(cleaned),
                     html: None,
                     links: want_links.then(Vec::new),
                     metadata: meta,
@@ -1652,7 +1672,7 @@ async fn build_scraped_html(
     tokio::task::spawn_blocking(move || {
         let decoded = decode_bytes(&bytes, content_type.as_deref());
         let document = Html::parse_document(&decoded);
-        quality::check(&document)?;
+        quality::check(&document, rendered)?;
         static TITLE: LazyLock<Selector> =
             LazyLock::new(|| Selector::parse("title").expect("title selector"));
         static CHALLENGE: LazyLock<Selector> = LazyLock::new(|| {
@@ -2667,7 +2687,7 @@ fn extract(
         Selector::parse("#challenge-form, #cf-challenge-running").expect("challenge selector")
     });
     let document = Html::parse_document(&text);
-    quality::check(&document)?;
+    quality::check(&document, rendered)?;
     let title = document
         .select(&TITLE)
         .next()
