@@ -769,3 +769,68 @@ fn text_plain_frontmatter_markdown_is_classified_as_markdown_while_plain_txt_sta
     .unwrap();
     assert!(matches!(plain.kind, Kind::Text));
 }
+
+#[test]
+fn pdf_layout_detector_flags_fragmented_tables_and_leaves_clean_prose_alone() {
+    let fragmented_table = "\
+Quarter
+Revenue
+Margin
+Q1 2026
+120.4
+18.2%
+Q2 2026
+134.8
+19.5%
+Q3 2026
+142.1
+20.1%
+Q4 2026
+155.0
+21.4%
+Total
+552.3
+19.8%
+North
+210.1
+20.0%
+South
+180.5
+19.1%
+East
+161.7
+20.3%";
+    assert!(pdf_needs_layout_mode(fragmented_table));
+
+    let clean_prose = "\
+The European Central Bank sets three key interest rates for the euro area each governing council cycle.\n\
+These rates guide monetary policy transmission across commercial banks, sovereign yields, and household credit.\n\
+Detailed statistical tables are published alongside the press release after each monetary policy meeting.\n\
+Historical series remain available in the public data portal for verification and empirical research.\n";
+    assert!(!pdf_needs_layout_mode(clean_prose));
+}
+
+#[test]
+fn pdf_garbled_detector_flags_cid_and_replacement_corruption() {
+    let garbled = "Report \u{FFFD}\u{FFFD}\u{FFFD} \u{E001}\u{E002}\u{E003}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD} 2026 \u{FFFD}\u{FFFD}\u{FFFD}\u{FFFD}";
+    assert!(pdf_text_garbled(garbled));
+    assert!(!pdf_text_garbled(
+        "Annual Financial Report 2026 — Revenue CHF 11.2 billion (+3.4%)."
+    ));
+}
+
+#[test]
+fn format_pdf_layout_text_dedents_and_converts_aligned_rows_to_markdown_tables() {
+    let raw = "\
+    Quarterly Results\n\
+\n\
+    Quarter     Revenue     Margin\n\
+    Q1 2026     120.4       18.2%\n\
+    Q2 2026     134.8       19.5%\n\
+    Q3 2026     142.1       20.1%\n";
+    let formatted = format_pdf_layout_text(raw);
+    assert!(formatted.contains("Quarterly Results"));
+    assert!(formatted.contains("| Quarter | Revenue | Margin |"));
+    assert!(formatted.contains("| Q1 2026 | 120.4 | 18.2% |"));
+    assert!(formatted.contains("| Q3 2026 | 142.1 | 20.1% |"));
+}

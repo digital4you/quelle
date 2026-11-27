@@ -46,6 +46,8 @@ pub struct PageMeta {
     pub status_code: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages_read: Option<usize>,
 }
 
 /// Options controlling HTML -> Markdown / text extraction.

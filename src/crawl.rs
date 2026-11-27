@@ -34,7 +34,7 @@ use crate::{
     pages::{
         self, ExtractOptions, OutputFormat, PageError, RenderMode, ScrapeOptions, ScrapedPage,
     },
-    problem, robots,
+    problem, robots, selection,
 };
 
 const MAX_MAP_LIMIT: usize = 5000;
@@ -70,6 +70,14 @@ pub struct CrawlErrorEntry {
     pub error: &'static str,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangeSummary {
+    pub added: usize,
+    pub updated: usize,
+    pub unchanged: usize,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CrawlJobSnapshot {
@@ -78,9 +86,17 @@ pub struct CrawlJobSnapshot {
     pub total: usize,
     pub completed: usize,
     pub failed: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<ChangeSummary>,
     pub data: Vec<ScrapedPage>,
     pub errors: Vec<CrawlErrorEntry>,
     pub elapsed_ms: u64,
+}
+
+#[derive(Clone)]
+struct StoredPageSnapshot {
+    hash: String,
+    markdown: Option<String>,
 }
 
 struct CrawlJobState {
@@ -91,6 +107,8 @@ struct CrawlJobState {
     total: usize,
     completed: usize,
     failed: usize,
+    changes: Option<ChangeSummary>,
+    page_snapshots: HashMap<String, StoredPageSnapshot>,
     data: Vec<ScrapedPage>,
     errors: Vec<CrawlErrorEntry>,
     cancel: Arc<AtomicBool>,
@@ -107,6 +125,7 @@ impl CrawlJobState {
             total: self.total,
             completed: self.completed,
             failed: self.failed,
+            changes: self.changes,
             data: self.data.clone(),
             errors: self.errors.clone(),
             elapsed_ms,
@@ -304,6 +323,7 @@ pub async fn map_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Resp
         render: RenderMode::Auto,
         wait_for_ms: None,
         cache_max_age: Duration::from_secs(5 * 60),
+        ..ScrapeOptions::default()
     };
     for seed in &seeds {
         if discovered.len() >= limit || Instant::now() >= deadline {
@@ -371,6 +391,16 @@ struct CrawlInput {
     concurrency: Option<usize>,
     #[serde(default)]
     sync: bool,
+    #[serde(default)]
+    incremental: bool,
+    since_crawl_id: Option<String>,
+    previous_hashes: Option<HashMap<String, String>>,
+    #[serde(default)]
+    omit_unchanged_content: bool,
+    max_tokens: Option<usize>,
+    chunk_tokens: Option<usize>,
+    focus_query: Option<String>,
+    max_pages: Option<usize>,
 }
 
 impl CrawlInput {
@@ -413,6 +443,31 @@ impl CrawlInput {
         {
             return false;
         }
+        if let Some(hashes) = &self.previous_hashes
+            && hashes.len() > 2000
+        {
+            return false;
+        }
+        if let Some(t) = self.max_tokens
+            && !(32..=200_000).contains(&t)
+        {
+            return false;
+        }
+        if let Some(t) = self.chunk_tokens
+            && !(32..=4096).contains(&t)
+        {
+            return false;
+        }
+        if let Some(q) = &self.focus_query
+            && q.chars().count() > 600
+        {
+            return false;
+        }
+        if let Some(p) = self.max_pages
+            && !(1..=pages::MAX_PDF_MAX_PAGES).contains(&p)
+        {
+            return false;
+        }
         true
     }
 }
@@ -431,6 +486,9 @@ struct CrawlConfig {
     keep_links_in_output: bool,
     concurrency: usize,
     timeout: Duration,
+    incremental: bool,
+    omit_unchanged_content: bool,
+    previous: HashMap<String, StoredPageSnapshot>,
 }
 
 pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
@@ -453,6 +511,41 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
     if !fetch_formats.contains(&OutputFormat::Links) {
         fetch_formats.push(OutputFormat::Links);
     }
+
+    let incremental =
+        input.incremental || input.since_crawl_id.is_some() || input.previous_hashes.is_some();
+
+    let mut previous: HashMap<String, StoredPageSnapshot> = HashMap::new();
+    if let Some(ref prev_id) = input.since_crawl_id {
+        let Some(prev_job) = app.crawls.get(prev_id) else {
+            return problem(StatusCode::NOT_FOUND, "crawl_not_found");
+        };
+        if let Ok(guard) = prev_job.lock() {
+            previous.extend(guard.page_snapshots.clone());
+        }
+    }
+    if let Some(ref hashes) = input.previous_hashes {
+        for (raw_url, hash) in hashes {
+            let key = Url::parse(raw_url)
+                .ok()
+                .map_or_else(|| raw_url.clone(), |u| selection::url_key(&u));
+            previous.insert(
+                key,
+                StoredPageSnapshot {
+                    hash: hash.clone(),
+                    markdown: None,
+                },
+            );
+        }
+    }
+
+    // Incremental crawls default to conditional revalidation (max_age = 0) so
+    // ETag / Last-Modified 304 responses verify freshness without stale cache hits.
+    let cache_max_age = match input.max_age {
+        Some(secs) => Duration::from_secs(secs),
+        None if incremental => Duration::ZERO,
+        None => Duration::from_secs(300),
+    };
 
     let config = CrawlConfig {
         seeds: input
@@ -477,7 +570,16 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
             },
             render: input.render,
             wait_for_ms: input.wait_for,
-            cache_max_age: Duration::from_secs(input.max_age.unwrap_or(300)),
+            cache_max_age,
+            max_tokens: input.max_tokens,
+            chunk_tokens: input.chunk_tokens,
+            focus_query: input
+                .focus_query
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            max_pages: input.max_pages,
         },
         keep_links_in_output,
         concurrency: input.concurrency.unwrap_or(4).min(8),
@@ -486,6 +588,9 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
         } else {
             ASYNC_CRAWL_TIMEOUT
         },
+        incremental,
+        omit_unchanged_content: input.omit_unchanged_content,
+        previous,
     };
 
     let id = CrawlManager::next_id();
@@ -497,6 +602,8 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
         total: config.seeds.len(),
         completed: 0,
         failed: 0,
+        changes: config.incremental.then(ChangeSummary::default),
+        page_snapshots: HashMap::new(),
         data: Vec::new(),
         errors: Vec::new(),
         cancel: Arc::new(AtomicBool::new(false)),
@@ -756,9 +863,59 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
                     }
                     continue;
                 }
+                let stable_hash = stable_content_hash(primary);
+                let url_key = selection::url_key(&page.url);
+                let snapshot_md = page.markdown.clone().or_else(|| page.text.clone());
+
+                let mut status_for_summary = None;
+                if config.incremental {
+                    let prev = config.previous.get(&url_key).or_else(|| {
+                        page.requested_url
+                            .as_ref()
+                            .and_then(|u| config.previous.get(&selection::url_key(u)))
+                    });
+                    let change_status = match prev {
+                        None => ChangeStatus::Added,
+                        Some(prev_snap) if prev_snap.hash == stable_hash => {
+                            if config.omit_unchanged_content {
+                                page.markdown = None;
+                                page.text = None;
+                                page.html = None;
+                                page.chunks = None;
+                            }
+                            ChangeStatus::Unchanged
+                        }
+                        Some(prev_snap) => {
+                            if let (Some(old_md), Some(new_md)) =
+                                (prev_snap.markdown.as_deref(), snapshot_md.as_deref())
+                            {
+                                page.diff = Some(compute_section_diff(old_md, new_md));
+                            }
+                            ChangeStatus::Updated
+                        }
+                    };
+                    page.content_hash = Some(stable_hash.clone());
+                    page.change_status = Some(change_status);
+                    status_for_summary = Some(change_status);
+                }
+
                 if let Ok(mut g) = job.lock() {
                     g.completed += 1;
                     g.total = seen.len();
+                    if let (Some(summary), Some(st)) = (g.changes.as_mut(), status_for_summary) {
+                        match st {
+                            ChangeStatus::Added => summary.added += 1,
+                            ChangeStatus::Updated => summary.updated += 1,
+                            ChangeStatus::Unchanged => summary.unchanged += 1,
+                        }
+                    }
+                    g.page_snapshots.insert(
+                        url_key,
+                        StoredPageSnapshot {
+                            hash: stable_hash,
+                            markdown: snapshot_md,
+                        },
+                    );
                     g.data.push(page);
                 }
             }
@@ -793,6 +950,191 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
 // ---------------------------------------------------------------------------
 // URL / Path Matching Helpers
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChangeStatus {
+    Added,
+    Updated,
+    Unchanged,
+}
+
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SectionDiff {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub added_sections: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub removed_sections: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changed_sections: Vec<String>,
+}
+
+/// Computes a stable deterministic SHA-256 hex digest (`sha256:<hex>`) over
+/// whitespace-normalized page content for cross-run incremental change tracking.
+pub(crate) fn stable_content_hash(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if !normalized.is_empty() {
+            normalized.push(' ');
+        }
+        normalized.push_str(word);
+    }
+    format!("sha256:{}", sha256_hex(normalized.as_bytes()))
+}
+
+/// Computes heading-level section diffs between previous and current Markdown.
+pub(crate) fn compute_section_diff(previous: &str, current: &str) -> SectionDiff {
+    let prev_sections = split_markdown_sections(previous);
+    let curr_sections = split_markdown_sections(current);
+
+    let prev_map: HashMap<&str, &str> = prev_sections
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let curr_map: HashMap<&str, &str> = curr_sections
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+
+    let mut diff = SectionDiff::default();
+    for (heading, body) in &curr_sections {
+        match prev_map.get(heading.as_str()) {
+            None => diff.added_sections.push(heading.clone()),
+            Some(old_body) if stable_content_hash(old_body) != stable_content_hash(body) => {
+                diff.changed_sections.push(heading.clone());
+            }
+            Some(_) => {}
+        }
+    }
+    for (heading, _) in &prev_sections {
+        if !curr_map.contains_key(heading.as_str()) {
+            diff.removed_sections.push(heading.clone());
+        }
+    }
+    diff
+}
+
+fn split_markdown_sections(md: &str) -> Vec<(String, String)> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut current_heading = "(intro)".to_owned();
+    let mut current_lines: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+
+    let flush = |sections: &mut Vec<(String, String)>, heading: &str, lines: &mut Vec<&str>| {
+        let body = lines.join("\n").trim().to_owned();
+        if !body.is_empty() || heading != "(intro)" {
+            sections.push((heading.to_owned(), body));
+        }
+        lines.clear();
+    };
+
+    for line in md.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            current_lines.push(line);
+            continue;
+        }
+        if !in_fence && trimmed.starts_with('#') {
+            let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+            if (1..=6).contains(&hashes)
+                && let Some(rest) = trimmed[hashes..].strip_prefix(' ')
+            {
+                let heading = rest.trim().trim_end_matches('#').trim();
+                if !heading.is_empty() {
+                    flush(&mut sections, &current_heading, &mut current_lines);
+                    current_heading = heading.to_owned();
+                    continue;
+                }
+            }
+        }
+        current_lines.push(line);
+    }
+    flush(&mut sections, &current_heading, &mut current_lines);
+    sections
+}
+
+/// Pure-Rust FIPS 180-4 SHA-256 hex digest (zero external crates).
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((data.len() + 9).div_ceil(64) * 64);
+    padded.extend_from_slice(data);
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    for block in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, chunk) in block.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        h[0] = h[0].wrapping_add(a);
+        h[1] = h[1].wrapping_add(b);
+        h[2] = h[2].wrapping_add(c);
+        h[3] = h[3].wrapping_add(d);
+        h[4] = h[4].wrapping_add(e);
+        h[5] = h[5].wrapping_add(f);
+        h[6] = h[6].wrapping_add(g);
+        h[7] = h[7].wrapping_add(hh);
+    }
+
+    let mut out = String::with_capacity(64);
+    for word in h {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{word:08x}");
+    }
+    out
+}
 
 fn fingerprint_text(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -913,5 +1255,50 @@ mod tests {
         assert!(host_matches(&sub, &hosts, true, false));
         assert!(!host_matches(&ext, &hosts, true, false));
         assert!(host_matches(&ext, &hosts, false, true));
+    }
+
+    #[test]
+    fn stable_content_hash_is_deterministic_sha256_and_whitespace_insensitive() {
+        let h1 = stable_content_hash("Hello   world\n\nSection 1");
+        let h2 = stable_content_hash("Hello world Section 1");
+        let h3 = stable_content_hash("Hello world Section 2");
+        assert!(h1.starts_with("sha256:"));
+        assert_eq!(h1.len(), "sha256:".len() + 64);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn section_diff_identifies_added_removed_and_changed_markdown_sections() {
+        let old = "\
+# Docs
+
+Welcome intro.
+
+## Authentication
+
+Use bearer tokens.
+
+## Deprecated Endpoints
+
+Legacy v1 endpoints.";
+
+        let new = "\
+# Docs
+
+Welcome intro.
+
+## Authentication
+
+Use bearer tokens with 32+ ASCII chars.
+
+## Incremental Crawls
+
+Pass previousHashes or sinceCrawlId.";
+
+        let diff = compute_section_diff(old, new);
+        assert_eq!(diff.added_sections, vec!["Incremental Crawls"]);
+        assert_eq!(diff.removed_sections, vec!["Deprecated Endpoints"]);
+        assert_eq!(diff.changed_sections, vec!["Authentication"]);
     }
 }

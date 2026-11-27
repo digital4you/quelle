@@ -55,6 +55,10 @@ struct ScrapeInput {
     render: RenderMode,
     wait_for: Option<u64>,
     max_age: Option<u64>,
+    max_tokens: Option<usize>,
+    chunk_tokens: Option<usize>,
+    focus_query: Option<String>,
+    max_pages: Option<usize>,
 }
 
 impl ScrapeInput {
@@ -67,6 +71,26 @@ impl ScrapeInput {
         }
         if let Some(f) = &self.formats
             && f.is_empty()
+        {
+            return false;
+        }
+        if let Some(t) = self.max_tokens
+            && !(32..=200_000).contains(&t)
+        {
+            return false;
+        }
+        if let Some(t) = self.chunk_tokens
+            && !(32..=4096).contains(&t)
+        {
+            return false;
+        }
+        if let Some(q) = &self.focus_query
+            && q.chars().count() > 600
+        {
+            return false;
+        }
+        if let Some(p) = self.max_pages
+            && !(1..=pages::MAX_PDF_MAX_PAGES).contains(&p)
         {
             return false;
         }
@@ -132,6 +156,15 @@ pub async fn scrape_handle(State(app): State<Arc<App>>, req: Request<Body>) -> R
         render: input.render,
         wait_for_ms: input.wait_for,
         cache_max_age: Duration::from_secs(input.max_age.unwrap_or(300)),
+        max_tokens: input.max_tokens,
+        chunk_tokens: input.chunk_tokens,
+        focus_query: input
+            .focus_query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        max_pages: input.max_pages,
     };
 
     // Single URL mode -> returns `{ "data": ScrapedPage }` directly (Firecrawl style).
@@ -271,6 +304,7 @@ pub async fn extract_handle(State(app): State<Arc<App>>, req: Request<Body>) -> 
         render: input.render,
         wait_for_ms: input.wait_for,
         cache_max_age: Duration::from_secs(5 * 60),
+        ..ScrapeOptions::default()
     };
 
     let (pages_data, errors) = scrape_many(&app, urls, &options, deadline).await;

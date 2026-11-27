@@ -28,6 +28,18 @@ enum Input {
     Urls {
         urls: Vec<Url>,
         limit: Option<usize>,
+        #[serde(default)]
+        chunks: bool,
+        #[serde(rename = "maxTokens")]
+        max_tokens: Option<usize>,
+        #[serde(rename = "chunkTokens")]
+        chunk_tokens: Option<usize>,
+        #[serde(rename = "focusQuery")]
+        focus_query: Option<String>,
+        #[serde(default)]
+        structured: bool,
+        #[serde(rename = "maxPages")]
+        max_pages: Option<usize>,
     },
     Search {
         query: String,
@@ -42,6 +54,18 @@ enum Input {
         preferred_domains: Vec<String>,
         #[serde(rename = "followUp")]
         follow_up: Option<bool>,
+        #[serde(default)]
+        chunks: bool,
+        #[serde(rename = "maxTokens")]
+        max_tokens: Option<usize>,
+        #[serde(rename = "chunkTokens")]
+        chunk_tokens: Option<usize>,
+        #[serde(rename = "focusQuery")]
+        focus_query: Option<String>,
+        #[serde(default)]
+        structured: bool,
+        #[serde(rename = "maxPages")]
+        max_pages: Option<usize>,
     },
 }
 
@@ -54,8 +78,102 @@ impl Input {
         }
     }
 
+    fn extras(&self) -> pages::FetchExtras {
+        match self {
+            Self::Urls {
+                chunks,
+                max_tokens,
+                chunk_tokens,
+                focus_query,
+                structured,
+                max_pages,
+                ..
+            } => pages::FetchExtras {
+                chunks: *chunks,
+                max_tokens: *max_tokens,
+                chunk_tokens: *chunk_tokens,
+                focus_query: focus_query
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned),
+                structured: *structured,
+                max_pages: *max_pages,
+            },
+            Self::Search {
+                query,
+                chunks,
+                max_tokens,
+                chunk_tokens,
+                focus_query,
+                structured,
+                max_pages,
+                ..
+            } => {
+                let explicit_focus = focus_query
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                // When searching with a token budget or chunking enabled and no
+                // explicit focusQuery, default focusQuery to the search query!
+                let effective_focus = explicit_focus
+                    .or_else(|| (*chunks || max_tokens.is_some()).then(|| query.clone()));
+                pages::FetchExtras {
+                    chunks: *chunks,
+                    max_tokens: *max_tokens,
+                    chunk_tokens: *chunk_tokens,
+                    focus_query: effective_focus,
+                    structured: *structured,
+                    max_pages: *max_pages,
+                }
+            }
+        }
+    }
+
     fn valid(&self) -> bool {
         if !(1..=RESULTS_PER_QUERY).contains(&self.limit()) {
+            return false;
+        }
+        let (max_tokens, chunk_tokens, focus_query, max_pages) = match self {
+            Self::Urls {
+                max_tokens,
+                chunk_tokens,
+                focus_query,
+                max_pages,
+                ..
+            }
+            | Self::Search {
+                max_tokens,
+                chunk_tokens,
+                focus_query,
+                max_pages,
+                ..
+            } => (
+                *max_tokens,
+                *chunk_tokens,
+                focus_query.as_deref(),
+                *max_pages,
+            ),
+        };
+        if let Some(t) = max_tokens
+            && !(32..=200_000).contains(&t)
+        {
+            return false;
+        }
+        if let Some(t) = chunk_tokens
+            && !(32..=4096).contains(&t)
+        {
+            return false;
+        }
+        if let Some(q) = focus_query
+            && q.chars().count() > 600
+        {
+            return false;
+        }
+        if let Some(p) = max_pages
+            && !(1..=pages::MAX_PDF_MAX_PAGES).contains(&p)
+        {
             return false;
         }
         match self {
@@ -88,6 +206,10 @@ struct Document {
     requested_url: Option<Url>,
     #[serde(flatten)]
     source: pages::Source,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chunks: Option<Vec<pages::chunks::Chunk>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    structured: Option<pages::structured::StructuredData>,
 }
 
 #[derive(Serialize)]
@@ -121,12 +243,14 @@ struct Extraction {
 }
 
 impl Extraction {
+    #[allow(clippy::too_many_arguments)]
     async fn read(
         &mut self,
         app: &App,
         urls: Vec<Url>,
         limit: usize,
         deadline: Instant,
+        extras: &pages::FetchExtras,
         attempted: &mut HashSet<String>,
         evidence: &mut selection::EvidenceSet,
     ) {
@@ -143,13 +267,14 @@ impl Extraction {
         let mut jobs = stream::iter(urls)
             .map(|url| {
                 let slots = app.search.page_slots.clone();
+                let extras = extras.clone();
                 async move {
                     let result = tokio::time::timeout_at(deadline, async {
                         let permit = slots
                             .acquire_owned()
                             .await
                             .expect("page semaphore remains open");
-                        pages::fetch(url.clone(), None, permit, deadline).await
+                        pages::fetch_rich(url.clone(), &extras, permit, deadline).await
                     })
                     .await
                     .unwrap_or(Err(pages::PageError::Timeout));
@@ -164,10 +289,12 @@ impl Extraction {
             attempted.insert(selection::url_key(&url));
             self.diagnostics.fetch_attempts += 1;
             match result {
-                Ok(source) if evidence.insert(&source.metadata.url, &source.content) => {
+                Ok(rich) if evidence.insert(&rich.source.metadata.url, &rich.source.content) => {
                     self.sources.push(Document {
-                        requested_url: (source.metadata.url != url).then_some(url),
-                        source,
+                        requested_url: (rich.source.metadata.url != url).then_some(url),
+                        source: rich.source,
+                        chunks: rich.chunks,
+                        structured: rich.structured,
                     })
                 }
                 Ok(_) => self.diagnostics.duplicates += 1,
@@ -188,6 +315,7 @@ pub async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response
         Err(response) => return response,
     };
     let limit = input.limit();
+    let extras = input.extras();
     let mut output = Extraction::default();
     let mut followup = None;
     let mut preferred = Vec::new();
@@ -255,7 +383,15 @@ pub async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response
     let mut attempted = HashSet::new();
     let mut evidence = selection::EvidenceSet::default();
     output
-        .read(&app, urls, limit, deadline, &mut attempted, &mut evidence)
+        .read(
+            &app,
+            urls,
+            limit,
+            deadline,
+            &extras,
+            &mut attempted,
+            &mut evidence,
+        )
         .await;
     let missing: Vec<_> = preferred
         .iter()
@@ -306,6 +442,7 @@ pub async fn handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response
                     urls,
                     before + 1,
                     deadline,
+                    &extras,
                     &mut attempted,
                     &mut evidence,
                 )

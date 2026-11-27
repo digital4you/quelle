@@ -21,12 +21,16 @@ use url::{Host, Url};
 
 use crate::{politeness, read_body, truncate};
 
+mod cdp;
+pub mod chunks;
 mod clean;
 pub mod markdown;
 mod quality;
+pub mod structured;
 #[cfg(test)]
 mod tests;
 
+pub use cdp::{set_cdp_pool_enabled, shutdown_pool};
 pub use markdown::{ExtractOptions, PageMeta};
 
 /// HTML beyond this is cut off and the prefix is parsed; long pages keep
@@ -45,12 +49,29 @@ const PASSAGE_BUDGET: usize = 6500;
 const PDF_BYTES: usize = 12 * 1024 * 1024;
 const PDF_TIMEOUT: Duration = Duration::from_secs(12);
 const PDF_EXTRACT_TIMEOUT: Duration = Duration::from_secs(5);
-/// Search answers rarely need more than the opening pages; this bounds
-/// extraction time for long reports.
-const PDF_PAGES: &str = "150";
+const PDF_LONG_EXTRACT_TIMEOUT: Duration = Duration::from_secs(12);
+/// Default page cap for PDF extraction; configurable via `QUELLE_PDF_MAX_PAGES`
+/// or per-request `maxPages` up to `MAX_PDF_MAX_PAGES`.
+pub const DEFAULT_PDF_MAX_PAGES: usize = 150;
+pub const MAX_PDF_MAX_PAGES: usize = 1000;
 const PDF_TEXT_BYTES: usize = 4 * 1024 * 1024;
 
+static PDF_MAX_PAGES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_PDF_MAX_PAGES);
 static PDF_SUPPORT: OnceLock<bool> = OnceLock::new();
+
+pub fn set_pdf_max_pages(pages: usize) {
+    PDF_MAX_PAGES.store(
+        pages.clamp(1, MAX_PDF_MAX_PAGES),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+fn effective_pdf_max_pages(override_pages: Option<usize>) -> usize {
+    override_pages
+        .unwrap_or_else(|| PDF_MAX_PAGES.load(std::sync::atomic::Ordering::Relaxed))
+        .clamp(1, MAX_PDF_MAX_PAGES)
+}
 static PROXY_URL: OnceLock<Option<String>> = OnceLock::new();
 static BROWSER_SIDECAR_URL: OnceLock<Option<Url>> = OnceLock::new();
 static OCR_SIDECAR_URL: OnceLock<Option<Url>> = OnceLock::new();
@@ -1175,6 +1196,8 @@ pub enum OutputFormat {
     Text,
     Html,
     Links,
+    Chunks,
+    Structured,
 }
 
 #[derive(Clone, Debug)]
@@ -1184,6 +1207,10 @@ pub struct ScrapeOptions {
     pub render: RenderMode,
     pub wait_for_ms: Option<u64>,
     pub cache_max_age: Duration,
+    pub max_tokens: Option<usize>,
+    pub chunk_tokens: Option<usize>,
+    pub focus_query: Option<String>,
+    pub max_pages: Option<usize>,
 }
 
 impl Default for ScrapeOptions {
@@ -1194,6 +1221,10 @@ impl Default for ScrapeOptions {
             render: RenderMode::Auto,
             wait_for_ms: None,
             cache_max_age: Duration::from_secs(5 * 60),
+            max_tokens: None,
+            chunk_tokens: None,
+            focus_query: None,
+            max_pages: None,
         }
     }
 }
@@ -1213,10 +1244,97 @@ pub struct ScrapedPage {
     pub html: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub links: Option<Vec<Url>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunks: Option<Vec<chunks::Chunk>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured: Option<structured::StructuredData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_status: Option<crate::crawl::ChangeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<crate::crawl::SectionDiff>,
     pub metadata: PageMeta,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retrieval: Option<&'static str>,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FetchExtras {
+    pub chunks: bool,
+    pub max_tokens: Option<usize>,
+    pub chunk_tokens: Option<usize>,
+    pub focus_query: Option<String>,
+    pub structured: bool,
+    pub max_pages: Option<usize>,
+}
+
+impl FetchExtras {
+    pub fn is_active(&self) -> bool {
+        self.chunks
+            || self.max_tokens.is_some()
+            || self.focus_query.is_some()
+            || self.structured
+            || self.max_pages.is_some()
+    }
+}
+
+pub struct RichSource {
+    pub source: Source,
+    pub chunks: Option<Vec<chunks::Chunk>>,
+    pub structured: Option<structured::StructuredData>,
+}
+
+pub async fn fetch_rich(
+    url: Url,
+    extras: &FetchExtras,
+    permit: OwnedSemaphorePermit,
+    deadline: Instant,
+) -> Result<RichSource, PageError> {
+    if !extras.is_active() {
+        let source = fetch(url, None, permit, deadline).await?;
+        return Ok(RichSource {
+            source,
+            chunks: None,
+            structured: None,
+        });
+    }
+    let mut formats = vec![OutputFormat::Markdown];
+    if extras.chunks {
+        formats.push(OutputFormat::Chunks);
+    }
+    if extras.structured {
+        formats.push(OutputFormat::Structured);
+    }
+    let opts = ScrapeOptions {
+        formats,
+        extract: ExtractOptions::default(),
+        render: RenderMode::Auto,
+        wait_for_ms: None,
+        cache_max_age: Duration::from_secs(5 * 60),
+        max_tokens: extras.max_tokens,
+        chunk_tokens: extras.chunk_tokens,
+        focus_query: extras.focus_query.clone(),
+        max_pages: extras.max_pages,
+    };
+    let page = scrape(url, &opts, permit, deadline).await?;
+    let content = page.markdown.or(page.text).unwrap_or_default();
+    let source = Source {
+        content,
+        metadata: Metadata {
+            title: page.title,
+            url: page.url,
+            retrieval: page.retrieval,
+            pages_read: page.metadata.pages_read,
+            truncated: Some(page.truncated),
+        },
+    };
+    Ok(RichSource {
+        source,
+        chunks: page.chunks,
+        structured: page.structured,
+    })
 }
 
 pub async fn fetch(
@@ -1314,7 +1432,7 @@ async fn fetch_uncached(
             ..
         } = downloaded;
         match kind {
-            Kind::Pdf => return pdf_or_ocr(url, &bytes, relevance, deadline).await,
+            Kind::Pdf => return pdf_or_ocr(url, &bytes, relevance, None, deadline).await,
             Kind::Document(format) => return document(url, bytes, format, relevance).await,
             Kind::Markdown => {
                 let decoded = decode_bytes(&bytes, content_type.as_deref());
@@ -1393,6 +1511,63 @@ pub async fn scrape(
         let want_text = options.formats.contains(&OutputFormat::Text);
         let want_html = options.formats.contains(&OutputFormat::Html);
         let want_links = options.formats.contains(&OutputFormat::Links);
+        let want_chunks = options.formats.contains(&OutputFormat::Chunks);
+        let want_structured = options.formats.contains(&OutputFormat::Structured);
+
+        let finalize_non_html = |url: Url,
+                                 requested: Url,
+                                 title: String,
+                                 raw_md: String,
+                                 raw_text: String,
+                                 links: Option<Vec<Url>>,
+                                 meta: PageMeta,
+                                 retrieval: Option<&'static str>,
+                                 truncated: bool| {
+            let needs_chunking =
+                want_chunks || options.max_tokens.is_some() || options.focus_query.is_some();
+            let (final_md, out_chunks) = if needs_chunking {
+                let raw_chunks = chunks::chunk_markdown(
+                    &raw_md,
+                    &url,
+                    &[],
+                    options.chunk_tokens.unwrap_or(chunks::DEFAULT_CHUNK_TOKENS),
+                );
+                let selected = chunks::distill_chunks(
+                    raw_chunks,
+                    options.focus_query.as_deref(),
+                    options.max_tokens,
+                );
+                let md_val = if want_md {
+                    Some(if options.max_tokens.is_some() {
+                        chunks::join_chunks_markdown(&selected)
+                    } else {
+                        raw_md
+                    })
+                } else {
+                    None
+                };
+                (md_val, want_chunks.then_some(selected))
+            } else {
+                (want_md.then_some(raw_md), None)
+            };
+            ScrapedPage {
+                requested_url: (url != requested).then_some(requested),
+                url,
+                title,
+                markdown: final_md,
+                text: want_text.then_some(raw_text),
+                html: None,
+                links,
+                chunks: out_chunks,
+                structured: None,
+                content_hash: None,
+                change_status: None,
+                diff: None,
+                metadata: meta,
+                retrieval,
+                truncated,
+            }
+        };
 
         let target = export_url(requested.clone());
         let host_key = target.host_str().unwrap_or_default().to_owned();
@@ -1420,6 +1595,8 @@ pub async fn scrape(
                     want_text,
                     want_html,
                     want_links,
+                    want_chunks,
+                    want_structured,
                 )
                 .await?;
                 Ok::<_, PageError>((page, tier))
@@ -1458,24 +1635,25 @@ pub async fn scrape(
 
         match kind {
             Kind::Pdf => {
-                let src = pdf_or_ocr(url.clone(), &bytes, None, deadline).await?;
+                let src =
+                    pdf_or_ocr(url.clone(), &bytes, None, options.max_pages, deadline).await?;
                 let meta = PageMeta {
                     status_code: Some(status),
                     content_type,
+                    pages_read: src.metadata.pages_read,
                     ..Default::default()
                 };
-                return Ok(ScrapedPage {
-                    requested_url: (url != requested).then_some(requested),
+                return Ok(finalize_non_html(
                     url,
-                    title: src.metadata.title,
-                    markdown: want_md.then(|| src.content.clone()),
-                    text: want_text.then_some(src.content),
-                    html: None,
-                    links: want_links.then(Vec::new),
-                    metadata: meta,
-                    retrieval: src.metadata.retrieval.or(Some("pdf")),
-                    truncated: src.metadata.truncated.unwrap_or(false),
-                });
+                    requested,
+                    src.metadata.title,
+                    src.content.clone(),
+                    src.content,
+                    want_links.then(Vec::new),
+                    meta,
+                    src.metadata.retrieval.or(Some("pdf")),
+                    src.metadata.truncated.unwrap_or(false),
+                ));
             }
             Kind::Document(format) => {
                 let src = document(url.clone(), bytes, format, None).await?;
@@ -1484,18 +1662,17 @@ pub async fn scrape(
                     content_type,
                     ..Default::default()
                 };
-                return Ok(ScrapedPage {
-                    requested_url: (url != requested).then_some(requested),
+                return Ok(finalize_non_html(
                     url,
-                    title: src.metadata.title,
-                    markdown: want_md.then(|| src.content.clone()),
-                    text: want_text.then_some(src.content),
-                    html: None,
-                    links: want_links.then(Vec::new),
-                    metadata: meta,
-                    retrieval: Some("document"),
-                    truncated: src.metadata.truncated.unwrap_or(false),
-                });
+                    requested,
+                    src.metadata.title,
+                    src.content.clone(),
+                    src.content,
+                    want_links.then(Vec::new),
+                    meta,
+                    Some("document"),
+                    src.metadata.truncated.unwrap_or(false),
+                ));
             }
             Kind::Markdown => {
                 let decoded = decode_bytes(&bytes, content_type.as_deref());
@@ -1506,18 +1683,17 @@ pub async fn scrape(
                     content_type,
                     ..Default::default()
                 };
-                return Ok(ScrapedPage {
-                    requested_url: (url != requested).then_some(requested),
+                return Ok(finalize_non_html(
                     url,
+                    requested,
                     title,
-                    markdown: want_md.then(|| cleaned.clone()),
-                    text: want_text.then_some(cleaned),
-                    html: None,
-                    links: want_links.then(Vec::new),
-                    metadata: meta,
-                    retrieval: Some("markdown"),
-                    truncated: cut,
-                });
+                    cleaned.clone(),
+                    cleaned,
+                    want_links.then(Vec::new),
+                    meta,
+                    Some("markdown"),
+                    cut,
+                ));
             }
             Kind::Json => {
                 let decoded = pretty_json_bytes(&bytes, content_type.as_deref());
@@ -1527,18 +1703,17 @@ pub async fn scrape(
                     content_type,
                     ..Default::default()
                 };
-                return Ok(ScrapedPage {
-                    requested_url: (url != requested).then_some(requested),
+                return Ok(finalize_non_html(
                     url,
+                    requested,
                     title,
-                    markdown: want_md.then(|| format!("```json\n{decoded}\n```")),
-                    text: want_text.then_some(decoded),
-                    html: None,
-                    links: want_links.then(Vec::new),
-                    metadata: meta,
-                    retrieval: Some("json"),
-                    truncated: cut,
-                });
+                    format!("```json\n{decoded}\n```"),
+                    decoded,
+                    want_links.then(Vec::new),
+                    meta,
+                    Some("json"),
+                    cut,
+                ));
             }
             Kind::Feed => {
                 let decoded = decode_bytes(&bytes, content_type.as_deref());
@@ -1548,18 +1723,17 @@ pub async fn scrape(
                     content_type,
                     ..Default::default()
                 };
-                return Ok(ScrapedPage {
-                    requested_url: (url != requested).then_some(requested),
+                return Ok(finalize_non_html(
                     url,
+                    requested,
                     title,
-                    markdown: want_md.then(|| md.clone()),
-                    text: want_text.then_some(md),
-                    html: None,
-                    links: want_links.then_some(feed_links),
-                    metadata: meta,
-                    retrieval: Some("feed"),
-                    truncated: cut,
-                });
+                    md.clone(),
+                    md,
+                    want_links.then_some(feed_links),
+                    meta,
+                    Some("feed"),
+                    cut,
+                ));
             }
             Kind::Text => {
                 let decoded = decode_bytes(&bytes, content_type.as_deref());
@@ -1569,18 +1743,17 @@ pub async fn scrape(
                     content_type,
                     ..Default::default()
                 };
-                return Ok(ScrapedPage {
-                    requested_url: (url != requested).then_some(requested),
+                return Ok(finalize_non_html(
                     url,
+                    requested,
                     title,
-                    markdown: want_md.then(|| decoded.clone()),
-                    text: want_text.then_some(decoded),
-                    html: None,
-                    links: want_links.then(Vec::new),
-                    metadata: meta,
-                    retrieval: Some("text"),
-                    truncated: cut,
-                });
+                    decoded.clone(),
+                    decoded,
+                    want_links.then(Vec::new),
+                    meta,
+                    Some("text"),
+                    cut,
+                ));
             }
             Kind::Html => {}
         }
@@ -1602,6 +1775,8 @@ pub async fn scrape(
             want_text,
             want_html,
             want_links,
+            want_chunks,
+            want_structured,
         )
         .await;
 
@@ -1666,8 +1841,13 @@ async fn build_scraped_html(
     want_text: bool,
     want_html: bool,
     want_links: bool,
+    want_chunks: bool,
+    want_structured: bool,
 ) -> Result<ScrapedPage, PageError> {
     let extract_opts = options.extract.clone();
+    let max_tokens = options.max_tokens;
+    let chunk_tokens = options.chunk_tokens;
+    let focus_query = options.focus_query.clone();
     let rendered = retrieval == Some("rendered");
     tokio::task::spawn_blocking(move || {
         let decoded = decode_bytes(&bytes, content_type.as_deref());
@@ -1707,8 +1887,43 @@ async fn build_scraped_html(
             return Err(PageError::NeedsJs);
         }
 
-        let md = want_md
+        let needs_chunking = want_chunks || max_tokens.is_some() || focus_query.is_some();
+        let raw_md = (want_md || needs_chunking)
             .then(|| markdown::html_to_markdown(&document, &url, &extract_opts, FULL_TEXT_BYTES));
+        let structured_data =
+            want_structured.then(|| structured::extract_structured(&document, &url, &extract_opts));
+
+        let (md, out_chunks) = if needs_chunking {
+            let anchors: Vec<(u8, String, Option<String>)> = match &structured_data {
+                Some(sd) => sd
+                    .outline
+                    .iter()
+                    .map(|h| (h.level, h.text.clone(), h.id.clone()))
+                    .collect(),
+                None => structured::extract_heading_anchors(&document, &extract_opts),
+            };
+            let source_md = raw_md.as_deref().unwrap_or("");
+            let raw_chunks = chunks::chunk_markdown(
+                source_md,
+                &url,
+                &anchors,
+                chunk_tokens.unwrap_or(chunks::DEFAULT_CHUNK_TOKENS),
+            );
+            let selected = chunks::distill_chunks(raw_chunks, focus_query.as_deref(), max_tokens);
+            let final_md = if want_md {
+                if max_tokens.is_some() {
+                    Some(chunks::join_chunks_markdown(&selected))
+                } else {
+                    raw_md
+                }
+            } else {
+                None
+            };
+            (final_md, want_chunks.then_some(selected))
+        } else {
+            (want_md.then(|| raw_md.unwrap_or_default()), None)
+        };
+
         let links = want_links.then(|| markdown::extract_links(&document, &url, 500));
         let mut meta = markdown::extract_meta(&document, &url);
         meta.status_code = Some(status);
@@ -1727,7 +1942,11 @@ async fn build_scraped_html(
         let has_content = md.as_deref().is_some_and(|s| !s.trim().is_empty())
             || text.as_deref().is_some_and(|s| !s.trim().is_empty())
             || html.as_deref().is_some_and(|s| !s.trim().is_empty())
-            || links.as_ref().is_some_and(|l| !l.is_empty());
+            || links.as_ref().is_some_and(|l| !l.is_empty())
+            || out_chunks.as_ref().is_some_and(|c| !c.is_empty())
+            || structured_data.as_ref().is_some_and(|s| {
+                !s.outline.is_empty() || !s.tables.is_empty() || !s.json_ld.is_empty()
+            });
         if !has_content && plain.trim().is_empty() {
             return Err(PageError::Unreadable);
         }
@@ -1740,6 +1959,11 @@ async fn build_scraped_html(
             text,
             html,
             links,
+            chunks: out_chunks,
+            structured: structured_data,
+            content_hash: None,
+            change_status: None,
+            diff: None,
             metadata: meta,
             retrieval,
             truncated: cut,
@@ -1817,7 +2041,7 @@ async fn render_with_fallback(
             Duration::ZERO
         };
         let stop = deadline - reserve;
-        match tokio::time::timeout_at(stop, render(url, threshold, wait_for_ms))
+        match tokio::time::timeout_at(stop, render(url, threshold, wait_for_ms, stop))
             .await
             .unwrap_or(Err(PageError::Timeout))
         {
@@ -1949,6 +2173,7 @@ async fn render(
     url: &Url,
     threshold: usize,
     wait_for_ms: Option<u64>,
+    deadline: Instant,
 ) -> Result<(Vec<u8>, bool), PageError> {
     let Some(binary) = RENDERER.get().and_then(Option::as_ref) else {
         return Err(PageError::NeedsJs);
@@ -1958,6 +2183,42 @@ async fn render(
         .await
         .map_err(|_| PageError::NeedsJs)?;
     let started = Instant::now();
+    let step_deadline = deadline.min(Instant::now() + RENDER_TIMEOUT);
+
+    // Prefer the persistent Lightpanda CDP server pool (zero cold-start tax,
+    // asset blocking, and post-navigation adaptive wait). Fall back cleanly to
+    // one-shot `lightpanda fetch` if the pool is disabled or unavailable.
+    if cdp::cdp_pool_enabled() {
+        match cdp::render_pooled(binary, url, threshold, wait_for_ms, step_deadline).await {
+            Ok((html, cut)) => {
+                tracing::info!(
+                    stage = "render_cdp",
+                    host = url.host_str(),
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ok = true
+                );
+                return Ok((html, cut));
+            }
+            Err(PageError::Timeout) => {
+                tracing::info!(
+                    stage = "render_cdp",
+                    host = url.host_str(),
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ok = false,
+                    timeout = true
+                );
+                return Err(PageError::Timeout);
+            }
+            Err(_) => {
+                tracing::info!(
+                    stage = "render_cdp_fallback",
+                    host = url.host_str(),
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                );
+            }
+        }
+    }
+
     let wait_ms = wait_for_ms.unwrap_or(7_000).clamp(500, 15_000);
     let terminate_ms = (wait_ms + 1500).min(17_000);
     let mut command = Command::new(binary);
@@ -2000,6 +2261,9 @@ async fn render(
     for network in blocked_networks() {
         command.args(["--block-cidrs", &network.to_string()]);
     }
+    for pattern in cdp::BLOCKED_ASSET_PATTERNS {
+        command.args(["--block-urls", pattern]);
+    }
     let output = command
         .args(["--dump-max-bytes", &PAGE_BYTES.to_string(), url.as_str()])
         .stdin(Stdio::null())
@@ -2007,7 +2271,7 @@ async fn render(
         .stderr(Stdio::null())
         .kill_on_drop(true)
         .output();
-    let output = tokio::time::timeout(RENDER_TIMEOUT, output).await;
+    let output = tokio::time::timeout_at(step_deadline, output).await;
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let output = match output {
         // A wait that runs out still writes the page and exits non-zero;
@@ -2264,16 +2528,18 @@ fn table_passages(rows: &[Vec<String>], context: &str) -> Vec<String> {
     passages
 }
 
-/// Extracts PDF text via `pdftotext` first; when the PDF has no embedded text
-/// layer (scanned PDF) and `QUELLE_OCR_URL` (OCRia-nano-1 / LiteParse sidecar)
-/// is configured, escalates to OCR automatically.
+/// Extracts PDF text via `pdftotext` first (switching automatically to
+/// `-layout` when multi-column/tabular fragmentation is detected); when the PDF
+/// has no embedded text layer or a garbled CID/replacement text layer and
+/// `QUELLE_OCR_URL` is configured, escalates to OCR automatically.
 async fn pdf_or_ocr(
     url: Url,
     bytes: &[u8],
     relevance: Option<&Relevance>,
+    max_pages: Option<usize>,
     deadline: Instant,
 ) -> Result<Source, PageError> {
-    match pdf(url.clone(), bytes, relevance).await {
+    match pdf(url.clone(), bytes, relevance, max_pages, deadline).await {
         Ok(src) => Ok(src),
         Err(PageError::NoTextLayer) if ocr_sidecar().is_some() => {
             ocr_pdf(url, bytes, relevance, deadline).await
@@ -2482,19 +2748,20 @@ fn parse_feed(xml: &str, base_url: &Url) -> (String, String, Vec<Url>) {
     (feed_title, md.trim().to_owned(), links)
 }
 
-/// Reads the PDF text layer with poppler's `pdftotext`. This covers both
-/// born-digital documents and scans that carry an OCR layer; image-only
-/// scans have no text layer and are skipped. The child process is killed
-/// when the request is dropped or the extraction budget runs out.
-async fn pdf(url: Url, bytes: &[u8], relevance: Option<&Relevance>) -> Result<Source, PageError> {
-    // Read one extra page in full-text mode to detect a truncated document.
-    let last = if relevance.is_none() {
-        "151"
-    } else {
-        PDF_PAGES
-    };
-    let mut child = Command::new("pdftotext")
-        .args(["-q", "-l", last, "-enc", "UTF-8", "-eol", "unix", "-", "-"])
+async fn run_pdftotext(
+    bytes: &[u8],
+    last_page: usize,
+    layout: bool,
+    timeout: Duration,
+) -> Result<(String, bool), PageError> {
+    let last_arg = last_page.to_string();
+    let mut command = Command::new("pdftotext");
+    command.arg("-q");
+    if layout {
+        command.arg("-layout");
+    }
+    let mut child = command
+        .args(["-l", &last_arg, "-enc", "UTF-8", "-eol", "unix", "-", "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -2504,7 +2771,7 @@ async fn pdf(url: Url, bytes: &[u8], relevance: Option<&Relevance>) -> Result<So
     let mut stdin = child.stdin.take().ok_or(PageError::Unreadable)?;
     let reader = child.stdout.take().ok_or(PageError::Unreadable)?;
     let mut stdout = Vec::new();
-    let success = tokio::time::timeout(PDF_EXTRACT_TIMEOUT, async {
+    let success = tokio::time::timeout(timeout, async {
         let write = async move {
             // Poppler can stop reading early. Its exit status decides.
             let _ = stdin.write_all(bytes).await;
@@ -2533,25 +2800,77 @@ async fn pdf(url: Url, bytes: &[u8], relevance: Option<&Relevance>) -> Result<So
     }
     let cut = stdout.len() > PDF_TEXT_BYTES;
     stdout.truncate(PDF_TEXT_BYTES);
-    let text = String::from_utf8_lossy(&stdout).into_owned();
+    Ok((String::from_utf8_lossy(&stdout).into_owned(), cut))
+}
+
+/// Reads the PDF text layer with poppler's `pdftotext`. Automatically switches
+/// to `-layout` mode when default extraction fragments tabular/multi-column
+/// layouts, and detects garbled CID/replacement text layers for OCR escalation.
+async fn pdf(
+    url: Url,
+    bytes: &[u8],
+    relevance: Option<&Relevance>,
+    max_pages: Option<usize>,
+    deadline: Instant,
+) -> Result<Source, PageError> {
+    let page_cap = effective_pdf_max_pages(max_pages);
+    // Read one extra page in full-text mode to detect a truncated document.
+    let last_page = if relevance.is_none() {
+        page_cap + 1
+    } else {
+        page_cap
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let base_timeout = if page_cap > DEFAULT_PDF_MAX_PAGES {
+        PDF_LONG_EXTRACT_TIMEOUT
+    } else {
+        PDF_EXTRACT_TIMEOUT
+    };
+    let timeout = remaining.min(base_timeout).max(Duration::from_secs(1));
+
+    let (mut text, mut cut) = run_pdftotext(bytes, last_page, false, timeout).await?;
+    if pdf_text_garbled(&text) {
+        return Err(PageError::NoTextLayer);
+    }
+
+    let mut used_layout = false;
+    if relevance.is_none() && pdf_needs_layout_mode(&text) {
+        let layout_timeout = deadline
+            .saturating_duration_since(Instant::now())
+            .min(base_timeout);
+        if layout_timeout >= Duration::from_millis(500)
+            && let Ok((layout_text, layout_cut)) =
+                run_pdftotext(bytes, last_page, true, layout_timeout).await
+            && !layout_text.trim().is_empty()
+            && !pdf_text_garbled(&layout_text)
+        {
+            text = layout_text;
+            cut = layout_cut;
+            used_layout = true;
+        }
+    }
+
     let relevance = relevance.cloned();
     tokio::task::spawn_blocking(move || {
         let pages = text.matches('\u{c}').count().max(1);
         let Some(relevance) = relevance else {
             let mut page_text = text.split_terminator('\u{c}');
-            let prefix = clean::strip_invisible_format_chars(
-                &page_text
-                    .by_ref()
-                    .take(150)
-                    .collect::<Vec<_>>()
-                    .join("\n\n"),
-            );
+            let raw_prefix = page_text
+                .by_ref()
+                .take(page_cap)
+                .collect::<Vec<_>>()
+                .join(if used_layout { "\u{c}" } else { "\n\n" });
+            let prefix = if used_layout {
+                format_pdf_layout_text(&raw_prefix)
+            } else {
+                clean::strip_invisible_format_chars(&raw_prefix)
+            };
             let title = pdf_name(&url);
             let mut source =
                 Source::full(url, title, &prefix).map_err(|_| PageError::NoTextLayer)?;
             source.mark_truncated(cut || page_text.next().is_some());
-            source.metadata.retrieval = Some("pdf");
-            source.metadata.pages_read = Some(pages.min(150));
+            source.metadata.retrieval = Some(if used_layout { "pdf-layout" } else { "pdf" });
+            source.metadata.pages_read = Some(pages.min(page_cap));
             return Ok(source);
         };
         let passages = pdf_passages(&text);
@@ -2567,11 +2886,149 @@ async fn pdf(url: Url, bytes: &[u8], relevance: Option<&Relevance>) -> Result<So
             .map_or_else(|| pdf_name(&url), |p| shorten(p, 160));
         let mut source = source(url, title, passages.into_iter(), &relevance)?;
         source.metadata.retrieval = Some("pdf");
-        source.metadata.pages_read = Some(pages);
+        source.metadata.pages_read = Some(pages.min(page_cap));
         Ok(source)
     })
     .await
     .map_err(|_| PageError::Unreadable)?
+}
+
+/// Detects fragmented single-column/table dumps from default `pdftotext` that
+/// benefit from retrying with `pdftotext -layout`.
+fn pdf_needs_layout_mode(text: &str) -> bool {
+    let non_empty: Vec<&str> = text
+        .lines()
+        .map(|l| l.trim_matches(|c: char| c.is_whitespace() || c == '\u{c}'))
+        .filter(|l| !l.is_empty())
+        .take(400)
+        .collect();
+    if non_empty.len() < 15 {
+        return false;
+    }
+    let short_lines = non_empty
+        .iter()
+        .filter(|l| l.chars().count() <= 32 && l.split_whitespace().count() <= 3)
+        .count();
+    let numeric_lines = non_empty
+        .iter()
+        .filter(|l| l.chars().any(|c| c.is_ascii_digit()))
+        .count();
+    short_lines * 100 >= non_empty.len() * 55 && numeric_lines * 100 >= non_empty.len() * 25
+}
+
+/// Detects corrupted or garbled PDF text layers (replacement characters,
+/// private-use CID glyphs) that should escalate to `QUELLE_OCR_URL` when set.
+fn pdf_text_garbled(text: &str) -> bool {
+    let mut non_ws = 0usize;
+    let mut bad = 0usize;
+    for c in text.chars().take(20_000) {
+        if c.is_whitespace() || c == '\u{c}' {
+            continue;
+        }
+        non_ws += 1;
+        let is_bad = c == '\u{FFFD}'
+            || ('\u{E000}'..='\u{F8FF}').contains(&c)
+            || ('\u{F0000}'..='\u{FFFFD}').contains(&c)
+            || (c.is_control() && !matches!(c, '\n' | '\r' | '\t'));
+        if is_bad {
+            bad += 1;
+        }
+    }
+    non_ws >= 16 && bad * 100 >= non_ws * 15
+}
+
+/// Cleans `pdftotext -layout` output by trimming common leading margins and
+/// formatting consistently aligned multi-column rows as Markdown tables.
+fn format_pdf_layout_text(raw: &str) -> String {
+    static COL_SPLIT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r" {2,}").unwrap());
+    let mut page_outputs = Vec::new();
+
+    for page in raw.split('\u{c}') {
+        let cleaned = clean::strip_invisible_format_chars(page);
+        let raw_lines: Vec<&str> = cleaned.lines().collect();
+        let min_indent = raw_lines
+            .iter()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| l.bytes().take_while(|&b| b == b' ').count())
+            .min()
+            .unwrap_or(0);
+        let lines: Vec<String> = raw_lines
+            .iter()
+            .map(|l| {
+                if l.len() >= min_indent {
+                    l[min_indent..].trim_end().to_owned()
+                } else {
+                    l.trim_end().to_owned()
+                }
+            })
+            .collect();
+
+        let mut out_lines: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let trimmed = lines[i].trim();
+            if trimmed.is_empty() {
+                if out_lines.last().is_some_and(|l| !l.is_empty()) {
+                    out_lines.push(String::new());
+                }
+                i += 1;
+                continue;
+            }
+            let cols: Vec<&str> = COL_SPLIT
+                .split(trimmed)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if (2..=12).contains(&cols.len()) {
+                let col_count = cols.len();
+                let mut table_rows: Vec<Vec<String>> =
+                    vec![cols.into_iter().map(str::to_owned).collect()];
+                let mut j = i + 1;
+                while j < lines.len() {
+                    let next_t = lines[j].trim();
+                    if next_t.is_empty() {
+                        break;
+                    }
+                    let next_cols: Vec<&str> = COL_SPLIT
+                        .split(next_t)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if next_cols.len() == col_count {
+                        table_rows.push(next_cols.into_iter().map(str::to_owned).collect());
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if table_rows.len() >= 2 {
+                    if out_lines.last().is_some_and(|l| !l.is_empty()) {
+                        out_lines.push(String::new());
+                    }
+                    for (r_idx, row) in table_rows.iter().enumerate() {
+                        let escaped: Vec<String> =
+                            row.iter().map(|c| c.replace('|', "\\|")).collect();
+                        out_lines.push(format!("| {} |", escaped.join(" | ")));
+                        if r_idx == 0 {
+                            let sep = vec!["---"; col_count].join(" | ");
+                            out_lines.push(format!("| {sep} |"));
+                        }
+                    }
+                    out_lines.push(String::new());
+                    i = j;
+                    continue;
+                }
+            }
+            out_lines.push(trimmed.split_whitespace().collect::<Vec<_>>().join(" "));
+            i += 1;
+        }
+        let joined = out_lines.join("\n").trim().to_owned();
+        if !joined.is_empty() {
+            page_outputs.push(joined);
+        }
+    }
+
+    page_outputs.join("\n\n")
 }
 
 /// Rebuilds paragraphs from pdftotext lines: blank lines and page breaks end

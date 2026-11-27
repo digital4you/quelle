@@ -511,6 +511,21 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
     politeness::configure(host_concurrency, host_spacing_ms);
     let render_concurrency = positive_env("QUELLE_RENDER_CONCURRENCY", 4, 1, 16)?;
     pages::set_render_concurrency(render_concurrency);
+    let pdf_max_pages = positive_env(
+        "QUELLE_PDF_MAX_PAGES",
+        pages::DEFAULT_PDF_MAX_PAGES,
+        1,
+        pages::MAX_PDF_MAX_PAGES,
+    )?;
+    pages::set_pdf_max_pages(pdf_max_pages);
+    if let Ok(value) = env::var("QUELLE_CDP_POOL") {
+        let enabled = match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => return Err("QUELLE_CDP_POOL"),
+        };
+        pages::set_cdp_pool_enabled(enabled);
+    }
     let concurrent = positive_env("QUELLE_CONCURRENCY", 8, 1, 64)?;
     let app = App {
         authorization,
@@ -590,11 +605,13 @@ async fn main() -> ExitCode {
                 response
             },
         ));
-    match axum::serve(listener, router)
+    let status = match axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await
     {
         Ok(()) => ExitCode::SUCCESS,
         Err(_) => ExitCode::FAILURE,
-    }
+    };
+    pages::shutdown_pool().await;
+    status
 }
