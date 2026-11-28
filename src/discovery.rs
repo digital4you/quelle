@@ -18,8 +18,9 @@ pub use providers::configure_engines;
 #[cfg(test)]
 use providers::{
     HtmlEngine as Kind, ddg_locale, parse_arxiv_xml, parse_github_json, parse_hackernews_json,
-    parse_search_html, parse_searxng_json, parse_stackexchange_json, query_has_academic_intent,
-    query_has_repo_intent, query_has_tech_intent, site_filter_allows,
+    parse_mdn_json, parse_openalex_json, parse_search_html, parse_searxng_json,
+    parse_stackexchange_json, query_has_academic_intent, query_has_repo_intent,
+    query_has_tech_intent, query_has_web_intent, site_filter_allows,
 };
 
 pub const RESULTS_PER_QUERY: usize = 20;

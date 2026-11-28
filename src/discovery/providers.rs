@@ -28,13 +28,18 @@ const FIREFOX_USER_AGENT: &str =
 const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
     (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36";
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
-/// Default keyless meta-search engine mix fused via parallel RRF.
-const DEFAULT_KEYLESS_ENGINES: &str = "duckduckgo,mwmbl,wikipedia,stackexchange,hackernews";
+/// Default keyless meta-search engine mix fused via parallel RRF:
+/// 4 independent general-web engines (duckduckgo, yahoo_jp, seznam, mwmbl)
+/// plus 4 intent-routed official JSON APIs (wikipedia, mdn, stackexchange, hackernews).
+const DEFAULT_KEYLESS_ENGINES: &str =
+    "duckduckgo,yahoo_jp,seznam,mwmbl,wikipedia,mdn,stackexchange,hackernews";
 
 #[derive(Clone, Copy)]
 pub(super) enum HtmlEngine {
     Bing,
     DuckDuckGo,
+    YahooJp,
+    Seznam,
 }
 
 enum Provider {
@@ -51,6 +56,8 @@ enum Provider {
         key: String,
     },
     Wikipedia,
+    Mdn,
+    OpenAlex,
     StackExchange,
     HackerNews,
     Arxiv,
@@ -125,6 +132,8 @@ pub fn configure_engines(client: &Client, service_token: &str) -> Result<EngineP
             },
             "bing" => Provider::Html(HtmlEngine::Bing),
             "duckduckgo" => Provider::Html(HtmlEngine::DuckDuckGo),
+            "yahoo_jp" | "yahoojp" => Provider::Html(HtmlEngine::YahooJp),
+            "seznam" => Provider::Html(HtmlEngine::Seznam),
             "mwmbl" => Provider::Mwmbl {
                 key: env::var_os("MWMBL_API_KEY")
                     .filter(|k| !k.is_empty())
@@ -136,6 +145,8 @@ pub fn configure_engines(client: &Client, service_token: &str) -> Result<EngineP
                 key: load_key("MOJEEK_API_KEY")?,
             },
             "wikipedia" => Provider::Wikipedia,
+            "mdn" => Provider::Mdn,
+            "openalex" => Provider::OpenAlex,
             "stackexchange" | "stackoverflow" => Provider::StackExchange,
             "hackernews" | "hn" => Provider::HackerNews,
             "arxiv" => Provider::Arxiv,
@@ -178,6 +189,7 @@ impl SearchEngine for NativeEngine {
             Provider::Mwmbl { key: Some(_) } => Duration::from_millis(200),
             Provider::Mwmbl { key: None } => Duration::from_secs(1),
             Provider::Html(HtmlEngine::DuckDuckGo) => Duration::from_millis(850),
+            Provider::Html(HtmlEngine::YahooJp | HtmlEngine::Seznam) => Duration::from_millis(700),
             Provider::GitHub => Duration::from_millis(1200),
             _ => Duration::ZERO,
         }
@@ -186,14 +198,18 @@ impl SearchEngine for NativeEngine {
     fn weight(&self) -> f64 {
         match &self.provider {
             Provider::Brave { .. } => 1.6,
+            Provider::Html(HtmlEngine::YahooJp) => 1.55,
             Provider::Html(HtmlEngine::DuckDuckGo) => 1.5,
             Provider::Searxng { .. } => 1.5,
+            Provider::Html(HtmlEngine::Seznam) => 1.35,
             Provider::Mojeek { .. } => 1.2,
             Provider::Html(HtmlEngine::Bing) => 1.0,
             Provider::Mwmbl { .. } => 0.9,
+            Provider::Mdn => 0.9,
             Provider::Wikipedia => 0.85,
             Provider::StackExchange => 0.75,
             Provider::HackerNews => 0.75,
+            Provider::OpenAlex => 0.7,
             Provider::GitHub => 0.65,
             Provider::Arxiv => 0.65,
         }
@@ -201,7 +217,8 @@ impl SearchEngine for NativeEngine {
 
     fn query_weight(&self, query: &Query) -> f64 {
         match &self.provider {
-            Provider::Arxiv if query_has_academic_intent(&query.text) => 1.15,
+            Provider::Mdn if query_has_web_intent(&query.text) => 1.35,
+            Provider::Arxiv | Provider::OpenAlex if query_has_academic_intent(&query.text) => 1.15,
             Provider::GitHub if query_has_repo_intent(&query.text) => 1.15,
             Provider::StackExchange if query_has_tech_intent(&query.text) => 0.95,
             _ => self.weight(),
@@ -211,6 +228,14 @@ impl SearchEngine for NativeEngine {
     fn supports_query(&self, query: &Query) -> bool {
         match &self.provider {
             Provider::Wikipedia => site_filter_allows(&query.text, &["wikipedia.org"]),
+            Provider::Mdn => {
+                site_filter_allows(&query.text, &["developer.mozilla.org", "mozilla.org"])
+                    && query_has_web_intent(&query.text)
+            }
+            Provider::OpenAlex => {
+                site_filter_allows(&query.text, &["openalex.org", "doi.org"])
+                    && query_has_academic_intent(&query.text)
+            }
             Provider::StackExchange => {
                 site_filter_allows(&query.text, &["stackoverflow.com", "stackexchange.com"])
                     && (query.language == Language::En || query_has_tech_intent(&query.text))
@@ -230,9 +255,13 @@ impl SearchEngine for NativeEngine {
             Provider::Brave { .. } => "brave",
             Provider::Html(HtmlEngine::Bing) => "bing",
             Provider::Html(HtmlEngine::DuckDuckGo) => "duckduckgo",
+            Provider::Html(HtmlEngine::YahooJp) => "yahoo_jp",
+            Provider::Html(HtmlEngine::Seznam) => "seznam",
             Provider::Mwmbl { .. } => "mwmbl",
             Provider::Mojeek { .. } => "mojeek",
             Provider::Wikipedia => "wikipedia",
+            Provider::Mdn => "mdn",
+            Provider::OpenAlex => "openalex",
             Provider::StackExchange => "stackexchange",
             Provider::HackerNews => "hackernews",
             Provider::Arxiv => "arxiv",
@@ -361,6 +390,26 @@ impl NativeEngine {
                     .header("Sec-Fetch-User", "?1")
                     .form(&[("q", q), ("b", ""), ("kl", kl), ("kp", "1")])
             }
+            Provider::Html(HtmlEngine::YahooJp) => self
+                .client
+                .get("https://search.yahoo.co.jp/search")
+                .header(header::USER_AGENT, FIREFOX_USER_AGENT)
+                .header(
+                    header::ACCEPT,
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                .header(header::ACCEPT_LANGUAGE, accept_language_for(language))
+                .query(&[("p", q), ("ei", "UTF-8")]),
+            Provider::Html(HtmlEngine::Seznam) => self
+                .client
+                .get("https://search.seznam.cz/")
+                .header(header::USER_AGENT, FIREFOX_USER_AGENT)
+                .header(
+                    header::ACCEPT,
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                )
+                .header(header::ACCEPT_LANGUAGE, accept_language_for(language))
+                .query(&[("q", q)]),
             Provider::Mwmbl { key } => {
                 let request = self
                     .client
@@ -402,6 +451,20 @@ impl NativeEngine {
                     ("format", "json"),
                     ("formatversion", "2"),
                 ]),
+            Provider::Mdn => self
+                .client
+                .get("https://developer.mozilla.org/api/v1/search")
+                .header(header::USER_AGENT, HONEST_USER_AGENT)
+                .header(header::ACCEPT, "application/json")
+                .query(&[("q", q), ("locale", "en-US")]),
+            Provider::OpenAlex => {
+                let per_page = options.count.min(10).to_string();
+                self.client
+                    .get("https://api.openalex.org/works")
+                    .header(header::USER_AGENT, HONEST_USER_AGENT)
+                    .header(header::ACCEPT, "application/json")
+                    .query(&[("search", q), ("per-page", per_page.as_str())])
+            }
             Provider::StackExchange => {
                 let pagesize = options.count.min(10).to_string();
                 self.client
@@ -548,6 +611,18 @@ impl NativeEngine {
                         }
                     })
                     .collect()
+            }
+            Provider::Mdn => {
+                let bytes = read_body(response, BODY_LIMIT)
+                    .await
+                    .map_err(|_| DiscoveryError::Unavailable)?;
+                return parse_mdn_json(&bytes, options.count);
+            }
+            Provider::OpenAlex => {
+                let bytes = read_body(response, BODY_LIMIT)
+                    .await
+                    .map_err(|_| DiscoveryError::Unavailable)?;
+                return parse_openalex_json(&bytes, options.count);
             }
             Provider::StackExchange => {
                 let bytes = read_body(response, BODY_LIMIT)
@@ -811,6 +886,99 @@ pub(super) fn parse_searxng_json(
     Ok(candidates(parsed.results, count))
 }
 
+pub(super) fn parse_mdn_json(bytes: &[u8], count: usize) -> Result<Vec<Candidate>, DiscoveryError> {
+    #[derive(Deserialize)]
+    struct MdnResponse {
+        #[serde(default)]
+        documents: Vec<MdnDoc>,
+    }
+    #[derive(Deserialize)]
+    struct MdnDoc {
+        mdn_url: String,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        summary: String,
+    }
+    let parsed: MdnResponse =
+        serde_json::from_slice(bytes).map_err(|_| DiscoveryError::Unavailable)?;
+    let rows = parsed.documents.into_iter().filter_map(|doc| {
+        let path = doc.mdn_url.trim();
+        if path.is_empty() {
+            return None;
+        }
+        let url = if path.starts_with("http://") || path.starts_with("https://") {
+            path.to_owned()
+        } else {
+            format!("https://developer.mozilla.org{path}")
+        };
+        Some(Row {
+            url,
+            title: decode_html_text(&doc.title),
+            description: decode_html_text(&doc.summary),
+        })
+    });
+    Ok(candidates(rows, count))
+}
+
+pub(super) fn parse_openalex_json(
+    bytes: &[u8],
+    count: usize,
+) -> Result<Vec<Candidate>, DiscoveryError> {
+    #[derive(Deserialize)]
+    struct OaResponse {
+        #[serde(default)]
+        results: Vec<OaWork>,
+    }
+    #[derive(Deserialize)]
+    struct OaLocation {
+        landing_page_url: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct OaWork {
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        publication_year: Option<u32>,
+        #[serde(default)]
+        doi: Option<String>,
+        #[serde(default)]
+        primary_location: Option<OaLocation>,
+    }
+    let parsed: OaResponse =
+        serde_json::from_slice(bytes).map_err(|_| DiscoveryError::Unavailable)?;
+    let rows = parsed.results.into_iter().filter_map(|work| {
+        let url = work
+            .primary_location
+            .and_then(|loc| loc.landing_page_url)
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| work.doi.filter(|u| !u.trim().is_empty()))?;
+        let title = work.title.unwrap_or_default();
+        let description = match work.publication_year {
+            Some(year) => format!("OpenAlex scholarly work ({year})"),
+            None => "OpenAlex scholarly work".to_owned(),
+        };
+        Some(Row {
+            url,
+            title: decode_html_text(&title),
+            description,
+        })
+    });
+    Ok(candidates(rows, count))
+}
+
+pub(super) fn query_has_web_intent(query: &str) -> bool {
+    static WEB_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"(?i)\b(mdn|wai-?aria|aria-[a-z-]+|wcag|accessibility|a11y|html|html5|css|dom|svg|canvas|webgl|wasm|webassembly|",
+            r"javascript|ecmascript|typescript|fetch|xhr|websocket|cors|csp|cookie|headers?|http|http/2|http/3|https|quic|rfc\s*\d+|",
+            r"status\s+code|retry-after|etag|cache-control|content-security-policy|same-?site|service\s+worker|indexeddb|shadow\s+dom)\b"
+        ))
+        .expect("web intent regex")
+    });
+    WEB_RE.is_match(query)
+}
+
 pub(super) fn query_has_tech_intent(query: &str) -> bool {
     static TECH_RE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(concat!(
@@ -859,10 +1027,11 @@ pub(super) fn parse_search_html(
     html: &str,
     count: usize,
 ) -> Result<Vec<Candidate>, DiscoveryError> {
-    let (row, link, snippet, empty, base) = match kind {
+    let (row, link, title_sel, snippet, empty, base) = match kind {
         HtmlEngine::Bing => (
             "li.b_algo",
             "h2 a[href]",
+            None,
             ".b_caption p",
             "li.b_no",
             "https://www.bing.com/",
@@ -870,9 +1039,26 @@ pub(super) fn parse_search_html(
         HtmlEngine::DuckDuckGo => (
             ".result:not(.result--ad)",
             ".result__a[href]",
+            None,
             ".result__snippet",
             ".no-results, .result--no-result",
             "https://html.duckduckgo.com/",
+        ),
+        HtmlEngine::YahooJp => (
+            "div.sw-Card.Algo",
+            "a.sw-Card__titleInner[href]",
+            Some("h3.sw-Card__titleMain"),
+            ".sw-Card__summary, .Algo__summary, p",
+            ".Empty, .sw-NoResult",
+            "https://search.yahoo.co.jp/",
+        ),
+        HtmlEngine::Seznam => (
+            "div[data-n-id][data-e-b-n]",
+            "h3 a[data-e-a='heading'][href]",
+            None,
+            "div[data-n-id] div span",
+            ".no-results",
+            "https://search.seznam.cz/",
         ),
     };
     let doc = Html::parse_document(html);
@@ -887,19 +1073,31 @@ pub(super) fn parse_search_html(
         return Err(DiscoveryError::RateLimited(DEFAULT_COOLDOWN));
     }
     let (row, link, snippet) = (selector(row), selector(link), selector(snippet));
+    let title_selector = title_sel.map(selector);
     let base = Url::parse(base).expect("search origin");
     let rows = doc.select(&row).filter_map(|item| {
         let anchor = item.select(&link).next()?;
         let href = base.join(anchor.attr("href")?).ok()?;
         let url = result_destination(kind, href)?;
+        let title_raw: String = title_selector
+            .as_ref()
+            .and_then(|sel| item.select(sel).next())
+            .map(|el| el.text().collect())
+            .unwrap_or_else(|| anchor.text().collect());
+        let title = title_raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let description_raw: String = item
+            .select(&snippet)
+            .next()
+            .map(|s| s.text().collect())
+            .unwrap_or_default();
+        let description = description_raw
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         Some(Row {
             url: url.into(),
-            title: anchor.text().collect(),
-            description: item
-                .select(&snippet)
-                .next()
-                .map(|s| s.text().collect())
-                .unwrap_or_default(),
+            title,
+            description,
         })
     });
     let hits = candidates(rows, count);
@@ -928,6 +1126,21 @@ fn result_destination(kind: HtmlEngine, url: Url) -> Option<Url> {
             }
             let (_, target) = url.query_pairs().find(|(k, _)| k == "uddg")?;
             Url::parse(&target).ok()
+        }
+        HtmlEngine::YahooJp
+            if host == "yahoo.co.jp"
+                || host.ends_with(".yahoo.co.jp")
+                || host.ends_with(".yimg.jp") =>
+        {
+            None
+        }
+        HtmlEngine::Seznam
+            if host == "seznam.cz"
+                || host.ends_with(".seznam.cz")
+                || host == "szn.cz"
+                || host.ends_with(".szn.cz") =>
+        {
+            None
         }
         _ => Some(url),
     }

@@ -413,3 +413,75 @@ fn parses_searxng_json_and_detects_tech_academic_and_repo_intents() {
         "European Central Bank deposit facility"
     ));
 }
+
+#[test]
+fn parses_yahoo_jp_seznam_mdn_and_openalex_free_providers() {
+    let yahoo_html = r#"
+    <div class="sw-Card Algo">
+      <section>
+        <div class="sw-Card__title">
+          <a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/" class="sw-Card__titleInner">
+            <h3 class="sw-Card__titleMain"><span><b>Redis persistence</b> | Docs</span></h3>
+            <div class="sw-Card__titleCiteWrapper"><cite>https://redis.io</cite></div>
+          </a>
+        </div>
+        <p class="sw-Card__summary">Learn about RDB snapshots and AOF append-only logs.</p>
+      </section>
+    </div>
+    <div class="sw-Card Algo">
+      <section>
+        <a href="https://search.yahoo.co.jp/internal" class="sw-Card__titleInner">
+          <h3 class="sw-Card__titleMain">Internal Yahoo Link</h3>
+        </a>
+      </section>
+    </div>"#;
+    let y_hits = parse_search_html(Kind::YahooJp, yahoo_html, 5).unwrap();
+    assert_eq!(y_hits.len(), 1);
+    assert_eq!(
+        y_hits[0].url.as_str(),
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/"
+    );
+    assert_eq!(y_hits[0].title, "Redis persistence | Docs");
+    assert!(y_hits[0].description.contains("RDB snapshots"));
+
+    let seznam_html = r#"
+    <div data-n-id="i18" data-e-b-n="lUmqfn~y">
+      <h3><a data-e-a="heading" href="https://www.w3.org/WAI/ARIA/apg/patterns/accordion/"><span><b>Accordion Pattern</b> | WAI-ARIA APG</span></a></h3>
+      <div data-n-id="i19"><div><span>An accordion is a vertically stacked set of interactive headings using aria-expanded.</span></div></div>
+    </div>
+    <div data-n-id="i20" data-e-b-n="ad~y">
+      <h3><a data-e-a="heading" href="https://search.seznam.cz/napoveda"><span>Seznam Help</span></a></h3>
+    </div>"#;
+    let s_hits = parse_search_html(Kind::Seznam, seznam_html, 5).unwrap();
+    assert_eq!(s_hits.len(), 1);
+    assert_eq!(
+        s_hits[0].url.as_str(),
+        "https://www.w3.org/WAI/ARIA/apg/patterns/accordion/"
+    );
+    assert_eq!(s_hits[0].title, "Accordion Pattern | WAI-ARIA APG");
+    assert!(s_hits[0].description.contains("aria-expanded"));
+
+    let mdn = br#"{"documents":[{"mdn_url":"/en-US/docs/Web/Accessibility/ARIA/Reference/Attributes/aria-expanded","title":"ARIA: aria-expanded attribute","summary":"Indicates whether a grouping element is expanded or collapsed."}]}"#;
+    let m_hits = parse_mdn_json(mdn, 5).unwrap();
+    assert_eq!(m_hits.len(), 1);
+    assert_eq!(
+        m_hits[0].url.as_str(),
+        "https://developer.mozilla.org/en-US/docs/Web/Accessibility/ARIA/Reference/Attributes/aria-expanded"
+    );
+    assert!(m_hits[0].description.contains("expanded or collapsed"));
+    assert!(query_has_web_intent(
+        "WAI-ARIA aria-expanded accordion disclosure pattern"
+    ));
+    assert!(query_has_web_intent("RFC 9110 HTTP 429 Retry-After"));
+    assert!(!query_has_web_intent("Schweiz MWST Steuersätze 2024 ESTV"));
+
+    let oa = br#"{"results":[{"title":"QUIC: A UDP-Based Multiplexed and Secure Transport","publication_year":2021,"doi":"https://doi.org/10.17487/rfc9000","primary_location":{"landing_page_url":"https://www.rfc-editor.org/info/rfc9000"}},{"title":"Fallback DOI Only","publication_year":2024,"doi":"https://doi.org/10.1000/example","primary_location":null}]}"#;
+    let oa_hits = parse_openalex_json(oa, 5).unwrap();
+    assert_eq!(oa_hits.len(), 2);
+    assert_eq!(
+        oa_hits[0].url.as_str(),
+        "https://www.rfc-editor.org/info/rfc9000"
+    );
+    assert_eq!(oa_hits[1].url.as_str(), "https://doi.org/10.1000/example");
+    assert!(oa_hits[0].description.contains("2021"));
+}
