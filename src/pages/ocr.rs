@@ -1,10 +1,18 @@
-//! PDF OCR fallback supporting LlamaIndex OCRia-nano-1 via LiteParse (`lit`)
-//! and optional HTTP OCR sidecars (`QUELLE_OCR_URL`).
+//! PDF OCR fallback prioritizing permissive Apache-2.0 engines:
+//!   1. LiteParse (`lit`) with bundled Apache-2.0 Tesseract (structured Markdown + tables,
+//!      ~1.9 s / 222 MiB on 2 small CPU cores). `QUELLE_OCR_BACKEND=ocria-nano` remains
+//!      strictly opt-in (restricted OpenRAIL-M license).
+//!   2. Direct `pdftoppm` + `tesseract` CLI (Apache-2.0, ~75 MiB RSS, zero extra tools).
+//!   3. Optional HTTP OCR sidecar (`QUELLE_OCR_URL`) for Apache-2.0 GPU VLMs such as
+//!      IBM Granite-Docling-258M, LightOnOCR-2, or PaddleOCR-VL.
 
 use std::{
     path::{Path, PathBuf},
     process::Stdio,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -23,12 +31,14 @@ use super::{
 use crate::read_body;
 
 const OCR_TIMEOUT: Duration = Duration::from_secs(45);
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum OcrMode {
     #[default]
     Auto,
-    Ocria,
+    Liteparse,
+    Tesseract,
     Sidecar,
     Off,
 }
@@ -37,7 +47,8 @@ impl OcrMode {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(Self::Auto),
-            "ocria" | "ocria-nano" | "liteparse" => Some(Self::Ocria),
+            "liteparse" | "ocria" | "ocria-nano" => Some(Self::Liteparse),
+            "tesseract" => Some(Self::Tesseract),
             "sidecar" | "http" => Some(Self::Sidecar),
             "off" | "none" | "disabled" => Some(Self::Off),
             _ => None,
@@ -47,31 +58,34 @@ impl OcrMode {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LiteparseBackend {
+    /// Apache-2.0 default: unrestricted commercial use, ~1.9 s / 222 MiB on 2 CPU cores.
     #[default]
-    OcriaNano,
     Tesseract,
+    /// Opt-in only: LlamaIndex OCRia-nano-1 (restricted OpenRAIL-M: >$2M revenue/funding
+    /// and competing-service restrictions).
+    OcriaNano,
 }
 
 impl LiteparseBackend {
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "ocria" | "ocria-nano" | "ocria-nano-1" => Some(Self::OcriaNano),
             "tesseract" => Some(Self::Tesseract),
+            "ocria" | "ocria-nano" | "ocria-nano-1" => Some(Self::OcriaNano),
             _ => None,
         }
     }
 
     pub fn as_arg(self) -> &'static str {
         match self {
-            Self::OcriaNano => "ocria-nano",
             Self::Tesseract => "tesseract",
+            Self::OcriaNano => "ocria-nano",
         }
     }
 
     pub fn retrieval_label(self) -> &'static str {
         match self {
-            Self::OcriaNano => "pdf-ocria",
             Self::Tesseract => "pdf-tesseract",
+            Self::OcriaNano => "pdf-ocria",
         }
     }
 }
@@ -79,6 +93,7 @@ impl LiteparseBackend {
 static OCR_MODE: OnceLock<OcrMode> = OnceLock::new();
 static LITEPARSE_BACKEND: OnceLock<LiteparseBackend> = OnceLock::new();
 static LITEPARSE_BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+static TESSERACT_CLI: OnceLock<bool> = OnceLock::new();
 static OCR_SIDECAR_URL: OnceLock<Option<Url>> = OnceLock::new();
 
 pub fn set_ocr_mode(mode: OcrMode) {
@@ -97,7 +112,7 @@ pub fn liteparse_backend() -> LiteparseBackend {
     LITEPARSE_BACKEND
         .get()
         .copied()
-        .unwrap_or(LiteparseBackend::OcriaNano)
+        .unwrap_or(LiteparseBackend::Tesseract)
 }
 
 pub fn set_ocr_sidecar(url: Option<Url>) {
@@ -133,20 +148,46 @@ pub fn detect_liteparse() -> bool {
         .is_some()
 }
 
+/// Probes once at startup for Apache-2.0 `pdftoppm` + `tesseract` CLI tools.
+pub fn detect_tesseract_cli() -> bool {
+    *TESSERACT_CLI.get_or_init(|| {
+        let has_pdftoppm = std::process::Command::new("pdftoppm")
+            .arg("-v")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok();
+        let has_tesseract = std::process::Command::new("tesseract")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        has_pdftoppm && has_tesseract
+    })
+}
+
 fn liteparse_bin() -> Option<&'static Path> {
     LITEPARSE_BIN.get().and_then(Option::as_deref)
+}
+
+fn tesseract_cli_enabled() -> bool {
+    TESSERACT_CLI.get().copied().unwrap_or(false)
 }
 
 pub(crate) fn any_ocr_enabled() -> bool {
     match ocr_mode() {
         OcrMode::Off => false,
-        OcrMode::Ocria => liteparse_bin().is_some(),
+        OcrMode::Liteparse => liteparse_bin().is_some(),
+        OcrMode::Tesseract => tesseract_cli_enabled(),
         OcrMode::Sidecar => ocr_sidecar().is_some(),
-        OcrMode::Auto => liteparse_bin().is_some() || ocr_sidecar().is_some(),
+        OcrMode::Auto => {
+            liteparse_bin().is_some() || tesseract_cli_enabled() || ocr_sidecar().is_some()
+        }
     }
 }
 
-/// Builds the exact `lit parse` CLI argument list for OCRia-nano-1 / LiteParse.
+/// Builds the exact `lit parse` CLI argument list.
 pub(crate) fn build_liteparse_args(backend: LiteparseBackend, max_pages: usize) -> Vec<String> {
     vec![
         "parse".to_owned(),
@@ -163,10 +204,10 @@ pub(crate) fn build_liteparse_args(backend: LiteparseBackend, max_pages: usize) 
     ]
 }
 
-/// Safe environment allowlist forwarded to LiteParse so it can locate cached
-/// OCRia-nano-1 ONNX weights and runtime libraries without inheriting Quelle
-/// secrets such as `QUELLE_TOKEN` or API keys.
-const SAFE_LITEPARSE_ENV: &[&str] = &[
+/// Safe environment allowlist forwarded to OCR subprocesses so they locate
+/// runtime models/tessdata without inheriting Quelle secrets (`QUELLE_TOKEN`,
+/// API keys, etc.).
+const SAFE_OCR_ENV: &[&str] = &[
     "HOME",
     "XDG_CACHE_HOME",
     "LITEPARSE_MODEL_DIR",
@@ -174,6 +215,7 @@ const SAFE_LITEPARSE_ENV: &[&str] = &[
     "TESSDATA_PREFIX",
     "PATH",
     "TMPDIR",
+    "OMP_NUM_THREADS",
 ];
 
 pub(crate) struct OcrOutput {
@@ -196,8 +238,9 @@ pub(crate) async fn run_pdf_ocr(
 
     let page_cap = effective_pdf_max_pages(max_pages);
     let backend = liteparse_backend();
+    let has_next_fallback = tesseract_cli_enabled() || ocr_sidecar().is_some();
 
-    if matches!(mode, OcrMode::Ocria | OcrMode::Auto)
+    if matches!(mode, OcrMode::Liteparse | OcrMode::Auto)
         && let Some(binary) = liteparse_bin()
     {
         match run_liteparse_binary(binary, backend, bytes, page_cap, deadline).await {
@@ -215,7 +258,7 @@ pub(crate) async fn run_pdf_ocr(
                     pages_read: None,
                 });
             }
-            Err(err) if mode == OcrMode::Ocria || ocr_sidecar().is_none() => {
+            Err(err) if mode == OcrMode::Liteparse || !has_next_fallback => {
                 tracing::info!(
                     stage = "pdf_ocr_liteparse",
                     backend = backend.as_arg(),
@@ -236,6 +279,41 @@ pub(crate) async fn run_pdf_ocr(
         }
     }
 
+    if matches!(mode, OcrMode::Tesseract | OcrMode::Auto) && tesseract_cli_enabled() {
+        match run_tesseract_cli(bytes, page_cap, deadline).await {
+            Ok((text, pages_read)) => {
+                tracing::info!(
+                    stage = "pdf_ocr_tesseract",
+                    host = url.host_str(),
+                    pages = pages_read,
+                    chars = text.len(),
+                    ok = true
+                );
+                return Ok(OcrOutput {
+                    markdown: text,
+                    retrieval: "pdf-tesseract",
+                    pages_read: Some(pages_read),
+                });
+            }
+            Err(err) if mode == OcrMode::Tesseract || ocr_sidecar().is_none() => {
+                tracing::info!(
+                    stage = "pdf_ocr_tesseract",
+                    host = url.host_str(),
+                    error = err.code(),
+                    ok = false
+                );
+                return Err(err);
+            }
+            Err(err) => {
+                tracing::info!(
+                    stage = "pdf_ocr_tesseract_fallback",
+                    host = url.host_str(),
+                    error = err.code()
+                );
+            }
+        }
+    }
+
     if matches!(mode, OcrMode::Sidecar | OcrMode::Auto)
         && let Some(endpoint) = ocr_sidecar()
     {
@@ -243,6 +321,15 @@ pub(crate) async fn run_pdf_ocr(
     }
 
     Err(PageError::NoTextLayer)
+}
+
+fn configure_safe_env(command: &mut Command) {
+    command.env_clear();
+    for key in SAFE_OCR_ENV {
+        if let Some(val) = std::env::var_os(key) {
+            command.env(key, val);
+        }
+    }
 }
 
 pub(crate) async fn run_liteparse_binary(
@@ -260,12 +347,7 @@ pub(crate) async fn run_liteparse_binary(
     let args = build_liteparse_args(backend, max_pages);
 
     let mut command = Command::new(binary);
-    command.env_clear();
-    for key in SAFE_LITEPARSE_ENV {
-        if let Some(val) = std::env::var_os(key) {
-            command.env(key, val);
-        }
-    }
+    configure_safe_env(&mut command);
     let mut child = command
         .args(&args)
         .stdin(Stdio::piped())
@@ -320,6 +402,128 @@ pub(crate) async fn run_liteparse_binary(
         return Err(PageError::NoTextLayer);
     }
     Ok(markdown)
+}
+
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn create_private_ocr_dir() -> Result<TempDirGuard, PageError> {
+    let pid = std::process::id();
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("quelle-ocr-{pid}-{seq}"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = std::fs::DirBuilder::new();
+        b.mode(0o700);
+        b.create(&dir).map_err(|_| PageError::NoTextLayer)?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(&dir).map_err(|_| PageError::NoTextLayer)?;
+    }
+    Ok(TempDirGuard(dir))
+}
+
+/// Apache-2.0 fallback using `pdftoppm` + `tesseract` CLI (~75 MiB peak RSS).
+async fn run_tesseract_cli(
+    bytes: &[u8],
+    max_pages: usize,
+    deadline: Instant,
+) -> Result<(String, usize), PageError> {
+    let _slot = DOCUMENT_SLOTS
+        .acquire()
+        .await
+        .map_err(|_| PageError::Unreadable)?;
+    let step_deadline = deadline.min(Instant::now() + OCR_TIMEOUT);
+    let work = create_private_ocr_dir()?;
+    let pdf_path = work.0.join("input.pdf");
+    tokio::fs::write(&pdf_path, bytes)
+        .await
+        .map_err(|_| PageError::Unreadable)?;
+
+    let prefix = work.0.join("page");
+    let cap = max_pages.clamp(1, MAX_PDF_MAX_PAGES).to_string();
+    let mut ppm = Command::new("pdftoppm");
+    configure_safe_env(&mut ppm);
+    let ppm_status = tokio::time::timeout_at(
+        step_deadline,
+        ppm.args(["-png", "-r", "200", "-f", "1", "-l", &cap])
+            .arg(&pdf_path)
+            .arg(&prefix)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await
+    .map_err(|_| PageError::Timeout)?
+    .map_err(|_| PageError::NoTextLayer)?;
+    if !ppm_status.success() {
+        return Err(PageError::NoTextLayer);
+    }
+
+    let mut page_files: Vec<PathBuf> = std::fs::read_dir(&work.0)
+        .map_err(|_| PageError::NoTextLayer)?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("page-") && n.ends_with(".png"))
+        })
+        .collect();
+    page_files.sort();
+    if page_files.is_empty() {
+        return Err(PageError::NoTextLayer);
+    }
+
+    let mut combined = String::new();
+    let mut pages_read = 0usize;
+    for page_png in page_files {
+        if Instant::now() >= step_deadline || combined.len() >= PDF_TEXT_BYTES {
+            break;
+        }
+        let mut tess = Command::new("tesseract");
+        configure_safe_env(&mut tess);
+        let out = tokio::time::timeout_at(
+            step_deadline,
+            tess.arg(&page_png)
+                .args(["stdout", "--oem", "1", "--psm", "3"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .map_err(|_| PageError::Timeout)?
+        .map_err(|_| PageError::NoTextLayer)?;
+        if out.status.success() {
+            let chunk = String::from_utf8_lossy(&out.stdout);
+            let trimmed = chunk.trim();
+            if !trimmed.is_empty() {
+                if !combined.is_empty() {
+                    combined.push_str("\n\n");
+                }
+                let room = PDF_TEXT_BYTES.saturating_sub(combined.len());
+                let end = trimmed.floor_char_boundary(room.min(trimmed.len()));
+                combined.push_str(&trimmed[..end]);
+            }
+            pages_read += 1;
+        }
+    }
+
+    if combined.trim().is_empty() {
+        return Err(PageError::NoTextLayer);
+    }
+    Ok((combined, pages_read))
 }
 
 async fn run_http_ocr_sidecar(
@@ -386,32 +590,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ocr_mode_and_backend_parse_cleanly() {
+    fn ocr_mode_and_backend_default_to_apache2_tesseract() {
+        assert_eq!(LiteparseBackend::default(), LiteparseBackend::Tesseract);
         assert_eq!(OcrMode::parse("auto"), Some(OcrMode::Auto));
-        assert_eq!(OcrMode::parse("ocria"), Some(OcrMode::Ocria));
-        assert_eq!(OcrMode::parse("ocria-nano"), Some(OcrMode::Ocria));
+        assert_eq!(OcrMode::parse("liteparse"), Some(OcrMode::Liteparse));
+        assert_eq!(OcrMode::parse("tesseract"), Some(OcrMode::Tesseract));
+        assert_eq!(OcrMode::parse("ocria"), Some(OcrMode::Liteparse));
         assert_eq!(OcrMode::parse("sidecar"), Some(OcrMode::Sidecar));
         assert_eq!(OcrMode::parse("off"), Some(OcrMode::Off));
         assert_eq!(OcrMode::parse("bogus"), None);
 
         assert_eq!(
-            LiteparseBackend::parse("ocria-nano"),
-            Some(LiteparseBackend::OcriaNano)
-        );
-        assert_eq!(
-            LiteparseBackend::parse("ocria-nano-1"),
-            Some(LiteparseBackend::OcriaNano)
-        );
-        assert_eq!(
             LiteparseBackend::parse("tesseract"),
             Some(LiteparseBackend::Tesseract)
+        );
+        assert_eq!(
+            LiteparseBackend::parse("ocria-nano"),
+            Some(LiteparseBackend::OcriaNano)
         );
         assert_eq!(LiteparseBackend::parse("unknown"), None);
     }
 
     #[test]
-    fn liteparse_args_use_ocria_nano_markdown_and_page_cap() {
-        let args = build_liteparse_args(LiteparseBackend::OcriaNano, 75);
+    fn liteparse_args_default_to_apache2_tesseract_and_enforce_page_cap() {
+        let args = build_liteparse_args(LiteparseBackend::default(), 75);
         assert_eq!(
             args,
             vec![
@@ -419,7 +621,7 @@ mod tests {
                 "--format",
                 "markdown",
                 "--ocr-backend",
-                "ocria-nano",
+                "tesseract",
                 "--image-mode",
                 "off",
                 "--max-pages",
@@ -428,8 +630,8 @@ mod tests {
                 "-",
             ]
         );
-        // Enforces bounds.
         let clamped = build_liteparse_args(LiteparseBackend::OcriaNano, 99_999);
+        assert_eq!(clamped[4], "ocria-nano");
         assert_eq!(clamped[8], MAX_PDF_MAX_PAGES.to_string());
     }
 
@@ -440,12 +642,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("quelle-ocr-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let script = dir.join("fake-lit.sh");
-        // Verifies stdin starts with %PDF-, args include ocria-nano, and QUELLE_TOKEN is NOT leaked.
         std::fs::write(
             &script,
             "#!/bin/sh\n\
              if [ -n \"$QUELLE_TOKEN\" ]; then exit 42; fi\n\
-             case \"$*\" in *\"--ocr-backend ocria-nano\"*) ;; *) exit 43 ;; esac\n\
+             case \"$*\" in *\"--ocr-backend tesseract\"*) ;; *) exit 43 ;; esac\n\
              head=$(head -c 5)\n\
              if [ \"$head\" != \"%PDF-\" ]; then exit 44; fi\n\
              printf '# Scanned Invoice\\n\\nTotal: CHF 420.00\\n'\n",
@@ -457,7 +658,7 @@ mod tests {
 
         let md = run_liteparse_binary(
             &script,
-            LiteparseBackend::OcriaNano,
+            LiteparseBackend::Tesseract,
             b"%PDF-1.4\nfake-scan-bytes",
             20,
             Instant::now() + Duration::from_secs(5),

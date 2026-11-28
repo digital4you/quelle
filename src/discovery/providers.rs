@@ -14,7 +14,7 @@ use url::Url;
 
 use super::{
     Candidate, DiscoveryError, DiscoveryFuture, DiscoveryMode, EnginePool, Language, Query,
-    SearchEngine, SearchOptions,
+    SearchEngine, SearchOptions, router,
 };
 use crate::{
     endpoint, env_text, pages::public_url, read_body, read_json, secret_header, sidecar_endpoint,
@@ -1145,15 +1145,7 @@ pub(super) fn parse_openalex_json(
 }
 
 pub(super) fn query_has_web_intent(query: &str) -> bool {
-    static WEB_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(concat!(
-            r"(?i)\b(mdn|wai-?aria|aria-[a-z-]+|wcag|accessibility|a11y|html|html5|css|dom|svg|canvas|webgl|wasm|webassembly|",
-            r"javascript|ecmascript|typescript|fetch|xhr|websocket|cors|csp|cookie|headers?|http|http/2|http/3|https|quic|rfc\s*\d+|",
-            r"status\s+code|retry-after|etag|cache-control|content-security-policy|same-?site|service\s+worker|indexeddb|shadow\s+dom)\b"
-        ))
-        .expect("web intent regex")
-    });
-    WEB_RE.is_match(query)
+    router::classify(query).has_web()
 }
 
 pub(super) fn extract_rfc_number(query: &str) -> Option<String> {
@@ -1178,35 +1170,15 @@ fn ietf_search_term(query: &str) -> String {
 }
 
 pub(super) fn query_has_ietf_intent(query: &str) -> bool {
-    static IETF_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(rfc\s*\d{3,5}|ietf|internet[- ]draft|quic|http/3|http/2|tls\s*1\.\d|oauth\s*2|jwt|dnssec|bgp|sctp)\b")
-            .expect("ietf intent regex")
-    });
-    IETF_RE.is_match(query)
+    router::classify(query).has_ietf()
 }
 
 pub(super) fn query_has_biomed_intent(query: &str) -> bool {
-    static BIOMED_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(concat!(
-            r"(?i)\b(pubmed|clinical\s+trial|placebo|vaccine|mrna|cancer|tumor|tumour|carcinoma|oncology|cardiology|diabetes|",
-            r"hypertension|alzheimer|parkinson|antibody|antigen|genome|genomic|protein|enzyme|ribosome|pharmacology|dosage|",
-            r"syndrome|pathology|epidemiology|meta-analysis|randomized|randomised|cohort|diagnosis|prognosis|therapy|therapeutic|medicine|medical)\b"
-        ))
-        .expect("biomed intent regex")
-    });
-    BIOMED_RE.is_match(query)
+    router::classify(query).has_biomed()
 }
 
 pub(super) fn query_has_news_intent(query: &str) -> bool {
-    static NEWS_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(concat!(
-            r"(?i)\b(news|breaking|headline|headlines|today|yesterday|latest|announced|announcement|election|referendum|",
-            r"summit|ceasefire|tariff|tariffs|sanctions|earnings|quarterly\s+results|rate\s+decision|central\s+bank\s+decision|",
-            r"aktuell|nachrichten|meldungen|nouvelles|actualités|notizie)\b"
-        ))
-        .expect("news intent regex")
-    });
-    NEWS_RE.is_match(query)
+    router::classify(query).has_news()
 }
 
 pub(super) fn parse_gdelt_json(
@@ -1445,31 +1417,15 @@ pub(super) fn parse_ietf_json(
 }
 
 pub(super) fn query_has_tech_intent(query: &str) -> bool {
-    static TECH_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(concat!(
-            r"(?i)\b(rust|python|javascript|typescript|golang|java|kotlin|swift|cpp|c\+\+|sql|sqlite|postgres|postgresql|mysql|redis|mongodb|",
-            r"docker|kubernetes|k8s|linux|unix|bash|git|github|http|https|quic|tls|ssl|dns|tcp|udp|grpc|graphql|rest|api|sdk|cli|json|yaml|html|css|wasm|",
-            r"react|vue|nuxt|next\.?js|node\.?js|tokio|async|mutex|regex|rfc|wal|mvcc|aria|oauth|jwt|csrf|ssrf|cve|compiler|error|exception|stacktrace)\b"
-        ))
-        .expect("tech intent regex")
-    });
-    TECH_RE.is_match(query) || query.contains("::") || query.contains("--") || query.contains('_')
+    router::classify(query).has_tech(query)
 }
 
 pub(super) fn query_has_academic_intent(query: &str) -> bool {
-    static ACAD_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(arxiv|paper|preprint|doi|theorem|proof|citation|et al|benchmark|transformer|attention|neural|diffusion|llm|empirical|dataset|ablation)\b")
-            .expect("academic intent regex")
-    });
-    ACAD_RE.is_match(query)
+    router::classify(query).has_academic()
 }
 
 pub(super) fn query_has_repo_intent(query: &str) -> bool {
-    static REPO_RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?i)\b(github|repo|repository|crate|cargo|npm|pypi|pip|package|library|sdk|cli|open[- ]source|release|changelog)\b")
-            .expect("repo intent regex")
-    });
-    REPO_RE.is_match(query)
+    router::classify(query).has_repo()
 }
 
 fn candidates(rows: impl IntoIterator<Item = Row>, count: usize) -> Vec<Candidate> {

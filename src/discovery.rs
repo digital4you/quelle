@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 mod providers;
+mod router;
 pub use providers::configure_engines;
 #[cfg(test)]
 use providers::{

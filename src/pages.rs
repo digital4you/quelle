@@ -36,8 +36,8 @@ pub use cdp::{
 };
 pub use markdown::{ExtractOptions, PageMeta};
 pub use ocr::{
-    LiteparseBackend, OcrMode, detect_liteparse, liteparse_backend, set_liteparse_backend,
-    set_ocr_mode, set_ocr_sidecar,
+    LiteparseBackend, OcrMode, detect_liteparse, detect_tesseract_cli, liteparse_backend,
+    set_liteparse_backend, set_ocr_mode, set_ocr_sidecar,
 };
 
 /// HTML beyond this is cut off and the prefix is parsed; long pages keep

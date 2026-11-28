@@ -627,10 +627,19 @@ async fn main() -> ExitCode {
         tracing::warn!("pdftotext not found; text-layer PDF extraction disabled");
     }
     if pages::detect_liteparse() {
+        let backend = pages::liteparse_backend();
         tracing::info!(
-            backend = pages::liteparse_backend().as_arg(),
-            "LiteParse PDF OCR fallback enabled (OCRia-nano-1)"
+            backend = backend.as_arg(),
+            "LiteParse PDF OCR fallback enabled"
         );
+        if backend == pages::LiteparseBackend::OcriaNano {
+            tracing::warn!(
+                "QUELLE_OCR_BACKEND=ocria-nano uses LlamaIndex's restricted OpenRAIL-M license (commercial >$2M and competing-service restrictions); default 'tesseract' is Apache-2.0"
+            );
+        }
+    }
+    if pages::detect_tesseract_cli() {
+        tracing::info!("Apache-2.0 pdftoppm + tesseract PDF OCR fallback enabled");
     }
     if app.search.model.is_none() {
         tracing::warn!(
