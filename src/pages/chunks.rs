@@ -5,8 +5,6 @@ use std::collections::HashSet;
 use serde::Serialize;
 use url::Url;
 
-use super::{matches_keyword, words};
-
 /// Default chunk target size in approximate LLM tokens.
 pub const DEFAULT_CHUNK_TOKENS: usize = 512;
 
@@ -336,65 +334,19 @@ pub fn distill_chunks(
     });
 
     if !query_terms.is_empty() {
-        let chunk_words: Vec<(HashSet<String>, HashSet<String>)> = chunks
+        let headings: Vec<String> = chunks.iter().map(|c| c.breadcrumb.join(" ")).collect();
+        let field_docs: Vec<Vec<(&str, f64)>> = chunks
             .iter()
-            .map(|c| {
-                let body_set: HashSet<String> = c
-                    .markdown
-                    .split(|ch: char| !ch.is_alphanumeric())
-                    .filter(|t| t.chars().count() >= 2)
-                    .map(str::to_lowercase)
-                    .chain(words(&c.markdown))
-                    .collect();
-                let heading_text = c.breadcrumb.join(" ");
-                let head_set: HashSet<String> = heading_text
-                    .split(|ch: char| !ch.is_alphanumeric())
-                    .filter(|t| t.chars().count() >= 2)
-                    .map(str::to_lowercase)
-                    .collect();
-                (body_set, head_set)
-            })
+            .zip(&headings)
+            .map(|(c, h)| vec![(h.as_str(), 2.5), (c.markdown.as_str(), 1.0)])
             .collect();
+        let bm25 = crate::selection::bm25f_scores(&query_terms, &field_docs);
+        let fq = focus_query.unwrap_or("");
 
-        #[allow(clippy::cast_precision_loss)]
-        let total = chunks.len().max(1) as f64;
-        let idf: Vec<f64> = query_terms
-            .iter()
-            .map(|term| {
-                let df = chunk_words
-                    .iter()
-                    .filter(|(body, _)| {
-                        body.contains(term)
-                            || (term.len() >= 4 && body.iter().any(|w| matches_keyword(w, term)))
-                    })
-                    .count();
-                if df == 0 {
-                    0.0
-                } else {
-                    #[allow(clippy::cast_precision_loss)]
-                    let df = df as f64;
-                    (1.0 + total / df).ln()
-                }
-            })
-            .collect();
-
-        for (chunk, (body, head)) in chunks.iter_mut().zip(&chunk_words) {
-            let mut score = 0.0f64;
-            for (term, &weight) in query_terms.iter().zip(&idf) {
-                if weight == 0.0 {
-                    continue;
-                }
-                let in_body = body.contains(term)
-                    || (term.len() >= 4 && body.iter().any(|w| matches_keyword(w, term)));
-                if in_body {
-                    score += weight;
-                    let in_head = head.contains(term)
-                        || (term.len() >= 4 && head.iter().any(|w| matches_keyword(w, term)));
-                    if in_head {
-                        score += weight;
-                    }
-                }
-            }
+        for ((chunk, head), bm25_score) in chunks.iter_mut().zip(&headings).zip(bm25) {
+            let trigram =
+                crate::selection::char_trigram_cosine(fq, &format!("{} {}", head, chunk.markdown));
+            let mut score = bm25_score + trigram * 1.5;
             if numeric_query && score > 0.0 && chunk.markdown.chars().any(|c| c.is_ascii_digit()) {
                 score *= 1.25;
             }
@@ -774,6 +726,31 @@ Clients must honor the Retry-After delta-seconds value before retrying HTTP 429 
         assert!(
             !all.iter()
                 .any(|c| c.markdown.contains("quarterly webinars"))
+        );
+    }
+
+    #[test]
+    fn distill_chunks_bm25f_prefers_dense_rare_term_section_over_lengthy_filler() {
+        let base = Url::parse("https://example.org/sqlite").unwrap();
+        let filler = "This long operational overview discusses general database storage patterns and configuration basics. ".repeat(12);
+        let md = format!(
+            "# SQLite Overview\n\n## General Storage\n\n{filler} checkpoint.\n\n## WAL Checkpointing\n\nSQLite WAL mode uses wal_autocheckpoint and PRAGMA wal_checkpoint(TRUNCATE) to merge frames back into the main database file."
+        );
+        let chunks = chunk_markdown(&md, &base, &[], 200);
+        let scored = distill_chunks(chunks, Some("SQLite WAL wal_autocheckpoint"), None);
+        let general = scored
+            .iter()
+            .find(|c| c.heading.as_deref() == Some("General Storage"))
+            .unwrap();
+        let wal = scored
+            .iter()
+            .find(|c| c.heading.as_deref() == Some("WAL Checkpointing"))
+            .unwrap();
+        assert!(
+            wal.score.unwrap_or(0) > general.score.unwrap_or(0) * 2,
+            "BM25F should strongly prefer dense heading+body WAL chunk ({:?}) over long filler ({:?})",
+            wal.score,
+            general.score
         );
     }
 }

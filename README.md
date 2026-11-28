@@ -10,11 +10,12 @@ Quelle is a Rust service that retrieves web pages for agents. It can answer a qu
 | Map | `POST /api/map` | Fast site URL discovery from `robots.txt`, `sitemap.xml`, and page links | No |
 | Crawl | `POST /api/crawl` (`GET`/`DELETE /api/crawl/{id}`, `GET /api/crawl/{id}/stream`) | Async, live-streamed SSE, or sync recursive crawl with mid-crawl resume checkpoints | No |
 | Extract | `POST /api/extract` | Structured JSON extracted from `url`, `urls`, or `query` with schema validation and corrective retry | Yes |
+| Observability | `GET /metrics`, `GET /api/status` | Auth-protected Prometheus metrics (`text/plain; version=0.0.4`) and JSON status snapshot (engines, caches, hosts, CDP, slots) | No |
 | MCP | `quelle mcp` (stdio JSON-RPC 2.0) | Built-in Model Context Protocol server exposing `quelle_search`, `quelle_scrape`, `quelle_extract`, `quelle_map`, and `quelle_crawl` | No |
 
 ## Quick start
 
-Copy [.env.example](.env.example) to `.env` and set `QUELLE_TOKEN` to a token of at least 32 characters. You can generate one with `openssl rand -hex 32`. This enables `/api/content` out of the box with zero-key parallel meta-search across 6 general-web engines (`duckduckgo`, `yahoo_jp`, `seznam`, `marginalia`, `naver`, `mwmbl`) plus 8 intent-routed official APIs (`wikipedia`, `mdn`, `ietf`, `crossref`, `pubmed`, `gdelt`, `stackexchange`, `hackernews`). Set `QUELLE_SEARCH_ENGINES` to choose other engines. To enable `/api/answer`, also fill in the three model variables before starting Quelle.
+Copy [.env.example](.env.example) to `.env` and set `QUELLE_TOKEN` to a token of at least 32 characters. You can generate one with `openssl rand -hex 32`. This enables `/api/content` out of the box with zero-key parallel meta-search across 6 general-web engines (`duckduckgo`, `yahoo_jp`, `seznam`, `marginalia`, `naver`, `mwmbl`) plus 9 intent-routed official APIs/feeds (`wikipedia`, `mdn`, `ietf`, `crossref`, `pubmed`, `gdelt`, `rss_news`, `stackexchange`, `hackernews`) — including a 135 KiB pure-Rust multilingual intent router, cross-lingual `de/fr/it → en` query assist for English-only specialists, and pure-Rust BM25F + char-trigram cosine reranking. Set `QUELLE_SEARCH_ENGINES` to choose other engines. To enable `/api/answer`, also fill in the three model variables before starting Quelle.
 
 ```sh
 docker run -d --name quelle --env-file .env \
@@ -25,7 +26,7 @@ curl -sS http://127.0.0.1:3000/healthz
 
 The health check returns `{"ok":true}`. For the API examples below, set `QUELLE_TOKEN` in your client shell to the same value you put in `.env`.
 
-To run from source, export the configuration in your shell and run `cargo run --locked --release` with Rust 1.95 or later. Install `pdftotext` (from `poppler-utils`) for PDFs and `lightpanda` for JavaScript rendering. The Docker image includes both.
+To run from source, export the configuration in your shell and run `cargo run --locked --release` with Rust 1.95 or later. Install `pdftotext` (from `poppler-utils`) for PDFs, `tesseract-ocr` for scanned PDF OCR, and `lightpanda` for JavaScript rendering. The Docker image includes all three (100% Apache-2.0 OCR defaults, non-root `65532:65532`).
 
 ## API
 
@@ -141,7 +142,7 @@ curl -sS http://127.0.0.1:3000/api/map \
   --data '{"url":"https://example.org","limit":100}'
 ```
 
-Optional fields: `urls` (multiple seeds), `search` (URL substring filter), `includeSubdomains`, `useSitemap` (default `true`), `includePaths`, `excludePaths`, `limit` (1–5000, default 200).
+Optional fields: `urls` (multiple seeds), `search` (URL substring filter), `includeSubdomains`, `useSitemap` (default `true`), `includePaths`, `excludePaths`, `limit` (1–5000, default 200), `llmsTxt` (default `false`; returns a standard Markdown `llms.txt` site index grouped by top-level URL section).
 
 ### Crawl mode · `POST /api/crawl`
 
@@ -153,7 +154,7 @@ curl -sS http://127.0.0.1:3000/api/crawl \
   --data '{"urls":["https://example.org/docs","https://example.org/blog"],"maxDepth":2,"limit":30,"formats":["markdown"]}'
 ```
 
-Optional fields: `maxDepth` (0–10, default 2), `limit` (1–1000, default 50), `includePaths` / `excludePaths` (prefix or `*` globs), `allowSubdomains`, `allowExternalLinks`, `useSitemap` (default `true`), `respectRobots` (default `true`), `formats`, `onlyMainContent`, `includeTags`, `excludeTags`, `render`, `waitFor`, `waitForSelector`, `scrollSteps` (0–10), `actions`, `maxAge`, `maxTokens`, `chunkTokens`, `focusQuery`, `maxPages`, `concurrency` (1–16, default 4; per-host politeness is always enforced), `sync` (default `false`), `incremental` (emit deterministic `sha256:` `contentHash`, `changeStatus`, and crawl `changes` summary; defaults `maxAge` to `0` for conditional HTTP revalidation), `sinceCrawlId` (compare against a prior crawl job — persisted across restarts when `QUELLE_STATE_DIR` is set — and attach heading-level `diff`s for updated pages), `previousHashes` (stateless `{url: contentHash}` map), `omitUnchangedContent` (omit page bodies when `changeStatus == "unchanged"`).
+Optional fields: `maxDepth` (0–10, default 2), `limit` (1–1000, default 50), `includePaths` / `excludePaths` (prefix or `*` globs), `allowSubdomains`, `allowExternalLinks`, `useSitemap` (default `true`), `respectRobots` (default `true`), `formats`, `onlyMainContent`, `includeTags`, `excludeTags`, `render`, `waitFor`, `waitForSelector`, `scrollSteps` (0–10), `actions`, `maxAge`, `maxTokens`, `chunkTokens`, `focusQuery`, `maxPages`, `concurrency` (1–16, default 4; per-host politeness is always enforced), `sync` (default `false`), `incremental` (emit deterministic `sha256:` `contentHash`, `changeStatus`, and crawl `changes` summary; defaults `maxAge` to `0` for conditional HTTP revalidation), `sinceCrawlId` (compare against a prior crawl job — persisted across restarts when `QUELLE_STATE_DIR` is set — and attach heading-level `diff`s for updated pages), `previousHashes` (stateless `{url: contentHash}` map), `omitUnchangedContent` (omit page bodies when `changeStatus == "unchanged"`), `llmsTxt` (default `false`; attaches a generated Markdown `llms.txt` index for all crawled pages).
 
 ### Extract mode · `POST /api/extract`
 

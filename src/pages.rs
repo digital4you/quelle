@@ -31,8 +31,10 @@ pub mod structured;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use cdp::cdp_pool_enabled;
 pub use cdp::{
-    PageAction, set_cdp_pool_enabled, shutdown_pool, valid_actions, valid_wait_selector,
+    PageAction, cdp_subresource_blocks, set_cdp_pool_enabled, shutdown_pool, valid_actions,
+    valid_wait_selector,
 };
 pub use markdown::{ExtractOptions, PageMeta};
 pub use ocr::{

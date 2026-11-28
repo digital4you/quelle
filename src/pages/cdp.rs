@@ -85,6 +85,7 @@ pub(crate) const BLOCKED_ASSET_PATTERNS: &[&str] = &[
 ];
 
 static CDP_ENABLED: AtomicBool = AtomicBool::new(true);
+static CDP_SUBRESOURCE_BLOCKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_cdp_pool_enabled(enabled: bool) {
     CDP_ENABLED.store(enabled, Ordering::Relaxed);
@@ -92,6 +93,64 @@ pub fn set_cdp_pool_enabled(enabled: bool) {
 
 pub(crate) fn cdp_pool_enabled() -> bool {
     cfg!(unix) && CDP_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn cdp_subresource_blocks() -> u64 {
+    CDP_SUBRESOURCE_BLOCKS.load(Ordering::Relaxed)
+}
+
+/// Validates whether a Chromium subresource or redirect URL is permitted by the
+/// SSRF policy: allows inline `about:blank` / `about:srcdoc` / `data:` / `blob:`
+/// URIs and public `http(s)://` URLs; rejects private IPs, loopback, metadata,
+/// blocked CIDRs, credentials, and local schemes (`file://`, `chrome://`, etc.).
+pub(crate) fn cdp_subresource_allowed(raw_url: &str) -> bool {
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.eq_ignore_ascii_case("about:blank") || trimmed.eq_ignore_ascii_case("about:srcdoc") {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("data:") {
+        return true;
+    }
+    if let Some(rest) = lower.strip_prefix("blob:") {
+        if rest.starts_with("https://") || rest.starts_with("http://") {
+            return Url::parse(&trimmed[5..])
+                .ok()
+                .and_then(|u| public_url(u).ok())
+                .is_some();
+        }
+        return false;
+    }
+    let Ok(parsed) = Url::parse(trimmed) else {
+        return false;
+    };
+    public_url(parsed).is_ok()
+}
+
+/// Performs full URL + DNS resolution SSRF verification for an intercepted
+/// Chromium subresource or redirect URL.
+async fn cdp_subresource_is_public(raw_url: &str) -> bool {
+    if !cdp_subresource_allowed(raw_url) {
+        return false;
+    }
+    let trimmed = raw_url.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    if !lower.starts_with("http://") && !lower.starts_with("https://") {
+        return true;
+    }
+    let Ok(parsed) = Url::parse(trimmed) else {
+        return false;
+    };
+    let Ok(clean) = public_url(parsed) else {
+        return false;
+    };
+    tokio::time::timeout(Duration::from_secs(2), resolve_public_addrs(&clean))
+        .await
+        .ok()
+        .is_some_and(|res| res.is_ok())
 }
 
 /// Validates a caller-supplied CSS selector for `waitForSelector` or actions.
@@ -516,7 +575,9 @@ impl Mix for u64 {
 struct WsClient<S> {
     stream: S,
     rx: Vec<u8>,
+    rx_fragment: Option<Vec<u8>>,
     next_id: u64,
+    fetch_guard: bool,
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
@@ -569,8 +630,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
         Ok(Self {
             stream,
             rx,
+            rx_fragment: None,
             next_id: 0,
+            fetch_guard: false,
         })
+    }
+
+    fn set_fetch_guard(&mut self, enabled: bool) {
+        self.fetch_guard = enabled;
     }
 
     async fn send_frame(&mut self, opcode: u8, payload: &[u8]) -> Result<(), &'static str> {
@@ -582,8 +649,89 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
         Ok(())
     }
 
+    async fn send_command_no_wait(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+    ) -> Result<u64, &'static str> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let mut req = json!({ "id": id, "method": method });
+        if let Some(p) = params {
+            req["params"] = p;
+        }
+        if let Some(sid) = session_id {
+            req["sessionId"] = Value::String(sid.to_owned());
+        }
+        let payload = serde_json::to_string(&req).map_err(|_| "cdp_encode")?;
+        self.send_frame(0x1, payload.as_bytes()).await?;
+        Ok(id)
+    }
+
+    async fn handle_event(&mut self, msg: &Value, default_session: Option<&str>) {
+        if !self.fetch_guard {
+            return;
+        }
+        if msg.get("method").and_then(Value::as_str) != Some("Fetch.requestPaused") {
+            return;
+        }
+        let Some(request_id) = msg.pointer("/params/requestId").and_then(Value::as_str) else {
+            return;
+        };
+        let req_url = msg
+            .pointer("/params/request/url")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let ev_session = msg
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .or(default_session);
+        if cdp_subresource_is_public(req_url).await {
+            let _ = self
+                .send_command_no_wait(
+                    "Fetch.continueRequest",
+                    Some(json!({ "requestId": request_id })),
+                    ev_session,
+                )
+                .await;
+        } else {
+            CDP_SUBRESOURCE_BLOCKS.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(stage = "cdp_ssrf_blocked", url = req_url);
+            let _ = self
+                .send_command_no_wait(
+                    "Fetch.failRequest",
+                    Some(json!({
+                        "requestId": request_id,
+                        "errorReason": "BlockedByClient",
+                    })),
+                    ev_session,
+                )
+                .await;
+        }
+    }
+
+    /// Waits for `duration` while actively servicing `Fetch.requestPaused`
+    /// interception events when `fetch_guard` is active so subresources never stall.
+    async fn sleep_pumping(&mut self, duration: Duration, session_id: Option<&str>) {
+        if !self.fetch_guard || duration.is_zero() {
+            tokio::time::sleep(duration).await;
+            return;
+        }
+        let until = Instant::now() + duration;
+        while Instant::now() < until {
+            match tokio::time::timeout_at(until, self.recv_text()).await {
+                Ok(Ok(raw)) => {
+                    if let Ok(msg) = serde_json::from_str::<Value>(&raw) {
+                        self.handle_event(&msg, session_id).await;
+                    }
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+    }
+
     async fn recv_text(&mut self) -> Result<String, &'static str> {
-        let mut assembled: Option<Vec<u8>> = None;
         let mut tmp = [0u8; 65_536];
         loop {
             while let Some((frame, consumed)) = decode_ws_frame(&self.rx, MAX_CDP_MESSAGE)? {
@@ -598,16 +746,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
                         if frame.fin {
                             return String::from_utf8(frame.payload).map_err(|_| "ws_utf8");
                         }
-                        assembled = Some(frame.payload);
+                        self.rx_fragment = Some(frame.payload);
                     }
                     0x0 => {
-                        let buf = assembled.as_mut().ok_or("ws_unexpected_continuation")?;
+                        let buf = self
+                            .rx_fragment
+                            .as_mut()
+                            .ok_or("ws_unexpected_continuation")?;
                         if buf.len() + frame.payload.len() > MAX_CDP_MESSAGE {
                             return Err("ws_payload_too_large");
                         }
                         buf.extend_from_slice(&frame.payload);
                         if frame.fin {
-                            let payload = assembled.take().unwrap_or_default();
+                            let payload = self.rx_fragment.take().unwrap_or_default();
                             return String::from_utf8(payload).map_err(|_| "ws_utf8");
                         }
                     }
@@ -628,17 +779,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, &'static str> {
-        self.next_id += 1;
-        let id = self.next_id;
-        let mut req = json!({ "id": id, "method": method });
-        if let Some(p) = params {
-            req["params"] = p;
-        }
-        if let Some(sid) = session_id {
-            req["sessionId"] = Value::String(sid.to_owned());
-        }
-        let payload = serde_json::to_string(&req).map_err(|_| "cdp_encode")?;
-        self.send_frame(0x1, payload.as_bytes()).await?;
+        let id = self
+            .send_command_no_wait(method, params, session_id)
+            .await?;
         loop {
             let raw = self.recv_text().await?;
             let msg: Value = serde_json::from_str(&raw).map_err(|_| "cdp_decode")?;
@@ -648,6 +791,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> WsClient<S> {
                 }
                 return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
             }
+            self.handle_event(&msg, session_id).await;
         }
     }
 }
@@ -715,6 +859,22 @@ async fn run_cdp_session<S: AsyncRead + AsyncWrite + Unpin>(
             ws.call("Network.enable", Some(json!({})), Some(&session_id)),
         )
         .await;
+        // Enable CDP Fetch request interception so every redirected navigation
+        // and subresource URL is checked against Quelle's SSRF + DNS policy.
+        let fetch_ok = tokio::time::timeout_at(
+            deadline,
+            ws.call(
+                "Fetch.enable",
+                Some(json!({ "patterns": [{ "urlPattern": "*" }] })),
+                Some(&session_id),
+            ),
+        )
+        .await
+        .ok()
+        .is_some_and(|r| r.is_ok());
+        if fetch_ok {
+            ws.set_fetch_guard(true);
+        }
         if capture_screenshot.is_some() {
             let _ = tokio::time::timeout_at(
                 deadline,
@@ -810,7 +970,7 @@ async fn run_cdp_session<S: AsyncRead + AsyncWrite + Unpin>(
         match decision {
             WaitDecision::Ready | WaitDecision::Stop => break,
             WaitDecision::Continue => {
-                tokio::time::sleep(POLL_INTERVAL).await;
+                ws.sleep_pumping(POLL_INTERVAL, Some(&session_id)).await;
             }
         }
     }
@@ -837,7 +997,8 @@ async fn run_cdp_session<S: AsyncRead + AsyncWrite + Unpin>(
             ),
         )
         .await;
-        tokio::time::sleep(Duration::from_millis(220)).await;
+        ws.sleep_pumping(Duration::from_millis(220), Some(&session_id))
+            .await;
     }
 
     // Optional safe scoped page actions (click, wait, waitForSelector, scroll, press).
@@ -849,7 +1010,7 @@ async fn run_cdp_session<S: AsyncRead + AsyncWrite + Unpin>(
             PageAction::Wait { milliseconds } => {
                 let dur = Duration::from_millis((*milliseconds).min(5_000));
                 let rem = poll_stop.saturating_duration_since(Instant::now());
-                tokio::time::sleep(dur.min(rem)).await;
+                ws.sleep_pumping(dur.min(rem), Some(&session_id)).await;
             }
             PageAction::WaitForSelector {
                 selector,
@@ -877,7 +1038,7 @@ async fn run_cdp_session<S: AsyncRead + AsyncWrite + Unpin>(
                         if found {
                             break;
                         }
-                        tokio::time::sleep(POLL_INTERVAL).await;
+                        ws.sleep_pumping(POLL_INTERVAL, Some(&session_id)).await;
                     }
                 }
             }
@@ -906,7 +1067,8 @@ async fn run_cdp_session<S: AsyncRead + AsyncWrite + Unpin>(
                             ),
                         )
                         .await;
-                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        ws.sleep_pumping(Duration::from_millis(200), Some(&session_id))
+                            .await;
                     }
                 }
             }
@@ -923,7 +1085,8 @@ async fn run_cdp_session<S: AsyncRead + AsyncWrite + Unpin>(
                     .await;
                     // Brief settle after clicks/keypresses for synchronous or microtask DOM updates.
                     let rem = poll_stop.saturating_duration_since(Instant::now());
-                    tokio::time::sleep(Duration::from_millis(180).min(rem)).await;
+                    ws.sleep_pumping(Duration::from_millis(180).min(rem), Some(&session_id))
+                        .await;
                 }
             }
         }
@@ -1106,6 +1269,7 @@ pub(crate) async fn render_chromium_cdp(
     )
     .await;
 
+    ws.set_fetch_guard(false);
     let _ = tokio::time::timeout(CLEANUP_TIMEOUT, async {
         let _ = ws
             .call(
@@ -1650,5 +1814,156 @@ mod tests {
 
         // Rejects non-ws schemes.
         assert!(normalize_chromium_ws_url(&endpoint, "http://127.0.0.1:9222/foo").is_none());
+    }
+
+    #[test]
+    fn cdp_subresource_guard_blocks_private_loopback_metadata_and_local_schemes() {
+        // Allowed non-network / public URLs
+        assert!(cdp_subresource_allowed("about:blank"));
+        assert!(cdp_subresource_allowed("about:srcdoc"));
+        assert!(cdp_subresource_allowed(
+            "data:image/png;base64,iVBORw0KGgo="
+        ));
+        assert!(cdp_subresource_allowed("blob:https://example.org/uuid-1"));
+        assert!(cdp_subresource_allowed("https://example.org/app.js"));
+        assert!(cdp_subresource_allowed("http://93.184.216.34/style.css"));
+
+        // Blocked private, loopback, metadata, credentials, and non-http schemes
+        assert!(!cdp_subresource_allowed("http://127.0.0.1/admin"));
+        assert!(!cdp_subresource_allowed("http://localhost:8080/api"));
+        assert!(!cdp_subresource_allowed(
+            "http://169.254.169.254/latest/meta-data/"
+        ));
+        assert!(!cdp_subresource_allowed("http://10.0.0.1/internal"));
+        assert!(!cdp_subresource_allowed("http://[::1]:3000/secret"));
+        assert!(!cdp_subresource_allowed("https://user:pass@example.org/"));
+        assert!(!cdp_subresource_allowed("file:///etc/passwd"));
+        assert!(!cdp_subresource_allowed("chrome://settings"));
+        assert!(!cdp_subresource_allowed("ftp://example.org/file"));
+        assert!(!cdp_subresource_allowed(""));
+    }
+
+    #[tokio::test]
+    async fn ws_client_fetch_guard_fails_private_subresource_and_continues_safe_data_uri() {
+        let (client_stream, mut server_stream) = tokio::io::duplex(64 * 1024);
+
+        let server = tokio::spawn(async move {
+            // Read client WebSocket handshake
+            let mut req_buf = Vec::new();
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = server_stream.read(&mut tmp).await.unwrap();
+                assert!(n > 0);
+                req_buf.extend_from_slice(&tmp[..n]);
+                if req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            server_stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                )
+                .await
+                .unwrap();
+
+            // Helper to read one masked client frame
+            async fn read_client_json(
+                srv: &mut tokio::io::DuplexStream,
+                rx: &mut Vec<u8>,
+            ) -> Value {
+                let mut buf = [0u8; 4096];
+                loop {
+                    if let Some((frame, consumed)) = decode_ws_frame(rx, 65536).unwrap() {
+                        rx.drain(..consumed);
+                        return serde_json::from_slice::<Value>(&frame.payload).unwrap();
+                    }
+                    let n = srv.read(&mut buf).await.unwrap();
+                    assert!(n > 0);
+                    rx.extend_from_slice(&buf[..n]);
+                }
+            }
+            // Helper to send unmasked server text frame
+            async fn send_server_json(srv: &mut tokio::io::DuplexStream, val: Value) {
+                let payload = serde_json::to_vec(&val).unwrap();
+                let mut frame = Vec::new();
+                frame.push(0x81);
+                if payload.len() < 126 {
+                    frame.push(payload.len() as u8);
+                } else {
+                    frame.push(126);
+                    frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                }
+                frame.extend_from_slice(&payload);
+                srv.write_all(&frame).await.unwrap();
+            }
+
+            let mut srv_rx = Vec::new();
+
+            // 1. Expect Page.navigate
+            let nav = read_client_json(&mut server_stream, &mut srv_rx).await;
+            assert_eq!(nav["method"], "Page.navigate");
+            let nav_id = nav["id"].as_u64().unwrap();
+
+            // 2. Emit two Fetch.requestPaused events before answering Page.navigate:
+            //    one SSRF attempt to 169.254.169.254 and one safe data: URI.
+            send_server_json(
+                &mut server_stream,
+                json!({
+                    "method": "Fetch.requestPaused",
+                    "sessionId": "sess-1",
+                    "params": {
+                        "requestId": "req-ssrf",
+                        "request": { "url": "http://169.254.169.254/latest/meta-data/" }
+                    }
+                }),
+            )
+            .await;
+            send_server_json(
+                &mut server_stream,
+                json!({
+                    "method": "Fetch.requestPaused",
+                    "sessionId": "sess-1",
+                    "params": {
+                        "requestId": "req-data",
+                        "request": { "url": "data:text/plain,hello" }
+                    }
+                }),
+            )
+            .await;
+
+            // 3. Verify client immediately fails the SSRF request and continues the safe one
+            let cmd1 = read_client_json(&mut server_stream, &mut srv_rx).await;
+            assert_eq!(cmd1["method"], "Fetch.failRequest");
+            assert_eq!(cmd1["params"]["requestId"], "req-ssrf");
+            assert_eq!(cmd1["params"]["errorReason"], "BlockedByClient");
+            assert_eq!(cmd1["sessionId"], "sess-1");
+
+            let cmd2 = read_client_json(&mut server_stream, &mut srv_rx).await;
+            assert_eq!(cmd2["method"], "Fetch.continueRequest");
+            assert_eq!(cmd2["params"]["requestId"], "req-data");
+            assert_eq!(cmd2["sessionId"], "sess-1");
+
+            // 4. Complete Page.navigate
+            send_server_json(
+                &mut server_stream,
+                json!({ "id": nav_id, "result": { "frameId": "f1" } }),
+            )
+            .await;
+        });
+
+        let mut ws = WsClient::handshake(client_stream, "localhost", "/")
+            .await
+            .unwrap();
+        ws.set_fetch_guard(true);
+        let res = ws
+            .call(
+                "Page.navigate",
+                Some(json!({ "url": "https://example.org" })),
+                Some("sess-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res["frameId"], "f1");
+        server.await.unwrap();
     }
 }

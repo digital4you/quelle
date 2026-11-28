@@ -3,6 +3,7 @@ mod content;
 mod crawl;
 mod discovery;
 mod mcp;
+mod metrics;
 mod model;
 mod pages;
 mod politeness;
@@ -142,6 +143,7 @@ fn client_builder() -> reqwest::ClientBuilder {
 }
 
 struct App {
+    started: std::time::Instant,
     authorization: HeaderValue,
     slots: Arc<Semaphore>,
     search: Search,
@@ -574,8 +576,11 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
         Ok(_) | Err(env::VarError::NotPresent) => None,
         Err(_) => return Err("QUELLE_STATE_DIR"),
     };
+    politeness::global().set_state_dir(state_dir.clone());
+    engines.set_state_dir(state_dir.clone());
     let concurrent = positive_env("QUELLE_CONCURRENCY", 8, 1, 64)?;
     let app = App {
+        started: std::time::Instant::now(),
         authorization,
         slots: Arc::new(Semaphore::new(concurrent)),
         search: Search {
@@ -662,6 +667,8 @@ async fn main() -> ExitCode {
         .route("/api/crawl/{id}", get(crawl::status_handle))
         .route("/api/crawl/{id}/stream", get(crawl::stream_handle))
         .route("/api/crawl/{id}", delete(crawl::cancel_handle))
+        .route("/api/status", get(metrics::status_handle))
+        .route("/metrics", get(metrics::prometheus_handle))
         .route("/healthz", get(health))
         .route("/api/providers", get(health))
         .with_state(app)

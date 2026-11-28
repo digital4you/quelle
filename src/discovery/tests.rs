@@ -579,3 +579,146 @@ fn parses_marginalia_naver_gdelt_crossref_pubmed_and_ietf_providers() {
     assert!(query_has_ietf_intent("RFC 9114 HTTP/3 QUIC transport"));
     assert!(!query_has_ietf_intent("Schweiz MWST Steuersätze 2024"));
 }
+
+#[tokio::test]
+async fn discovery_disk_cache_persists_candidates_across_restarts() {
+    let dir =
+        std::env::temp_dir().join(format!("quelle-discovery-disk-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    struct CountingEngine {
+        calls: std::sync::Arc<AtomicUsize>,
+    }
+    impl SearchEngine for CountingEngine {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+        fn search<'a>(&'a self, _query: &'a Query, _options: SearchOptions) -> DiscoveryFuture<'a> {
+            let calls = std::sync::Arc::clone(&self.calls);
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::Relaxed);
+                Ok(vec![Candidate {
+                    url: Url::parse("https://www.ietf.org/rfc/rfc9110.txt").unwrap(),
+                    title: "RFC 9110".into(),
+                    description: "HTTP Semantics".into(),
+                }])
+            })
+        }
+    }
+
+    let calls1 = std::sync::Arc::new(AtomicUsize::new(0));
+    let pool1 = EnginePool::new(vec![Box::new(CountingEngine {
+        calls: std::sync::Arc::clone(&calls1),
+    })]);
+    pool1.set_state_dir(Some(dir.clone()));
+
+    let q = Query {
+        text: "RFC 9110 HTTP Semantics".into(),
+        language: Language::En,
+    };
+    let opts = SearchOptions {
+        count: 5,
+        spellcheck: false,
+    };
+    let retries = AtomicUsize::new(2);
+    let hits1 = pool1.lookup(&q, opts, &retries).await.unwrap();
+    assert_eq!(hits1.len(), 1);
+    assert_eq!(calls1.load(Ordering::Relaxed), 1);
+    assert_eq!(pool1.engine_metrics()[0].requests, 1);
+    assert_eq!(pool1.engine_metrics()[0].hits, 1);
+
+    // Simulated restart: brand new EnginePool pointed at the same state dir
+    let calls2 = std::sync::Arc::new(AtomicUsize::new(0));
+    let pool2 = EnginePool::new(vec![Box::new(CountingEngine {
+        calls: std::sync::Arc::clone(&calls2),
+    })]);
+    pool2.set_state_dir(Some(dir.clone()));
+
+    let hits2 = pool2.lookup(&q, opts, &retries).await.unwrap();
+    assert_eq!(hits2.len(), 1);
+    assert_eq!(
+        hits2[0].url.as_str(),
+        "https://www.ietf.org/rfc/rfc9110.txt"
+    );
+    assert_eq!(
+        calls2.load(Ordering::Relaxed),
+        0,
+        "second pool must serve from persistent disk cache without hitting upstream"
+    );
+    assert_eq!(pool2.cache_stats().1, 1, "disk hit counter must increment");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn parses_and_ranks_rss_and_atom_news_feeds_and_translates_non_english_specialist_queries() {
+    let rss = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel>
+      <item>
+        <title><![CDATA[ECB cuts key deposit interest rate to 2.0 percent]]></title>
+        <link>https://www.bbc.co.uk/news/ecb-rate-cut</link>
+        <description><![CDATA[<p>The European Central Bank lowered its main deposit facility rate today.</p>]]></description>
+        <pubDate>Sat, 28 Nov 2026 10:00:00 GMT</pubDate>
+      </item>
+      <item>
+        <title>Premier League weekend football preview</title>
+        <link>https://www.bbc.co.uk/sport/football-preview</link>
+        <description>Match previews across England.</description>
+      </item>
+    </channel></rss>"#;
+    let atom = r#"<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <title>Linux 6.18 release brings io_uring improvements</title>
+        <link href="https://lwn.net/Articles/1000001/"/>
+        <summary>Kernel networking and io_uring zero-copy updates.</summary>
+        <updated>2026-11-28T09:00:00Z</updated>
+      </entry>
+    </feed>"#;
+
+    let mut items = parse_rss_or_atom(rss, "BBC World");
+    items.extend(parse_rss_or_atom(atom, "LWN"));
+    assert_eq!(items.len(), 3);
+
+    let hits = rank_feed_items("latest ECB deposit rate decision news", &items, 5);
+    assert_eq!(
+        hits.len(),
+        1,
+        "unrelated sports/kernel items must be filtered out"
+    );
+    assert_eq!(
+        hits[0].url.as_str(),
+        "https://www.bbc.co.uk/news/ecb-rate-cut"
+    );
+    assert!(hits[0].description.contains("BBC World"));
+
+    // Cross-lingual DE/FR/IT -> EN specialist translation for PubMed / MDN
+    let de = translate_specialist_query("Nebenwirkungen Paracetamol Leber Dosierung", Language::De);
+    assert!(de.contains("side effects"));
+    assert!(de.contains("paracetamol"));
+    assert!(de.contains("liver"));
+    assert!(de.contains("dosage"));
+
+    let fr = translate_specialist_query(
+        "Effets secondaires ibuprofène posologie et foie",
+        Language::Fr,
+    );
+    assert!(fr.contains("side effects"));
+    assert!(fr.contains("dosage"));
+    assert!(fr.contains("liver"));
+
+    let it = translate_specialist_query(
+        "Effetti collaterali vaccino efficacia studio clinico",
+        Language::It,
+    );
+    assert!(it.contains("side effects"));
+    assert!(it.contains("vaccine"));
+    assert!(it.contains("efficacy"));
+    assert!(it.contains("clinical trial"));
+
+    // Already-English queries remain untouched (preserving case and exact syntax)
+    assert_eq!(
+        translate_specialist_query("RFC 9110 HTTP 429 Retry-After", Language::En),
+        "RFC 9110 HTTP 429 Retry-After"
+    );
+}

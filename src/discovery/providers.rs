@@ -1,11 +1,12 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
-    sync::LazyLock,
-    time::{Duration, SystemTime},
+    sync::{LazyLock, Mutex, OnceLock},
+    time::{Duration, Instant, SystemTime},
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use regex::Regex;
 use reqwest::{Client, Response, StatusCode, header};
 use scraper::{Html, Selector};
@@ -22,6 +23,8 @@ use crate::{
 };
 
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
+const RSS_BODY_LIMIT: usize = 512 * 1024;
+const RSS_FEED_TTL: Duration = Duration::from_secs(5 * 60);
 const HONEST_USER_AGENT: &str = "Quelle/0.1 (+https://github.com/digital4you/quelle)";
 const FIREFOX_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0";
@@ -30,9 +33,9 @@ const CHROME_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Apple
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
 /// Default keyless meta-search engine mix fused via parallel RRF:
 /// 6 independent general-web engines (duckduckgo, yahoo_jp, seznam, marginalia, naver, mwmbl)
-/// plus 8 intent-routed official JSON APIs (wikipedia, mdn, ietf, crossref, pubmed, gdelt,
-/// stackexchange, hackernews).
-const DEFAULT_KEYLESS_ENGINES: &str = "duckduckgo,yahoo_jp,seznam,marginalia,naver,mwmbl,wikipedia,mdn,ietf,crossref,pubmed,gdelt,stackexchange,hackernews";
+/// plus 9 intent-routed official JSON/RSS APIs (wikipedia, mdn, ietf, crossref, pubmed, gdelt,
+/// rss_news, stackexchange, hackernews).
+const DEFAULT_KEYLESS_ENGINES: &str = "duckduckgo,yahoo_jp,seznam,marginalia,naver,mwmbl,wikipedia,mdn,ietf,crossref,pubmed,gdelt,rss_news,stackexchange,hackernews";
 
 #[derive(Clone, Copy)]
 pub(super) enum HtmlEngine {
@@ -63,6 +66,7 @@ enum Provider {
     Crossref,
     PubMed,
     Gdelt,
+    RssNews,
     OpenAlex,
     StackExchange,
     HackerNews,
@@ -158,6 +162,7 @@ pub fn configure_engines(client: &Client, service_token: &str) -> Result<EngineP
             "crossref" => Provider::Crossref,
             "pubmed" | "nih" => Provider::PubMed,
             "gdelt" => Provider::Gdelt,
+            "rss_news" | "news" => Provider::RssNews,
             "openalex" => Provider::OpenAlex,
             "stackexchange" | "stackoverflow" => Provider::StackExchange,
             "hackernews" | "hn" => Provider::HackerNews,
@@ -228,6 +233,7 @@ impl SearchEngine for NativeEngine {
             Provider::Wikipedia => 0.85,
             Provider::PubMed => 0.85,
             Provider::Gdelt => 0.85,
+            Provider::RssNews => 0.9,
             Provider::Crossref => 0.8,
             Provider::StackExchange => 0.75,
             Provider::HackerNews => 0.75,
@@ -243,6 +249,7 @@ impl SearchEngine for NativeEngine {
             Provider::Mdn if query_has_web_intent(&query.text) => 1.35,
             Provider::PubMed if query_has_biomed_intent(&query.text) => 1.3,
             Provider::Gdelt if query_has_news_intent(&query.text) => 1.15,
+            Provider::RssNews if query_has_news_intent(&query.text) => 1.25,
             Provider::Arxiv | Provider::OpenAlex | Provider::Crossref
                 if query_has_academic_intent(&query.text) =>
             {
@@ -273,7 +280,9 @@ impl SearchEngine for NativeEngine {
                 site_filter_allows(&query.text, &["pubmed.ncbi.nlm.nih.gov", "nih.gov"])
                     && query_has_biomed_intent(&query.text)
             }
-            Provider::Gdelt => query_has_news_intent(&query.text) && !query.text.contains("site:"),
+            Provider::Gdelt | Provider::RssNews => {
+                query_has_news_intent(&query.text) && !query.text.contains("site:")
+            }
             Provider::OpenAlex => {
                 site_filter_allows(&query.text, &["openalex.org", "doi.org"])
                     && query_has_academic_intent(&query.text)
@@ -309,6 +318,7 @@ impl SearchEngine for NativeEngine {
             Provider::Crossref => "crossref",
             Provider::PubMed => "pubmed",
             Provider::Gdelt => "gdelt",
+            Provider::RssNews => "rss_news",
             Provider::OpenAlex => "openalex",
             Provider::StackExchange => "stackexchange",
             Provider::HackerNews => "hackernews",
@@ -569,6 +579,11 @@ impl NativeEngine {
                         ("format", "json"),
                     ])
             }
+            Provider::RssNews => {
+                // Handled directly in `fetch_rss_news` via multi-feed cache.
+                self.client
+                    .get("https://feeds.bbci.co.uk/news/world/rss.xml")
+            }
             Provider::PubMed => {
                 let retmax = options.count.min(10).to_string();
                 self.client
@@ -665,15 +680,24 @@ impl NativeEngine {
         query: &Query,
         options: SearchOptions,
     ) -> Result<Vec<Candidate>, DiscoveryError> {
+        if matches!(self.provider, Provider::RssNews) {
+            return self.fetch_rss_news(query, options.count).await;
+        }
         let lang = match query.language {
             Language::De => "de",
             Language::Fr => "fr",
             Language::It => "it",
             Language::En => "en",
         };
+        let effective_query = match self.provider {
+            Provider::PubMed | Provider::Mdn | Provider::Ietf | Provider::StackExchange => {
+                translate_specialist_query(&query.text, query.language)
+            }
+            _ => query.text.clone(),
+        };
         let html = matches!(self.provider, Provider::Html(_));
         let response = self
-            .request(&query.text, query.language, options)
+            .request(&effective_query, query.language, options)
             .timeout(Duration::from_secs(5))
             .send()
             .await
@@ -761,6 +785,7 @@ impl NativeEngine {
                     .map_err(|_| DiscoveryError::Unavailable)?;
                 return parse_gdelt_json(&bytes, options.count);
             }
+            Provider::RssNews => unreachable!("handled in fetch_rss_news"),
             Provider::PubMed => {
                 let bytes = read_body(response, BODY_LIMIT)
                     .await
@@ -833,6 +858,427 @@ impl NativeEngine {
             }
         };
         Ok(candidates(rows, options.count))
+    }
+
+    async fn fetch_rss_news(
+        &self,
+        query: &Query,
+        count: usize,
+    ) -> Result<Vec<Candidate>, DiscoveryError> {
+        type FeedCacheMap = HashMap<&'static str, (Instant, Vec<FeedItem>)>;
+        static FEED_CACHE: OnceLock<Mutex<FeedCacheMap>> = OnceLock::new();
+        let cache = FEED_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+        let feeds = curated_news_feeds(query.language);
+        let mut pooled: Vec<FeedItem> = Vec::new();
+        let mut to_fetch: Vec<(&'static str, &'static str)> = Vec::new();
+        {
+            if let Ok(guard) = cache.lock() {
+                for &(source, url) in feeds {
+                    if let Some((stored, items)) = guard.get(url)
+                        && stored.elapsed() < RSS_FEED_TTL
+                    {
+                        pooled.extend(items.iter().cloned());
+                    } else {
+                        to_fetch.push((source, url));
+                    }
+                }
+            }
+        }
+
+        if !to_fetch.is_empty() {
+            let mut tasks = FuturesUnordered::new();
+            for (source, url) in to_fetch {
+                let client = self.client.clone();
+                tasks.push(async move {
+                    let resp = client
+                        .get(url)
+                        .header(header::USER_AGENT, HONEST_USER_AGENT)
+                        .header(
+                            header::ACCEPT,
+                            "application/rss+xml, application/atom+xml, application/xml, text/xml",
+                        )
+                        .timeout(Duration::from_millis(3500))
+                        .send()
+                        .await
+                        .ok()?;
+                    if !resp.status().is_success() {
+                        return None;
+                    }
+                    let bytes = read_body(resp, RSS_BODY_LIMIT).await.ok()?;
+                    let xml = String::from_utf8_lossy(&bytes);
+                    let parsed = parse_rss_or_atom(&xml, source);
+                    (!parsed.is_empty()).then_some((url, parsed))
+                });
+            }
+            while let Some(res) = tasks.next().await {
+                if let Some((url, items)) = res {
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.insert(url, (Instant::now(), items.clone()));
+                    }
+                    pooled.extend(items);
+                }
+            }
+        }
+
+        if pooled.is_empty() {
+            return Err(DiscoveryError::Unavailable);
+        }
+        Ok(rank_feed_items(&query.text, &pooled, count))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct FeedItem {
+    pub url: String,
+    pub title: String,
+    pub description: String,
+    pub source: String,
+    pub published: String,
+}
+
+fn curated_news_feeds(language: Language) -> &'static [(&'static str, &'static str)] {
+    match language {
+        Language::De => &[
+            ("SRF News", "https://www.srf.ch/news/bnf/rss/1646"),
+            (
+                "Tagesschau",
+                "https://www.tagesschau.de/infoservices/alle-meldungen-100~rss2.xml",
+            ),
+            ("Heise", "https://www.heise.de/rss/heise-atom.xml"),
+            ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+        ],
+        Language::Fr => &[
+            ("France 24", "https://www.france24.com/fr/rss"),
+            ("Le Monde", "https://www.lemonde.fr/rss/une.xml"),
+            ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+        ],
+        Language::It => &[
+            ("ANSA", "https://www.ansa.it/sito/ansait_rss.xml"),
+            (
+                "la Repubblica",
+                "https://www.repubblica.it/rss/homepage/rss2.0.xml",
+            ),
+            ("RaiNews", "https://www.rainews.it/rss/tutti"),
+            ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+        ],
+        Language::En => &[
+            ("BBC World", "https://feeds.bbci.co.uk/news/world/rss.xml"),
+            ("NPR News", "https://feeds.npr.org/1001/rss.xml"),
+            ("The Guardian", "https://www.theguardian.com/world/rss"),
+            (
+                "Ars Technica",
+                "https://feeds.arstechnica.com/arstechnica/index",
+            ),
+            ("LWN", "https://lwn.net/headlines/rss"),
+        ],
+    }
+}
+
+fn strip_cdata(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix("<![CDATA[")
+        .and_then(|s| s.strip_suffix("]]>"))
+        .unwrap_or(trimmed)
+}
+
+pub(super) fn parse_rss_or_atom(xml: &str, source_name: &str) -> Vec<FeedItem> {
+    static RSS_ITEM: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<item\b[^>]*>(.*?)</item>").unwrap());
+    static ATOM_ENTRY: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<entry\b[^>]*>(.*?)</entry>").unwrap());
+    static TITLE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<title\b[^>]*>(.*?)</title>").unwrap());
+    static LINK_TEXT: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<link\b[^>]*>(.*?)</link>").unwrap());
+    static LINK_HREF: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"(?is)<link\b[^>]*\bhref=["']([^"']+)["']"#).unwrap());
+    static DESC: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?is)<(?:description|summary|content)\b[^>]*>(.*?)</(?:description|summary|content)>",
+        )
+        .unwrap()
+    });
+    static PUBDATE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?is)<(?:pubDate|updated|published)\b[^>]*>(.*?)</(?:pubDate|updated|published)>",
+        )
+        .unwrap()
+    });
+
+    let extract_block = |block: &str| -> Option<FeedItem> {
+        let url = LINK_TEXT
+            .captures(block)
+            .map(|c| strip_cdata(&c[1]).trim().to_owned())
+            .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+            .or_else(|| {
+                LINK_HREF
+                    .captures(block)
+                    .map(|c| c[1].trim().to_owned())
+                    .filter(|u| u.starts_with("http://") || u.starts_with("https://"))
+            })?;
+        let title = TITLE
+            .captures(block)
+            .map(|c| decode_html_text(strip_cdata(&c[1])))
+            .unwrap_or_default();
+        if title.is_empty() {
+            return None;
+        }
+        let desc_raw = DESC
+            .captures(block)
+            .map(|c| decode_html_text(strip_cdata(&c[1])))
+            .unwrap_or_default();
+        let published = PUBDATE
+            .captures(block)
+            .map(|c| strip_cdata(&c[1]).trim().to_owned())
+            .unwrap_or_default();
+        Some(FeedItem {
+            url,
+            title,
+            description: truncate(&desc_raw, 280),
+            source: source_name.to_owned(),
+            published,
+        })
+    };
+
+    let mut out: Vec<FeedItem> = RSS_ITEM
+        .captures_iter(xml)
+        .filter_map(|cap| extract_block(&cap[1]))
+        .collect();
+    if out.is_empty() {
+        out = ATOM_ENTRY
+            .captures_iter(xml)
+            .filter_map(|cap| extract_block(&cap[1]))
+            .collect();
+    }
+    out
+}
+
+pub(super) fn rank_feed_items(query: &str, items: &[FeedItem], count: usize) -> Vec<Candidate> {
+    if items.is_empty() || count == 0 {
+        return Vec::new();
+    }
+    let mut seen_terms = HashSet::new();
+    let query_terms: Vec<String> = crate::selection::bm25_tokens(query)
+        .into_iter()
+        .filter(|t| {
+            !matches!(
+                t.as_str(),
+                "latest"
+                    | "news"
+                    | "today"
+                    | "breaking"
+                    | "aktuell"
+                    | "nachrichten"
+                    | "actualités"
+                    | "notizie"
+                    | "2025"
+                    | "2026"
+            )
+        })
+        .filter(|t| seen_terms.insert(t.clone()))
+        .take(32)
+        .collect();
+
+    let field_docs: Vec<Vec<(&str, f64)>> = items
+        .iter()
+        .map(|it| vec![(it.title.as_str(), 3.0), (it.description.as_str(), 1.0)])
+        .collect();
+    let bm25 = crate::selection::bm25f_scores(&query_terms, &field_docs);
+
+    let mut scored: Vec<(f64, usize, &FeedItem)> = items
+        .iter()
+        .enumerate()
+        .zip(bm25)
+        .filter_map(|((idx, item), bm)| {
+            let trigram = crate::selection::char_trigram_cosine(
+                query,
+                &format!("{} {}", item.title, item.description),
+            );
+            // Require genuine topical relevance so unrelated breaking headlines
+            // are never injected into specific news queries.
+            if bm <= 0.0 && trigram < 0.16 {
+                return None;
+            }
+            Some((bm + trigram * 2.0, idx, item))
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let rows = scored.into_iter().map(|(_, _, item)| {
+        let mut meta = vec![item.source.clone()];
+        if !item.published.is_empty() {
+            meta.push(item.published.clone());
+        }
+        let description = if item.description.is_empty() {
+            meta.join(" · ")
+        } else {
+            format!("{} — {}", meta.join(" · "), item.description)
+        };
+        Row {
+            url: item.url.clone(),
+            title: item.title.clone(),
+            description,
+        }
+    });
+    candidates(rows, count)
+}
+
+/// Translates common German, French, and Italian biomedical and technical terms
+/// into English equivalents for English-only specialist APIs (`pubmed`, `mdn`,
+/// `ietf`, `stackexchange`), preserving drug names, RFC numbers, and proper nouns.
+pub(super) fn translate_specialist_query(query: &str, _language: Language) -> String {
+    // Multi-word phrases first, then single-word stems (all lowercase keys).
+    const PHRASES: &[(&str, &str)] = &[
+        ("klinische studie", "clinical trial"),
+        ("klinischen studie", "clinical trial"),
+        ("étude clinique", "clinical trial"),
+        ("essai clinique", "clinical trial"),
+        ("studio clinico", "clinical trial"),
+        ("effets secondaires", "side effects"),
+        ("effet secondaire", "side effect"),
+        ("effetti collaterali", "side effects"),
+        ("effetto collaterale", "side effect"),
+        ("hypertension artérielle", "hypertension"),
+        ("pressione alta", "hypertension"),
+        ("interactions médicamenteuses", "drug interactions"),
+        ("base de données", "database"),
+        ("base di dati", "database"),
+    ];
+    const WORDS: &[(&str, &str)] = &[
+        // German biomedical
+        ("nebenwirkungen", "side effects"),
+        ("nebenwirkung", "side effect"),
+        ("dosierung", "dosage"),
+        ("überdosierung", "overdose"),
+        ("wechselwirkungen", "drug interactions"),
+        ("leber", "liver"),
+        ("leberschaden", "liver damage"),
+        ("lebertoxizität", "hepatotoxicity"),
+        ("niere", "kidney"),
+        ("nieren", "kidney"),
+        ("bluthochdruck", "hypertension"),
+        ("blutdruck", "blood pressure"),
+        ("impfstoff", "vaccine"),
+        ("impfung", "vaccination"),
+        ("wirksamkeit", "efficacy"),
+        ("krebs", "cancer"),
+        ("behandlung", "treatment"),
+        ("therapie", "therapy"),
+        ("studie", "clinical study"),
+        ("schmerzmittel", "analgesic"),
+        ("fieber", "fever"),
+        ("entzündung", "inflammation"),
+        ("infektion", "infection"),
+        ("antibiotika", "antibiotics"),
+        ("antibiotikum", "antibiotic"),
+        ("herzinfarkt", "myocardial infarction"),
+        ("schlaganfall", "stroke"),
+        ("schwangerschaft", "pregnancy"),
+        ("stillzeit", "lactation"),
+        ("symptome", "symptoms"),
+        ("diagnose", "diagnosis"),
+        ("vorbeugung", "prevention"),
+        ("blutzucker", "blood glucose"),
+        ("stoffwechsel", "metabolism"),
+        ("immunsystem", "immune system"),
+        ("kopfschmerzen", "headache"),
+        ("übelkeit", "nausea"),
+        ("schwindel", "dizziness"),
+        ("allergie", "allergy"),
+        ("magen", "gastric"),
+        ("darm", "intestinal"),
+        ("lunge", "lung"),
+        ("gehirn", "brain"),
+        ("erkrankung", "disease"),
+        ("krankheit", "disease"),
+        ("medikament", "drug"),
+        ("wirkstoff", "active ingredient"),
+        // French biomedical
+        ("posologie", "dosage"),
+        ("surdosage", "overdose"),
+        ("foie", "liver"),
+        ("rein", "kidney"),
+        ("vaccin", "vaccine"),
+        ("efficacité", "efficacy"),
+        ("traitement", "treatment"),
+        ("douleur", "pain"),
+        ("fièvre", "fever"),
+        ("grossesse", "pregnancy"),
+        ("maladie", "disease"),
+        ("médicament", "drug"),
+        ("symptômes", "symptoms"),
+        ("prévention", "prevention"),
+        ("glycémie", "blood glucose"),
+        // Italian biomedical
+        ("dosaggio", "dosage"),
+        ("sovradosaggio", "overdose"),
+        ("fegato", "liver"),
+        ("rene", "kidney"),
+        ("vaccino", "vaccine"),
+        ("efficacia", "efficacy"),
+        ("trattamento", "treatment"),
+        ("dolore", "pain"),
+        ("febbre", "fever"),
+        ("gravidanza", "pregnancy"),
+        ("malattia", "disease"),
+        ("farmaco", "drug"),
+        ("sintomi", "symptoms"),
+        ("prevenzione", "prevention"),
+        // DE/FR/IT web & tech
+        ("barrierefreiheit", "accessibility"),
+        ("speicher", "memory"),
+        ("datenbank", "database"),
+        ("verschlüsselung", "encryption"),
+        ("authentifizierung", "authentication"),
+        ("schnittstelle", "interface"),
+        ("fehlerbehandlung", "error handling"),
+        ("abfrage", "query"),
+        ("netzwerk", "network"),
+        ("protokoll", "protocol"),
+        ("sicherheit", "security"),
+        ("accessibilité", "accessibility"),
+        ("chiffrement", "encryption"),
+        ("mémoire", "memory"),
+        ("accessibilità", "accessibility"),
+        ("crittografia", "encryption"),
+    ];
+    const STOPWORDS: &[&str] = &[
+        "und", "oder", "bei", "für", "mit", "über", "von", "der", "die", "das", "den", "dem",
+        "des", "ein", "eine", "les", "pour", "avec", "dans", "sur", "une", "chez", "degli",
+        "della", "delle", "con", "per", "nel", "nella",
+    ];
+
+    let mut working = query.to_lowercase();
+    let mut translated_any = false;
+    for &(src, dst) in PHRASES {
+        if working.contains(src) {
+            working = working.replace(src, dst);
+            translated_any = true;
+        }
+    }
+
+    let mut out = Vec::new();
+    for raw_tok in working.split_whitespace() {
+        let clean = raw_tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '/');
+        if clean.is_empty() {
+            continue;
+        }
+        if let Some(&(_, dst)) = WORDS.iter().find(|&&(src, _)| src == clean) {
+            out.push(dst.to_owned());
+            translated_any = true;
+        } else if translated_any && STOPWORDS.contains(&clean) {
+            continue;
+        } else {
+            out.push(raw_tok.to_owned());
+        }
+    }
+
+    if translated_any {
+        out.join(" ")
+    } else {
+        query.to_owned()
     }
 }
 

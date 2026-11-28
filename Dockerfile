@@ -16,7 +16,13 @@ RUN cargo build --locked --release
 FROM debian:bookworm-slim
 ARG LIGHTPANDA_VERSION=1.0.5
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates poppler-utils \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        poppler-utils \
+        tesseract-ocr \
+        tesseract-ocr-deu \
+        tesseract-ocr-fra \
+        tesseract-ocr-ita \
     && rm -rf /var/lib/apt/lists/*
 # Lightpanda is AGPL-3.0 and shipped unmodified as a separate program; its
 # licence is kept next to it and its source is at

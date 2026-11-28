@@ -120,6 +120,8 @@ pub struct CrawlJobSnapshot {
     pub changes: Option<ChangeSummary>,
     pub data: Vec<ScrapedPage>,
     pub errors: Vec<CrawlErrorEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub llms_txt: Option<String>,
     pub elapsed_ms: u64,
 }
 
@@ -159,6 +161,8 @@ struct CrawlCheckpointConfig {
     concurrency: usize,
     incremental: bool,
     omit_unchanged_content: bool,
+    #[serde(default)]
+    llms_txt: bool,
 }
 
 impl CrawlCheckpointConfig {
@@ -191,6 +195,7 @@ impl CrawlCheckpointConfig {
             concurrency: cfg.concurrency,
             incremental: cfg.incremental,
             omit_unchanged_content: cfg.omit_unchanged_content,
+            llms_txt: cfg.llms_txt,
         }
     }
 
@@ -228,6 +233,7 @@ impl CrawlCheckpointConfig {
             timeout: ASYNC_CRAWL_TIMEOUT,
             incremental: self.incremental,
             omit_unchanged_content: self.omit_unchanged_content,
+            llms_txt: self.llms_txt,
             previous: HashMap::new(),
         }
     }
@@ -262,6 +268,7 @@ impl CrawlCheckpointConfig {
             concurrency: 2,
             incremental: false,
             omit_unchanged_content: false,
+            llms_txt: false,
         }
     }
 }
@@ -291,6 +298,8 @@ struct CrawlJobState {
     page_snapshots: HashMap<String, StoredPageSnapshot>,
     data: Vec<ScrapedPage>,
     errors: Vec<CrawlErrorEntry>,
+    include_llms_txt: bool,
+    seed_url: Option<Url>,
     cancel: Arc<AtomicBool>,
     events: broadcast::Sender<CrawlStreamEvent>,
 }
@@ -299,6 +308,22 @@ impl CrawlJobState {
     fn snapshot(&self) -> CrawlJobSnapshot {
         let elapsed_ms = self.finished_elapsed_ms.unwrap_or_else(|| {
             u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+        });
+        let llms_txt = self.include_llms_txt.then(|| {
+            let entries: Vec<(Url, Option<String>, Option<String>)> = self
+                .data
+                .iter()
+                .map(|p| {
+                    let title = (!p.title.trim().is_empty()).then(|| p.title.clone());
+                    let desc = p
+                        .metadata
+                        .description
+                        .clone()
+                        .or_else(|| p.markdown.as_deref().and_then(first_summary_line));
+                    (p.url.clone(), title, desc)
+                })
+                .collect();
+            render_llms_txt(self.seed_url.as_ref(), &entries)
         });
         CrawlJobSnapshot {
             id: self.id.clone(),
@@ -309,6 +334,7 @@ impl CrawlJobState {
             changes: self.changes,
             data: self.data.clone(),
             errors: self.errors.clone(),
+            llms_txt,
             elapsed_ms,
         }
     }
@@ -473,6 +499,8 @@ impl CrawlManager {
                 page_snapshots: cp.page_snapshots.clone(),
                 data: Vec::new(),
                 errors: Vec::new(),
+                include_llms_txt: cp.config.llms_txt,
+                seed_url: cp.config.seeds.first().cloned(),
                 cancel: Arc::new(AtomicBool::new(false)),
                 events: tx,
             }));
@@ -549,6 +577,18 @@ impl CrawlManager {
     fn get(&self, id: &str) -> Option<Arc<Mutex<CrawlJobState>>> {
         self.jobs.lock().ok()?.get(id).cloned()
     }
+
+    /// Returns `(running_jobs, stored_jobs, available_crawl_slots)` for observability.
+    pub fn summary(&self) -> (usize, usize, usize) {
+        let (running, stored) = self.jobs.lock().map_or((0, 0), |map| {
+            let run = map
+                .values()
+                .filter(|j| j.lock().is_ok_and(|g| g.status == CrawlStatus::Running))
+                .count();
+            (run, map.len())
+        });
+        (running, stored, self.slots.available_permits())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +610,8 @@ struct MapInput {
     #[serde(default)]
     exclude_paths: Vec<String>,
     limit: Option<usize>,
+    #[serde(default)]
+    llms_txt: bool,
 }
 
 fn default_true() -> bool {
@@ -606,9 +648,12 @@ impl MapInput {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct MapOutput {
     links: Vec<Url>,
     total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    llms_txt: Option<String>,
 }
 
 pub async fn map_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
@@ -717,9 +762,15 @@ pub async fn map_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Resp
     }
 
     let total = discovered.len();
+    let llms_txt = input.llms_txt.then(|| {
+        let entries: Vec<(Url, Option<String>, Option<String>)> =
+            discovered.iter().map(|u| (u.clone(), None, None)).collect();
+        render_llms_txt(seeds.first(), &entries)
+    });
     Json(MapOutput {
         links: discovered,
         total,
+        llms_txt,
     })
     .into_response()
 }
@@ -775,6 +826,8 @@ struct CrawlInput {
     chunk_tokens: Option<usize>,
     focus_query: Option<String>,
     max_pages: Option<usize>,
+    #[serde(default)]
+    llms_txt: bool,
 }
 
 impl CrawlInput {
@@ -875,6 +928,7 @@ struct CrawlConfig {
     timeout: Duration,
     incremental: bool,
     omit_unchanged_content: bool,
+    llms_txt: bool,
     previous: HashMap<String, StoredPageSnapshot>,
 }
 
@@ -988,6 +1042,7 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
         },
         incremental,
         omit_unchanged_content: input.omit_unchanged_content,
+        llms_txt: input.llms_txt,
         previous,
     };
 
@@ -1005,6 +1060,8 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
         page_snapshots: HashMap::new(),
         data: Vec::new(),
         errors: Vec::new(),
+        include_llms_txt: config.llms_txt,
+        seed_url: config.seeds.first().cloned(),
         cancel: Arc::new(AtomicBool::new(false)),
         events: tx,
     }));
@@ -1768,6 +1825,129 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     true
 }
 
+/// Extracts the first clean non-heading prose line from Markdown for `llms.txt` summaries.
+fn first_summary_line(markdown: &str) -> Option<String> {
+    for line in markdown.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("```")
+            || trimmed.starts_with('|')
+            || trimmed.starts_with("---")
+        {
+            continue;
+        }
+        let clean = trimmed
+            .trim_start_matches(['-', '*', '>', ' '])
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if clean.len() >= 12 {
+            return Some(crate::truncate(&clean, 180));
+        }
+    }
+    None
+}
+
+fn title_from_url(url: &Url) -> String {
+    let seg = url
+        .path_segments()
+        .and_then(|mut s| s.rfind(|p| !p.is_empty()))
+        .unwrap_or("");
+    if seg.is_empty() {
+        return url.host_str().unwrap_or("Home").to_owned();
+    }
+    let clean = seg
+        .trim_end_matches(".html")
+        .trim_end_matches(".htm")
+        .trim_end_matches(".md")
+        .replace(['-', '_'], " ");
+    let mut chars = clean.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => url.host_str().unwrap_or("Page").to_owned(),
+    }
+}
+
+fn section_for_url(url: &Url) -> String {
+    let first = url
+        .path_segments()
+        .and_then(|mut s| s.find(|p| !p.is_empty()))
+        .unwrap_or("");
+    if first.is_empty() {
+        return "Overview".to_owned();
+    }
+    let clean = first.replace(['-', '_'], " ");
+    let mut chars = clean.chars();
+    match chars.next() {
+        Some(c) => format!("{}{}", c.to_uppercase(), chars.as_str()),
+        None => "Overview".to_owned(),
+    }
+}
+
+/// Renders a standard `llms.txt` Markdown site index grouped by top-level URL path section.
+pub(crate) fn render_llms_txt(
+    seed: Option<&Url>,
+    entries: &[(Url, Option<String>, Option<String>)],
+) -> String {
+    use std::collections::BTreeMap;
+    use std::fmt::Write;
+
+    let site_name = seed
+        .and_then(Url::host_str)
+        .or_else(|| entries.first().and_then(|(u, _, _)| u.host_str()))
+        .unwrap_or("Site Index");
+
+    let mut seen = HashSet::new();
+    let mut grouped: BTreeMap<String, Vec<(String, String, Option<String>)>> = BTreeMap::new();
+    let mut total = 0usize;
+
+    for (url, title, desc) in entries {
+        if !seen.insert(selection::url_key(url)) {
+            continue;
+        }
+        let section = section_for_url(url);
+        let label = title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| t.replace(['\r', '\n', '[', ']'], " "))
+            .unwrap_or_else(|| title_from_url(url));
+        let summary = desc
+            .as_deref()
+            .map(|d| d.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|d| !d.is_empty())
+            .map(|d| crate::truncate(&d, 180));
+        grouped
+            .entry(section)
+            .or_default()
+            .push((label, url.as_str().to_owned(), summary));
+        total += 1;
+    }
+
+    let mut out = String::with_capacity(512 + total * 96);
+    let _ = writeln!(out, "# {site_name}\n");
+    let _ = writeln!(
+        out,
+        "> Site index generated by Quelle ({total} pages from {site_name}).\n"
+    );
+    for (section, items) in grouped {
+        let _ = writeln!(out, "## {section}\n");
+        for (label, url, summary) in items {
+            match summary {
+                Some(desc) => {
+                    let _ = writeln!(out, "- [{label}]({url}): {desc}");
+                }
+                None => {
+                    let _ = writeln!(out, "- [{label}]({url})");
+                }
+            }
+        }
+        out.push('\n');
+    }
+    out.trim_end().to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1917,5 +2097,47 @@ Pass previousHashes or sinceCrawlId.";
         m2.remove_checkpoint("crawl-abcdef-0007");
         assert!(m2.list_interrupted_checkpoints().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_llms_txt_groups_pages_by_section_and_deduplicates_tracking_urls() {
+        let seed = Url::parse("https://docs.example.org/").unwrap();
+        let entries = vec![
+            (
+                Url::parse("https://docs.example.org/").unwrap(),
+                Some("Example Docs".to_owned()),
+                Some("Main documentation portal.".to_owned()),
+            ),
+            (
+                Url::parse("https://docs.example.org/guides/getting-started").unwrap(),
+                None,
+                None,
+            ),
+            (
+                Url::parse("https://docs.example.org/guides/getting-started?utm_source=x").unwrap(),
+                Some("Duplicate".to_owned()),
+                None,
+            ),
+            (
+                Url::parse("https://docs.example.org/api/endpoints").unwrap(),
+                Some("REST API".to_owned()),
+                Some("HTTP endpoints and auth.\nSecond line.".to_owned()),
+            ),
+        ];
+
+        let rendered = render_llms_txt(Some(&seed), &entries);
+        assert!(rendered.starts_with("# docs.example.org\n"));
+        assert!(rendered.contains("(3 pages from docs.example.org)"));
+        assert!(rendered.contains("## Overview"));
+        assert!(rendered.contains("## Api"));
+        assert!(rendered.contains("## Guides"));
+        assert!(rendered.contains(
+            "- [REST API](https://docs.example.org/api/endpoints): HTTP endpoints and auth. Second line."
+        ));
+        assert!(
+            rendered
+                .contains("- [Getting started](https://docs.example.org/guides/getting-started)")
+        );
+        assert!(!rendered.contains("utm_source"));
     }
 }
