@@ -485,6 +485,95 @@ pub fn join_chunks_markdown(chunks: &[Chunk]) -> String {
         .join("\n\n")
 }
 
+/// Deduplicates identical/syndicated chunks across multiple documents and packs
+/// the highest-value chunks globally within `total_max_tokens`, restoring each
+/// document's original chunk order.
+pub fn budget_evidence_pack(
+    doc_chunks: Vec<Vec<Chunk>>,
+    focus_query: Option<&str>,
+    total_max_tokens: usize,
+) -> Vec<Vec<Chunk>> {
+    let doc_count = doc_chunks.len();
+    if doc_count == 0 {
+        return Vec::new();
+    }
+    let budget = total_max_tokens.max(32);
+
+    // Flatten with (doc_idx, chunk), deduplicating identical normalized bodies
+    // across documents while keeping the earliest (highest-ranked document) copy.
+    let mut seen_bodies: HashSet<String> = HashSet::new();
+    let mut flat: Vec<(usize, Chunk)> = Vec::new();
+    for (doc_idx, chunks) in doc_chunks.into_iter().enumerate() {
+        let scored = if focus_query.is_some() {
+            distill_chunks(chunks, focus_query, None)
+        } else {
+            chunks
+        };
+        for chunk in scored {
+            let norm: String = chunk
+                .markdown
+                .split_whitespace()
+                .map(str::to_ascii_lowercase)
+                .collect::<Vec<_>>()
+                .join(" ");
+            if !norm.is_empty() && seen_bodies.insert(norm) {
+                flat.push((doc_idx, chunk));
+            }
+        }
+    }
+
+    // Rank globally: query relevance score descending (with gentle document-rank
+    // prior so ties favor earlier sources), then pack within `budget`.
+    let mut order: Vec<usize> = (0..flat.len()).collect();
+    order.sort_by(|&a, &b| {
+        let (doc_a, ca) = &flat[a];
+        let (doc_b, cb) = &flat[b];
+        if focus_query.is_some() {
+            cb.score
+                .unwrap_or(0)
+                .cmp(&ca.score.unwrap_or(0))
+                .then_with(|| doc_a.cmp(doc_b))
+                .then_with(|| ca.index.cmp(&cb.index))
+        } else {
+            doc_a.cmp(doc_b).then_with(|| ca.index.cmp(&cb.index))
+        }
+    });
+
+    let mut selected = vec![false; flat.len()];
+    let mut used = 0usize;
+    for idx in order {
+        let tk = flat[idx].1.tokens;
+        if used + tk <= budget {
+            selected[idx] = true;
+            used += tk;
+        }
+    }
+    if !selected.iter().any(|&s| s)
+        && let Some(&first_idx) = (0..flat.len())
+            .max_by_key(|&i| {
+                (
+                    flat[i].1.score.unwrap_or(0),
+                    std::cmp::Reverse((flat[i].0, flat[i].1.index)),
+                )
+            })
+            .as_ref()
+    {
+        trim_chunk_to_budget(&mut flat[first_idx].1, budget);
+        selected[first_idx] = true;
+    }
+
+    let mut out: Vec<Vec<Chunk>> = vec![Vec::new(); doc_count];
+    for (idx, (doc_idx, chunk)) in flat.into_iter().enumerate() {
+        if selected[idx] {
+            out[doc_idx].push(chunk);
+        }
+    }
+    for chunks in &mut out {
+        chunks.sort_by_key(|c| c.index);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,5 +730,50 @@ Clients must honor the Retry-After delta-seconds value before retrying HTTP 429 
         let mut sorted = indices.clone();
         sorted.sort_unstable();
         assert_eq!(indices, sorted);
+    }
+
+    #[test]
+    fn budget_evidence_pack_deduplicates_across_docs_and_respects_global_token_cap() {
+        let u1 = Url::parse("https://doc1.example.org/a").unwrap();
+        let u2 = Url::parse("https://doc2.example.org/b").unwrap();
+        let dup_text =
+            "The 429 status code indicates the client sent too many requests in a given window.";
+        let unique1 = "Retry-After header specifies exact delta-seconds before retrying HTTP 429.";
+        let unique2 =
+            "Unrelated marketing footer boilerplate about quarterly webinars and newsletters.";
+
+        let c1 = chunk_markdown(
+            &format!("# Rate Limits\n\n{dup_text}\n\n## Retry-After\n\n{unique1}"),
+            &u1,
+            &[],
+            64,
+        );
+        let c2 = chunk_markdown(
+            &format!("# Rate Limits\n\n{dup_text}\n\n## Webinars\n\n{unique2}"),
+            &u2,
+            &[],
+            64,
+        );
+
+        let packed = budget_evidence_pack(vec![c1, c2], Some("HTTP 429 Retry-After"), 60);
+        assert_eq!(packed.len(), 2);
+        let all: Vec<&Chunk> = packed.iter().flat_map(|v| v.iter()).collect();
+        let total_tokens: usize = all.iter().map(|c| c.tokens).sum();
+        assert!(total_tokens <= 60, "global budget exceeded: {total_tokens}");
+        // Duplicate chunk must appear at most once across all documents.
+        let dup_count = all
+            .iter()
+            .filter(|c| c.markdown.contains("too many requests"))
+            .count();
+        assert_eq!(
+            dup_count, 1,
+            "expected cross-doc duplicate chunk to be deduplicated"
+        );
+        // High-relevance Retry-After chunk must survive while unrelated webinar chunk is dropped.
+        assert!(all.iter().any(|c| c.markdown.contains("delta-seconds")));
+        assert!(
+            !all.iter()
+                .any(|c| c.markdown.contains("quarterly webinars"))
+        );
     }
 }

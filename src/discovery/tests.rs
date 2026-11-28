@@ -347,3 +347,69 @@ fn site_filter_skips_specialized_engines_for_unrelated_site_queries() {
         &["wikipedia.org"]
     ));
 }
+
+#[tokio::test]
+async fn fuse_mode_waits_for_primary_engine_when_fast_secondary_finishes_first() {
+    let engines: Vec<Box<dyn SearchEngine>> = vec![
+        Box::new(RichFake {
+            id: "secondary",
+            weight: 0.9,
+            delay: Duration::from_millis(10),
+            hits: Ok(vec![(
+                "https://secondary.example.org/weak",
+                "Weak Hit",
+                "From secondary",
+            )]),
+        }),
+        Box::new(RichFake {
+            id: "primary",
+            weight: 1.5,
+            delay: Duration::from_millis(900),
+            hits: Ok(vec![(
+                "https://primary.example.org/official",
+                "Official Primary",
+                "From primary web engine",
+            )]),
+        }),
+    ];
+    let pool = EnginePool::with_mode(engines, DiscoveryMode::Fuse);
+    let hits = pool
+        .lookup(
+            &Query {
+                text: "primary wait test".into(),
+                language: Language::En,
+            },
+            SearchOptions {
+                count: 5,
+                spellcheck: false,
+            },
+            &AtomicUsize::new(6),
+        )
+        .await
+        .unwrap();
+    // Primary engine took 900ms (> 750ms secondary grace), so primary-aware grace
+    // must wait for it and rank its official result #1!
+    assert_eq!(hits.len(), 2);
+    assert_eq!(hits[0].url.as_str(), "https://primary.example.org/official");
+}
+
+#[test]
+fn parses_searxng_json_and_detects_tech_academic_and_repo_intents() {
+    let payload = br#"{"results":[{"url":"https://www.ecb.europa.eu/rates","title":"ECB Rates","content":"Key ECB interest rates"},{"url":"http://127.0.0.1/secret","title":"Local","content":"Blocked"}]}"#;
+    let hits = parse_searxng_json(payload, 5).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].url.as_str(), "https://www.ecb.europa.eu/rates");
+    assert_eq!(hits[0].description, "Key ECB interest rates");
+
+    assert!(!query_has_tech_intent("Schweiz MWST Steuersätze 2024 ESTV"));
+    assert!(query_has_tech_intent("SQLite WAL mode durability"));
+    assert!(query_has_tech_intent("Rust async tokio Mutex"));
+    assert!(query_has_academic_intent(
+        "transformer attention arxiv paper"
+    ));
+    assert!(!query_has_academic_intent("Swiss VAT rate 2024"));
+    assert!(query_has_repo_intent("lightpanda github repo rust crate"));
+    assert!(!query_has_repo_intent(
+        "European Central Bank deposit facility"
+    ));
+}

@@ -84,11 +84,13 @@ Supply a finished search query or a list of known URLs. Both forms return page t
 | `preferredDomains` | No | With `query`: up to eight domain names to prioritize, including their subdomains. An explicit preference also overrides engine order. |
 | `followUp` | No | With `query`: default true. At most one extra site-restricted search when a preferred domain has no retrieved evidence. No expansion without preferred domains, or for an existing `site:` query. |
 | `chunks` | No | Boolean, default `false`. Return heading-scoped, section-anchored (`#id`) chunks with breadcrumbs and token counts on each source without splitting code blocks or tables. |
-| `maxTokens` | No | Integer (32–200,000). Distills page Markdown and chunks to fit the token budget while preserving document order. |
+| `maxTokens` | No | Integer (32–200,000). Distills each page's Markdown and chunks to fit the per-page token budget while preserving document order. |
+| `totalMaxTokens` | No | Integer (32–200,000). Deduplicates syndicated chunks across all returned sources and packs a single global evidence bundle within the total token cap. |
 | `chunkTokens` | No | Integer (32–4,096, default 512). Target token size per chunk. |
-| `focusQuery` | No | String (up to 600 chars). Scores and selects the highest-relevance chunks for `maxTokens` distillation (defaults to `query` in search mode when `chunks` or `maxTokens` is set). |
+| `focusQuery` | No | String (up to 600 chars). Scores and selects the highest-relevance chunks for `maxTokens` / `totalMaxTokens` distillation (defaults to `query` in search mode when chunking or budgeting is set). |
 | `structured` | No | Boolean, default `false`. Return deterministic single-pass `outline` (with `#id` URLs), real data `tables` (excluding layout tables), and `jsonLd` payloads alongside content. |
 | `maxPages` | No | Integer (1–1,000, default `QUELLE_PDF_MAX_PAGES` = 150). Override the PDF page cap for this request. |
+| `stream` | No | Boolean, default `false`. Stream SSE events (`source`, `error`, `done`) as each page completes instead of buffering the full batch. |
 
 To fetch known pages directly, pass `urls`. This makes zero search or model calls.
 
@@ -126,7 +128,7 @@ curl -sS http://127.0.0.1:3000/api/scrape \
   --data '{"url":"https://example.org","formats":["markdown","links"],"onlyMainContent":true}'
 ```
 
-Optional fields: `formats` (`["markdown","text","html","links","chunks","structured"]`, default `["markdown"]`), `onlyMainContent` (default `true`), `includeTags` / `excludeTags` (CSS selectors), `render` (`"auto"`, `"always"`, `"never"`), `waitFor` (ms), `maxAge` (cache TTL in seconds, default `300`; set `0` to bypass cache), `maxTokens` (token-budgeted distillation), `chunkTokens` (default `512`), `focusQuery` (query-focused chunk scoring), `maxPages` (PDF page cap, 1–1,000), `limit`, `language`.
+Optional fields: `formats` (`["markdown","text","html","links","chunks","structured"]`, default `["markdown"]`), `onlyMainContent` (default `true`), `includeTags` / `excludeTags` (CSS selectors), `render` (`"auto"`, `"always"`, `"never"`), `waitFor` (ms), `waitForSelector` (CSS selector awaited in CDP), `scrollSteps` (0–10 smooth viewport scrolls for lazy-loaded pages), `maxAge` (cache TTL in seconds, default `300`; set `0` to bypass cache), `maxTokens` (token-budgeted distillation), `chunkTokens` (default `512`), `focusQuery` (query-focused chunk scoring), `maxPages` (PDF page cap, 1–1,000), `stream` (SSE streaming for batch `urls`/`query`), `limit`, `language`.
 
 ### Map mode · `POST /api/map`
 
@@ -150,7 +152,7 @@ curl -sS http://127.0.0.1:3000/api/crawl \
   --data '{"urls":["https://example.org/docs","https://example.org/blog"],"maxDepth":2,"limit":30,"formats":["markdown"]}'
 ```
 
-Optional fields: `maxDepth` (0–10, default 2), `limit` (1–1000, default 50), `includePaths` / `excludePaths` (prefix or `*` globs), `allowSubdomains`, `allowExternalLinks`, `useSitemap` (default `true`), `respectRobots` (default `true`), `formats`, `onlyMainContent`, `includeTags`, `excludeTags`, `render`, `waitFor`, `maxAge`, `maxTokens`, `chunkTokens`, `focusQuery`, `maxPages`, `concurrency` (1–16, default 4; per-host politeness is always enforced), `sync` (default `false`), `incremental` (emit deterministic `sha256:` `contentHash`, `changeStatus`, and crawl `changes` summary; defaults `maxAge` to `0` for conditional HTTP revalidation), `sinceCrawlId` (compare against a prior stored crawl job and attach heading-level `diff`s for updated pages), `previousHashes` (stateless `{url: contentHash}` map), `omitUnchangedContent` (omit page bodies when `changeStatus == "unchanged"`).
+Optional fields: `maxDepth` (0–10, default 2), `limit` (1–1000, default 50), `includePaths` / `excludePaths` (prefix or `*` globs), `allowSubdomains`, `allowExternalLinks`, `useSitemap` (default `true`), `respectRobots` (default `true`), `formats`, `onlyMainContent`, `includeTags`, `excludeTags`, `render`, `waitFor`, `waitForSelector`, `scrollSteps` (0–10), `maxAge`, `maxTokens`, `chunkTokens`, `focusQuery`, `maxPages`, `concurrency` (1–16, default 4; per-host politeness is always enforced), `sync` (default `false`), `incremental` (emit deterministic `sha256:` `contentHash`, `changeStatus`, and crawl `changes` summary; defaults `maxAge` to `0` for conditional HTTP revalidation), `sinceCrawlId` (compare against a prior crawl job — persisted across restarts when `QUELLE_STATE_DIR` is set — and attach heading-level `diff`s for updated pages), `previousHashes` (stateless `{url: contentHash}` map), `omitUnchangedContent` (omit page bodies when `changeStatus == "unchanged"`).
 
 ### Extract mode · `POST /api/extract`
 
@@ -200,10 +202,11 @@ Set `QUELLE_SEARCH_ENGINES` to a comma-separated list of engines. With the varia
 | `wikipedia` | Wikipedia articles in the query language (`de`, `fr`, `it`, or `en`) | None |
 | `stackexchange` | Stack Overflow Q&A (official Stack Exchange v2.3 API; alias `stackoverflow`) | None |
 | `hackernews` | Primary tech articles & discussions via Hacker News Algolia API (alias `hn`) | None |
-| `arxiv` | Academic preprints via arXiv Atom API | None |
-| `github` | Open-source repositories via GitHub Search API | None |
+| `arxiv` | Academic preprints via arXiv Atom API (auto-boosted on academic/paper queries) | None |
+| `github` | Open-source repositories via GitHub Search API (auto-boosted on repo/library queries) | None |
+| `searxng` | Self-hosted SearXNG JSON API (`QUELLE_SEARXNG_URL`, optional `QUELLE_SEARXNG_ENGINES` / `QUELLE_SEARXNG_CATEGORIES`) | None |
 
-By default (`QUELLE_SEARCH_MODE=fuse`), when multiple engines are configured, Quelle queries eligible engines **in parallel**, enforces a 750 ms tail-cut grace window once fast engines respond so slow stragglers never stall latency, deduplicates canonical URLs, and merges results using **weighted Reciprocal Rank Fusion (RRF)** with a cross-engine consensus bonus. Specialized engines (`wikipedia`, `stackexchange`, `hackernews`, `arxiv`, `github`) are skipped automatically when a query targets an unrelated `site:` domain. Set `QUELLE_SEARCH_MODE=rotate` to restore single-engine round-robin fallback. Nonempty results are cached for 15 minutes; rate-limited engines enter cooldown automatically. Page fetch failures are reported separately.
+By default (`QUELLE_SEARCH_MODE=fuse`), when multiple engines are configured, Quelle queries eligible engines **in parallel**, uses a **primary-aware tail-cut grace window** (600 ms after a primary web engine answers; up to 1,400 ms if only secondary engines have answered while a primary engine is still in flight), deduplicates canonical URLs, and merges results using **weighted Reciprocal Rank Fusion (RRF)** with a cross-engine consensus bonus. Specialized engines (`wikipedia`, `stackexchange`, `hackernews`, `arxiv`, `github`) are skipped automatically on unrelated `site:` domains, and English-centric `stackexchange`/`hackernews` are skipped on non-English non-technical queries. Set `QUELLE_SEARCH_MODE=rotate` to restore single-engine round-robin fallback. Nonempty results are cached for 15 minutes; rate-limited engines enter cooldown automatically. Page fetches use unordered fast-fill completion with a 1.5 s rank-preservation grace window and per-host circuit breakers so stalled origins cannot block healthy results.
 
 Discovery allows up to six upstream attempts per API request, shared across the planned queries in answer mode. Rate-limited engines enter a cooldown. Mwmbl requests are also spaced to match its anonymous or keyed rate. Invalid engine names, duplicate entries, and missing keys for enabled engines stop startup.
 
@@ -237,6 +240,8 @@ Set all three connection variables together to enable answer generation. Omit al
 | `QUELLE_RENDER_CONCURRENCY` | `4` | Maximum simultaneous browser renders (Lightpanda or sidecar, 1–16). |
 | `QUELLE_CDP_POOL` | `true` | Keep a supervised persistent Lightpanda CDP server over a private Unix socket with asset blocking (`false` falls back to one-shot `lightpanda fetch`). |
 | `QUELLE_PDF_MAX_PAGES` | `150` | Default maximum pages extracted per PDF document (1–1,000; overridable per request via `maxPages`). |
+| `QUELLE_STATE_DIR` | None | Optional directory to persist incremental crawl snapshots (`sinceCrawlId`) across restarts. |
+| `QUELLE_SEARXNG_URL` | None | Self-hosted SearXNG base URL when `searxng` is enabled in `QUELLE_SEARCH_ENGINES`. |
 
 ### Optional sidecars (`QUELLE_BROWSER_URL` & `QUELLE_OCR_URL`)
 

@@ -93,7 +93,7 @@ pub struct CrawlJobSnapshot {
     pub elapsed_ms: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct StoredPageSnapshot {
     hash: String,
     markdown: Option<String>,
@@ -136,14 +136,95 @@ impl CrawlJobState {
 pub struct CrawlManager {
     jobs: Mutex<HashMap<String, Arc<Mutex<CrawlJobState>>>>,
     slots: Arc<Semaphore>,
+    state_dir: Option<std::path::PathBuf>,
+}
+
+fn valid_crawl_id(id: &str) -> bool {
+    let Some(rest) = id.strip_prefix("crawl-") else {
+        return false;
+    };
+    let Some((ts, seq)) = rest.split_once('-') else {
+        return false;
+    };
+    !ts.is_empty()
+        && !seq.is_empty()
+        && ts.len() <= 24
+        && seq.len() <= 16
+        && ts.bytes().all(|b| b.is_ascii_hexdigit())
+        && seq.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 impl CrawlManager {
-    pub fn new() -> Self {
+    pub fn with_state_dir(state_dir: Option<std::path::PathBuf>) -> Self {
+        if let Some(ref dir) = state_dir {
+            let _ = std::fs::create_dir_all(dir);
+        }
         Self {
             jobs: Mutex::new(HashMap::new()),
             slots: Arc::new(Semaphore::new(MAX_CONCURRENT_CRAWLS)),
+            state_dir,
         }
+    }
+
+    fn persist_snapshots(&self, id: &str, snapshots: &HashMap<String, StoredPageSnapshot>) {
+        let Some(ref dir) = self.state_dir else {
+            return;
+        };
+        if !valid_crawl_id(id) || snapshots.is_empty() {
+            return;
+        }
+        let Ok(bytes) = serde_json::to_vec(snapshots) else {
+            return;
+        };
+        let target = dir.join(format!("{id}.json"));
+        let tmp = dir.join(format!("{id}.json.tmp"));
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &target);
+        }
+        // Keep at most MAX_STORED_JOBS persisted files on disk.
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut files: Vec<_> = entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("crawl-") && n.ends_with(".json"))
+                })
+                .filter_map(|e| {
+                    let mtime = e.metadata().ok()?.modified().ok()?;
+                    Some((e.path(), mtime))
+                })
+                .collect();
+            if files.len() > MAX_STORED_JOBS {
+                files.sort_by_key(|(_, m)| *m);
+                for (path, _) in files.into_iter().take(MAX_STORED_JOBS / 4) {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+        }
+    }
+
+    fn load_persisted_snapshots(&self, id: &str) -> Option<HashMap<String, StoredPageSnapshot>> {
+        let dir = self.state_dir.as_ref()?;
+        if !valid_crawl_id(id) {
+            return None;
+        }
+        let path = dir.join(format!("{id}.json"));
+        let bytes = std::fs::read(path).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    #[cfg(test)]
+    fn save_test_snapshot(&self, id: &str, url_key: &str, hash: &str, md: &str) {
+        let mut map = HashMap::new();
+        map.insert(
+            url_key.to_owned(),
+            StoredPageSnapshot {
+                hash: hash.to_owned(),
+                markdown: Some(md.to_owned()),
+            },
+        );
+        self.persist_snapshots(id, &map);
     }
 
     fn next_id() -> String {
@@ -387,6 +468,8 @@ struct CrawlInput {
     #[serde(default)]
     render: RenderMode,
     wait_for: Option<u64>,
+    wait_for_selector: Option<String>,
+    scroll_steps: Option<u8>,
     max_age: Option<u64>,
     concurrency: Option<usize>,
     #[serde(default)]
@@ -468,6 +551,16 @@ impl CrawlInput {
         {
             return false;
         }
+        if let Some(sel) = &self.wait_for_selector
+            && !pages::valid_wait_selector(sel)
+        {
+            return false;
+        }
+        if let Some(steps) = self.scroll_steps
+            && steps > 10
+        {
+            return false;
+        }
         true
     }
 }
@@ -517,11 +610,14 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
 
     let mut previous: HashMap<String, StoredPageSnapshot> = HashMap::new();
     if let Some(ref prev_id) = input.since_crawl_id {
-        let Some(prev_job) = app.crawls.get(prev_id) else {
+        if let Some(prev_job) = app.crawls.get(prev_id) {
+            if let Ok(guard) = prev_job.lock() {
+                previous.extend(guard.page_snapshots.clone());
+            }
+        } else if let Some(persisted) = app.crawls.load_persisted_snapshots(prev_id) {
+            previous.extend(persisted);
+        } else {
             return problem(StatusCode::NOT_FOUND, "crawl_not_found");
-        };
-        if let Ok(guard) = prev_job.lock() {
-            previous.extend(guard.page_snapshots.clone());
         }
     }
     if let Some(ref hashes) = input.previous_hashes {
@@ -570,6 +666,13 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
             },
             render: input.render,
             wait_for_ms: input.wait_for,
+            wait_for_selector: input
+                .wait_for_selector
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            scroll_steps: input.scroll_steps.unwrap_or(0),
             cache_max_age,
             max_tokens: input.max_tokens,
             chunk_tokens: input.chunk_tokens,
@@ -932,7 +1035,7 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
         }
     }
 
-    if let Ok(mut g) = job.lock() {
+    let persist_data = if let Ok(mut g) = job.lock() {
         if g.status == CrawlStatus::Running {
             g.status = if cancel.load(Ordering::Relaxed) {
                 CrawlStatus::Cancelled
@@ -944,6 +1047,12 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
         }
         g.finished_elapsed_ms =
             Some(u64::try_from(g.started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        (!g.page_snapshots.is_empty()).then(|| (g.id.clone(), g.page_snapshots.clone()))
+    } else {
+        None
+    };
+    if let Some((job_id, snapshots)) = persist_data {
+        app.crawls.persist_snapshots(&job_id, &snapshots);
     }
 }
 
@@ -1300,5 +1409,32 @@ Pass previousHashes or sinceCrawlId.";
         assert_eq!(diff.added_sections, vec!["Incremental Crawls"]);
         assert_eq!(diff.removed_sections, vec!["Deprecated Endpoints"]);
         assert_eq!(diff.changed_sections, vec!["Authentication"]);
+    }
+
+    #[test]
+    fn persistent_crawl_state_survives_manager_restart_and_rejects_traversal_ids() {
+        let dir =
+            std::env::temp_dir().join(format!("quelle-crawl-state-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m1 = CrawlManager::with_state_dir(Some(dir.clone()));
+        m1.save_test_snapshot(
+            "crawl-1a2b3c-0001",
+            "https://example.org/docs",
+            "sha256:abc",
+            "# Docs\n\nBody v1",
+        );
+
+        let m2 = CrawlManager::with_state_dir(Some(dir.clone()));
+        let loaded = m2
+            .load_persisted_snapshots("crawl-1a2b3c-0001")
+            .expect("reloaded persisted snapshots after restart");
+        assert_eq!(loaded["https://example.org/docs"].hash, "sha256:abc");
+        assert_eq!(
+            loaded["https://example.org/docs"].markdown.as_deref(),
+            Some("# Docs\n\nBody v1")
+        );
+        // Path traversal IDs must never load anything.
+        assert!(m2.load_persisted_snapshots("../etc/passwd").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

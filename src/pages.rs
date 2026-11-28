@@ -30,7 +30,7 @@ pub mod structured;
 #[cfg(test)]
 mod tests;
 
-pub use cdp::{set_cdp_pool_enabled, shutdown_pool};
+pub use cdp::{set_cdp_pool_enabled, shutdown_pool, valid_wait_selector};
 pub use markdown::{ExtractOptions, PageMeta};
 
 /// HTML beyond this is cut off and the prefix is parsed; long pages keep
@@ -807,6 +807,10 @@ async fn download(
 
     for _ in 0..=(2 * MAX_REDIRECTS + MAX_RETRIES + 2) {
         let host_key = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        if politeness::global().is_circuit_open(&host_key) {
+            tracing::info!(stage = "host_circuit_open", host = %host_key);
+            return Err(PageError::Transport);
+        }
         if active_host
             .as_ref()
             .is_none_or(|(held, _)| *held != host_key)
@@ -854,12 +858,23 @@ async fn download(
                 request = request.header(header::IF_MODIFIED_SINCE, modified.clone());
             }
         }
+        let step_started = Instant::now();
         let response = request.send();
-        let step_deadline = deadline.min(Instant::now() + PAGE_TIMEOUT);
+        let step_budget = politeness::global().host_step_budget(&host_key, PAGE_TIMEOUT);
+        let step_deadline = deadline.min(Instant::now() + step_budget);
         let response = match tokio::time::timeout_at(step_deadline, response).await {
-            Ok(Ok(resp)) => resp,
-            Ok(Err(_)) => return Err(PageError::Transport),
-            Err(_) => return Err(PageError::Timeout),
+            Ok(Ok(resp)) => {
+                politeness::global().record_host_success(&host_key, step_started.elapsed());
+                resp
+            }
+            Ok(Err(_)) => {
+                politeness::global().record_host_failure(&host_key);
+                return Err(PageError::Transport);
+            }
+            Err(_) => {
+                politeness::global().record_host_failure(&host_key);
+                return Err(PageError::Timeout);
+            }
         };
         if response.status() == StatusCode::NOT_MODIFIED
             && let Some(entry) =
@@ -1211,6 +1226,8 @@ pub struct ScrapeOptions {
     pub extract: ExtractOptions,
     pub render: RenderMode,
     pub wait_for_ms: Option<u64>,
+    pub wait_for_selector: Option<String>,
+    pub scroll_steps: u8,
     pub cache_max_age: Duration,
     pub max_tokens: Option<usize>,
     pub chunk_tokens: Option<usize>,
@@ -1225,6 +1242,8 @@ impl Default for ScrapeOptions {
             extract: ExtractOptions::default(),
             render: RenderMode::Auto,
             wait_for_ms: None,
+            wait_for_selector: None,
+            scroll_steps: 0,
             cache_max_age: Duration::from_secs(5 * 60),
             max_tokens: None,
             chunk_tokens: None,
@@ -1317,6 +1336,8 @@ pub async fn fetch_rich(
         extract: ExtractOptions::default(),
         render: RenderMode::Auto,
         wait_for_ms: None,
+        wait_for_selector: None,
+        scroll_steps: 0,
         cache_max_age: Duration::from_secs(5 * 60),
         max_tokens: extras.max_tokens,
         chunk_tokens: extras.chunk_tokens,
@@ -1392,7 +1413,7 @@ async fn fetch_uncached(
 
         let rendered = |url: Url, threshold| async move {
             let (html, cut, tier, validated) =
-                render_with_fallback(&url, threshold, None, deadline).await?;
+                render_with_fallback(&url, threshold, None, None, 0, deadline).await?;
             let mut source = match (validated, relevance) {
                 (Some(source), None) => source,
                 _ => {
@@ -1581,8 +1602,15 @@ pub async fn scrape(
             let req = requested.clone();
             let opts = options.clone();
             async move {
-                let (html_bytes, cut, tier, _) =
-                    render_with_fallback(&u, threshold, opts.wait_for_ms, deadline).await?;
+                let (html_bytes, cut, tier, _) = render_with_fallback(
+                    &u,
+                    threshold,
+                    opts.wait_for_ms,
+                    opts.wait_for_selector.as_deref(),
+                    opts.scroll_steps,
+                    deadline,
+                )
+                .await?;
                 let retrieval = match tier {
                     politeness::FetchTier::Sidecar => Some("sidecar"),
                     _ => Some("rendered"),
@@ -1608,10 +1636,18 @@ pub async fn scrape(
             }
         };
 
-        if options.render == RenderMode::Always {
-            let clean_target = public_url(requested.clone())?;
-            let (page, _) = render_to_page(clean_target, 300).await?;
-            return Ok(page);
+        if options.render == RenderMode::Always
+            || options.wait_for_selector.is_some()
+            || options.scroll_steps > 0
+        {
+            if options.render != RenderMode::Never && any_renderer_enabled() {
+                let clean_target = public_url(requested.clone())?;
+                let (page, _) = render_to_page(clean_target, 300).await?;
+                return Ok(page);
+            }
+            if options.render == RenderMode::Always {
+                return Err(PageError::NeedsJs);
+            }
         }
 
         let downloaded = match download(target.clone(), deadline, options.cache_max_age).await {
@@ -2031,6 +2067,8 @@ async fn render_with_fallback(
     url: &Url,
     threshold: usize,
     wait_for_ms: Option<u64>,
+    wait_for_selector: Option<&str>,
+    scroll_steps: u8,
     deadline: Instant,
 ) -> Result<(Vec<u8>, bool, politeness::FetchTier, Option<Source>), PageError> {
     let host_key = url.host_str().unwrap_or_default();
@@ -2046,9 +2084,19 @@ async fn render_with_fallback(
             Duration::ZERO
         };
         let stop = deadline - reserve;
-        match tokio::time::timeout_at(stop, render(url, threshold, wait_for_ms, stop))
-            .await
-            .unwrap_or(Err(PageError::Timeout))
+        match tokio::time::timeout_at(
+            stop,
+            render(
+                url,
+                threshold,
+                wait_for_ms,
+                wait_for_selector,
+                scroll_steps,
+                stop,
+            ),
+        )
+        .await
+        .unwrap_or(Err(PageError::Timeout))
         {
             Ok((html, cut)) => {
                 match parse(
@@ -2178,6 +2226,8 @@ async fn render(
     url: &Url,
     threshold: usize,
     wait_for_ms: Option<u64>,
+    wait_for_selector: Option<&str>,
+    scroll_steps: u8,
     deadline: Instant,
 ) -> Result<(Vec<u8>, bool), PageError> {
     let url = public_url(url.clone())?;
@@ -2196,7 +2246,17 @@ async fn render(
     // asset blocking, and post-navigation adaptive wait). Fall back cleanly to
     // one-shot `lightpanda fetch` if the pool is disabled or unavailable.
     if cdp::cdp_pool_enabled() {
-        match cdp::render_pooled(binary, url, threshold, wait_for_ms, step_deadline).await {
+        match cdp::render_pooled(
+            binary,
+            url,
+            threshold,
+            wait_for_ms,
+            wait_for_selector,
+            scroll_steps,
+            step_deadline,
+        )
+        .await
+        {
             Ok((html, cut)) => {
                 tracing::info!(
                     stage = "render_cdp",
@@ -2206,6 +2266,17 @@ async fn render(
                 );
                 return Ok((html, cut));
             }
+            Err(PageError::Blocked) => {
+                tracing::info!(
+                    stage = "render_cdp",
+                    host = url.host_str(),
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ok = false,
+                    blocked = true
+                );
+                politeness::global().record_host_failure(url.host_str().unwrap_or_default());
+                return Err(PageError::Blocked);
+            }
             Err(PageError::Timeout) => {
                 tracing::info!(
                     stage = "render_cdp",
@@ -2214,6 +2285,7 @@ async fn render(
                     ok = false,
                     timeout = true
                 );
+                politeness::global().record_host_failure(url.host_str().unwrap_or_default());
                 return Err(PageError::Timeout);
             }
             Err(_) => {

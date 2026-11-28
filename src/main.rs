@@ -526,6 +526,17 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
         };
         pages::set_cdp_pool_enabled(enabled);
     }
+    let state_dir = match env::var("QUELLE_STATE_DIR") {
+        Ok(value) if !value.trim().is_empty() => {
+            let path = std::path::PathBuf::from(value.trim());
+            if std::fs::create_dir_all(&path).is_err() {
+                return Err("QUELLE_STATE_DIR");
+            }
+            Some(path)
+        }
+        Ok(_) | Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err("QUELLE_STATE_DIR"),
+    };
     let concurrent = positive_env("QUELLE_CONCURRENCY", 8, 1, 64)?;
     let app = App {
         authorization,
@@ -536,7 +547,7 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
             engines,
             page_slots: Arc::new(Semaphore::new(concurrent * 4)),
         },
-        crawls: crawl::CrawlManager::new(),
+        crawls: crawl::CrawlManager::with_state_dir(state_dir),
     };
     Ok((listen, Arc::new(app)))
 }

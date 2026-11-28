@@ -89,6 +89,42 @@ pub(crate) fn cdp_pool_enabled() -> bool {
     cfg!(unix) && CDP_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Validates a caller-supplied CSS selector for `waitForSelector`.
+pub fn valid_wait_selector(selector: &str) -> bool {
+    let trimmed = selector.trim();
+    !trimmed.is_empty()
+        && trimmed.len() <= 256
+        && !trimmed.chars().any(char::is_control)
+        && scraper::Selector::parse(trimmed).is_ok()
+}
+
+/// Builds the CDP readiness polling expression with optional safe JSON-encoded
+/// CSS selector waiting.
+pub(crate) fn build_poll_expression(threshold: usize, wait_for_selector: Option<&str>) -> String {
+    let selector_check = match wait_for_selector.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(sel) => {
+            let encoded = serde_json::to_string(sel).unwrap_or_else(|_| "\"\"".to_owned());
+            format!(
+                "const selEl = document.querySelector({encoded}); \
+                 if (!selEl) {{ const a = globalThis.__quelleActivity; return (a && typeof a.busy === 'function' && a.busy()) ? 1 : 0; }} "
+            )
+        }
+        None => String::new(),
+    };
+    format!(
+        "(() => {{ \
+            const t = (document.title || '').trim().toLowerCase(); \
+            if (t === 'just a moment...' || t === 'attention required! | cloudflare' || t === 'access denied' || t === 'robot check' || document.querySelector('#challenge-form, #cf-challenge-running')) return 3; \
+            {selector_check}\
+            const ready = ({readiness})({threshold}); \
+            if (ready) return 2; \
+            const a = globalThis.__quelleActivity; \
+            return (a && typeof a.busy === 'function' && a.busy()) ? 1 : 0; \
+         }})()",
+        readiness = include_str!("readiness.js")
+    )
+}
+
 /// Decides whether a URL matches Lightpanda's case-insensitive `*` wildcard pattern.
 #[cfg(test)]
 pub(crate) fn wildcard_url_match(pattern: &str, url: &str) -> bool {
@@ -602,6 +638,8 @@ mod unix_pool {
         url: &Url,
         threshold: usize,
         wait_for_ms: Option<u64>,
+        wait_for_selector: Option<&str>,
+        scroll_steps: u8,
         deadline: Instant,
     ) -> Result<(Vec<u8>, bool), PageError> {
         let mut ws = tokio::time::timeout_at(deadline, connect_client(binary))
@@ -658,7 +696,17 @@ mod unix_pool {
             Err(_) => return Err(PageError::Timeout),
         };
 
-        let result = run_session(&mut ws, &target_id, url, threshold, wait_for_ms, deadline).await;
+        let result = run_session(
+            &mut ws,
+            &target_id,
+            url,
+            threshold,
+            wait_for_ms,
+            wait_for_selector,
+            scroll_steps,
+            deadline,
+        )
+        .await;
 
         let _ = tokio::time::timeout(CLEANUP_TIMEOUT, async {
             let _ = ws
@@ -681,12 +729,15 @@ mod unix_pool {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_session(
         ws: &mut WsClient,
         target_id: &str,
         url: &Url,
         threshold: usize,
         wait_for_ms: Option<u64>,
+        wait_for_selector: Option<&str>,
+        scroll_steps: u8,
         deadline: Instant,
     ) -> Result<(Vec<u8>, bool), PageError> {
         let session_id = tokio::time::timeout_at(
@@ -748,15 +799,7 @@ mod unix_pool {
         let max_wait_ms = wait_for_ms.map_or(13_000, |ms| ms.saturating_add(6_000).min(16_000));
         let policy = AdaptiveWait::new(base_wait_ms, max_wait_ms);
 
-        let poll_expr = format!(
-            "(() => {{ \
-                const ready = ({readiness})({threshold}); \
-                if (ready) return 2; \
-                const a = globalThis.__quelleActivity; \
-                return (a && typeof a.busy === 'function' && a.busy()) ? 1 : 0; \
-             }})()",
-            readiness = include_str!("readiness.js")
-        );
+        let poll_expr = build_poll_expression(threshold, wait_for_selector);
 
         let poll_stop = deadline
             .checked_sub(Duration::from_millis(500))
@@ -781,6 +824,9 @@ mod unix_pool {
                     .unwrap_or(0),
                 _ => 0,
             };
+            if state == 3 {
+                return Err(PageError::Blocked);
+            }
             let decision = policy.decide(nav_done.elapsed(), state == 2, state == 1);
             match decision {
                 WaitDecision::Ready | WaitDecision::Stop => break,
@@ -788,6 +834,31 @@ mod unix_pool {
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
             }
+        }
+
+        // Optional read-only viewport scrolling to hydrate lazy-loaded sections.
+        let steps = scroll_steps.min(10);
+        for step in 1..=steps {
+            if Instant::now() >= poll_stop {
+                break;
+            }
+            let scroll_expr = format!(
+                "(() => {{ \
+                    const h = Math.max(document.body ? document.body.scrollHeight : 0, 1200); \
+                    window.scrollTo(0, Math.round((h * {step}) / {steps})); \
+                    return true; \
+                 }})()"
+            );
+            let _ = tokio::time::timeout_at(
+                poll_stop.min(Instant::now() + Duration::from_secs(1)),
+                ws.call(
+                    "Runtime.evaluate",
+                    Some(json!({ "expression": scroll_expr, "returnByValue": true })),
+                    Some(&session_id),
+                ),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(220)).await;
         }
 
         let dump = tokio::time::timeout_at(
@@ -825,15 +896,34 @@ pub(crate) async fn render_pooled(
     url: &Url,
     threshold: usize,
     wait_for_ms: Option<u64>,
+    wait_for_selector: Option<&str>,
+    scroll_steps: u8,
     deadline: Instant,
 ) -> Result<(Vec<u8>, bool), PageError> {
     #[cfg(unix)]
     {
-        unix_pool::render(binary, url, threshold, wait_for_ms, deadline).await
+        unix_pool::render(
+            binary,
+            url,
+            threshold,
+            wait_for_ms,
+            wait_for_selector,
+            scroll_steps,
+            deadline,
+        )
+        .await
     }
     #[cfg(not(unix))]
     {
-        let _ = (binary, url, threshold, wait_for_ms, deadline);
+        let _ = (
+            binary,
+            url,
+            threshold,
+            wait_for_ms,
+            wait_for_selector,
+            scroll_steps,
+            deadline,
+        );
         Err(PageError::NeedsJs)
     }
 }
@@ -962,5 +1052,22 @@ mod tests {
         assert_eq!(mode1, 0o700, "socket directory must be mode 0700");
         let _ = std::fs::remove_dir_all(&dir1);
         let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn wait_selector_validates_css_and_escapes_safely_in_poll_expression() {
+        assert!(valid_wait_selector("main .quote"));
+        assert!(valid_wait_selector("table[data-loaded='true']"));
+        assert!(!valid_wait_selector(""));
+        assert!(!valid_wait_selector("div >>> invalid((("));
+        assert!(!valid_wait_selector("main\nalert(1)"));
+
+        let expr = build_poll_expression(300, Some("div[data-id=\"a'b\"]"));
+        assert!(expr.contains("document.querySelector("));
+        assert!(expr.contains(r#"\"a'b\""#));
+        // Must detect bot/Cloudflare challenge pages early (return state 3) instead of
+        // burning the 13s adaptive wait budget on an infinite challenge timer loop.
+        assert!(expr.contains("just a moment..."));
+        assert!(expr.contains("#cf-challenge-running"));
     }
 }

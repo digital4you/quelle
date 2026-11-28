@@ -16,7 +16,10 @@ use super::{
     Candidate, DiscoveryError, DiscoveryFuture, DiscoveryMode, EnginePool, Language, Query,
     SearchEngine, SearchOptions,
 };
-use crate::{endpoint, env_text, pages::public_url, read_body, read_json, secret_header, truncate};
+use crate::{
+    endpoint, env_text, pages::public_url, read_body, read_json, secret_header, sidecar_endpoint,
+    truncate,
+};
 
 const BODY_LIMIT: usize = 2 * 1024 * 1024;
 const HONEST_USER_AGENT: &str = "Quelle/0.1 (+https://github.com/digital4you/quelle)";
@@ -52,6 +55,11 @@ enum Provider {
     HackerNews,
     Arxiv,
     GitHub,
+    Searxng {
+        endpoint: Url,
+        engines: Option<String>,
+        categories: String,
+    },
 }
 
 struct NativeEngine {
@@ -132,6 +140,28 @@ pub fn configure_engines(client: &Client, service_token: &str) -> Result<EngineP
             "hackernews" | "hn" => Provider::HackerNews,
             "arxiv" => Provider::Arxiv,
             "github" => Provider::GitHub,
+            "searxng" => {
+                let raw = env_text("QUELLE_SEARXNG_URL")?;
+                let mut ep = sidecar_endpoint(&raw, "QUELLE_SEARXNG_URL")?;
+                let path = ep.path().trim_end_matches('/');
+                if !path.ends_with("/search") {
+                    ep.set_path(&format!("{path}/search"));
+                }
+                let engines = env::var("QUELLE_SEARXNG_ENGINES")
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty());
+                let categories = env::var("QUELLE_SEARXNG_CATEGORIES")
+                    .ok()
+                    .map(|s| s.trim().to_owned())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "general".to_owned());
+                Provider::Searxng {
+                    endpoint: ep,
+                    engines,
+                    categories,
+                }
+            }
             _ => return Err("QUELLE_SEARCH_ENGINES"),
         };
         engines.push(Box::new(NativeEngine {
@@ -157,6 +187,7 @@ impl SearchEngine for NativeEngine {
         match &self.provider {
             Provider::Brave { .. } => 1.6,
             Provider::Html(HtmlEngine::DuckDuckGo) => 1.5,
+            Provider::Searxng { .. } => 1.5,
             Provider::Mojeek { .. } => 1.2,
             Provider::Html(HtmlEngine::Bing) => 1.0,
             Provider::Mwmbl { .. } => 0.9,
@@ -168,13 +199,26 @@ impl SearchEngine for NativeEngine {
         }
     }
 
+    fn query_weight(&self, query: &Query) -> f64 {
+        match &self.provider {
+            Provider::Arxiv if query_has_academic_intent(&query.text) => 1.15,
+            Provider::GitHub if query_has_repo_intent(&query.text) => 1.15,
+            Provider::StackExchange if query_has_tech_intent(&query.text) => 0.95,
+            _ => self.weight(),
+        }
+    }
+
     fn supports_query(&self, query: &Query) -> bool {
         match &self.provider {
             Provider::Wikipedia => site_filter_allows(&query.text, &["wikipedia.org"]),
             Provider::StackExchange => {
                 site_filter_allows(&query.text, &["stackoverflow.com", "stackexchange.com"])
+                    && (query.language == Language::En || query_has_tech_intent(&query.text))
             }
-            Provider::HackerNews => site_filter_allows(&query.text, &["news.ycombinator.com"]),
+            Provider::HackerNews => {
+                site_filter_allows(&query.text, &["news.ycombinator.com"])
+                    && (query.language == Language::En || query_has_tech_intent(&query.text))
+            }
             Provider::Arxiv => site_filter_allows(&query.text, &["arxiv.org"]),
             Provider::GitHub => site_filter_allows(&query.text, &["github.com"]),
             _ => true,
@@ -193,6 +237,7 @@ impl SearchEngine for NativeEngine {
             Provider::HackerNews => "hackernews",
             Provider::Arxiv => "arxiv",
             Provider::GitHub => "github",
+            Provider::Searxng { .. } => "searxng",
         }
     }
 
@@ -403,6 +448,27 @@ impl NativeEngine {
                     .header(header::ACCEPT, "application/vnd.github+json")
                     .query(&[("q", q), ("per_page", per_page.as_str())])
             }
+            Provider::Searxng {
+                endpoint,
+                engines,
+                categories,
+            } => {
+                let mut req = self
+                    .client
+                    .get(endpoint.clone())
+                    .header(header::USER_AGENT, HONEST_USER_AGENT)
+                    .header(header::ACCEPT, "application/json")
+                    .query(&[
+                        ("q", q),
+                        ("format", "json"),
+                        ("language", lang),
+                        ("categories", categories.as_str()),
+                    ]);
+                if let Some(eng) = engines {
+                    req = req.query(&[("engines", eng.as_str())]);
+                }
+                req
+            }
         }
     }
 
@@ -506,6 +572,12 @@ impl NativeEngine {
                     .await
                     .map_err(|_| DiscoveryError::Unavailable)?;
                 return parse_github_json(&bytes, options.count);
+            }
+            Provider::Searxng { .. } => {
+                let bytes = read_body(response, BODY_LIMIT)
+                    .await
+                    .map_err(|_| DiscoveryError::Unavailable)?;
+                return parse_searxng_json(&bytes, options.count);
             }
         };
         Ok(candidates(rows, options.count))
@@ -729,6 +801,42 @@ pub(super) fn parse_github_json(
         }
     });
     Ok(candidates(rows, count))
+}
+
+pub(super) fn parse_searxng_json(
+    bytes: &[u8],
+    count: usize,
+) -> Result<Vec<Candidate>, DiscoveryError> {
+    let parsed: Results = serde_json::from_slice(bytes).map_err(|_| DiscoveryError::Unavailable)?;
+    Ok(candidates(parsed.results, count))
+}
+
+pub(super) fn query_has_tech_intent(query: &str) -> bool {
+    static TECH_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(concat!(
+            r"(?i)\b(rust|python|javascript|typescript|golang|java|kotlin|swift|cpp|c\+\+|sql|sqlite|postgres|postgresql|mysql|redis|mongodb|",
+            r"docker|kubernetes|k8s|linux|unix|bash|git|github|http|https|quic|tls|ssl|dns|tcp|udp|grpc|graphql|rest|api|sdk|cli|json|yaml|html|css|wasm|",
+            r"react|vue|nuxt|next\.?js|node\.?js|tokio|async|mutex|regex|rfc|wal|mvcc|aria|oauth|jwt|csrf|ssrf|cve|compiler|error|exception|stacktrace)\b"
+        ))
+        .expect("tech intent regex")
+    });
+    TECH_RE.is_match(query) || query.contains("::") || query.contains("--") || query.contains('_')
+}
+
+pub(super) fn query_has_academic_intent(query: &str) -> bool {
+    static ACAD_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(arxiv|paper|preprint|doi|theorem|proof|citation|et al|benchmark|transformer|attention|neural|diffusion|llm|empirical|dataset|ablation)\b")
+            .expect("academic intent regex")
+    });
+    ACAD_RE.is_match(query)
+}
+
+pub(super) fn query_has_repo_intent(query: &str) -> bool {
+    static REPO_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b(github|repo|repository|crate|cargo|npm|pypi|pip|package|library|sdk|cli|open[- ]source|release|changelog)\b")
+            .expect("repo intent regex")
+    });
+    REPO_RE.is_match(query)
 }
 
 fn candidates(rows: impl IntoIterator<Item = Row>, count: usize) -> Vec<Candidate> {

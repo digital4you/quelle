@@ -5,16 +5,19 @@
 //! - `POST /api/extract`: scrapes `url`/`urls`/`query` and extracts structured
 //!   JSON matching a user-supplied `prompt` and/or `schema` via the configured model.
 
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{collections::HashSet, convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Json,
     body::Body,
     extract::State,
     http::{Request, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
 };
-use futures_util::{StreamExt, stream};
+use futures_util::stream::{self, FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::time::Instant;
@@ -54,11 +57,15 @@ struct ScrapeInput {
     #[serde(default)]
     render: RenderMode,
     wait_for: Option<u64>,
+    wait_for_selector: Option<String>,
+    scroll_steps: Option<u8>,
     max_age: Option<u64>,
     max_tokens: Option<usize>,
     chunk_tokens: Option<usize>,
     focus_query: Option<String>,
     max_pages: Option<usize>,
+    #[serde(default)]
+    stream: bool,
 }
 
 impl ScrapeInput {
@@ -71,6 +78,16 @@ impl ScrapeInput {
         }
         if let Some(f) = &self.formats
             && f.is_empty()
+        {
+            return false;
+        }
+        if let Some(sel) = &self.wait_for_selector
+            && !pages::valid_wait_selector(sel)
+        {
+            return false;
+        }
+        if let Some(steps) = self.scroll_steps
+            && steps > 10
         {
             return false;
         }
@@ -136,9 +153,24 @@ struct ScrapeBatchOutput {
     error: Option<&'static str>,
 }
 
+async fn scrape_stream_one(
+    slots: Arc<tokio::sync::Semaphore>,
+    url: Url,
+    opts: ScrapeOptions,
+    deadline: Instant,
+) -> (Url, Result<ScrapedPage, pages::PageError>) {
+    let res = tokio::time::timeout_at(deadline, async {
+        let p = slots.acquire_owned().await.expect("page semaphore");
+        pages::scrape(url.clone(), &opts, p, deadline).await
+    })
+    .await
+    .unwrap_or(Err(pages::PageError::Timeout));
+    (url, res)
+}
+
 pub async fn scrape_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Response {
     let deadline = Instant::now() + REQUEST_TIMEOUT;
-    let (_permit, input) = match admit(&app, req, ScrapeInput::valid).await {
+    let (permit, input) = match admit(&app, req, ScrapeInput::valid).await {
         Ok(admitted) => admitted,
         Err(response) => return response,
     };
@@ -155,6 +187,13 @@ pub async fn scrape_handle(State(app): State<Arc<App>>, req: Request<Body>) -> R
         },
         render: input.render,
         wait_for_ms: input.wait_for,
+        wait_for_selector: input
+            .wait_for_selector
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        scroll_steps: input.scroll_steps.unwrap_or(0),
         cache_max_age: Duration::from_secs(input.max_age.unwrap_or(300)),
         max_tokens: input.max_tokens,
         chunk_tokens: input.chunk_tokens,
@@ -169,10 +208,11 @@ pub async fn scrape_handle(State(app): State<Arc<App>>, req: Request<Body>) -> R
 
     // Single URL mode -> returns `{ "data": ScrapedPage }` directly (Firecrawl style).
     if let Some(url) = input.url {
-        let Ok(permit) = app.search.page_slots.clone().acquire_owned().await else {
+        let _permit = permit;
+        let Ok(page_permit) = app.search.page_slots.clone().acquire_owned().await else {
             return problem(StatusCode::SERVICE_UNAVAILABLE, "search_capacity");
         };
-        return match pages::scrape(url.clone(), &options, permit, deadline).await {
+        return match pages::scrape(url.clone(), &options, page_permit, deadline).await {
             Ok(page) => Json(json!({ "data": page })).into_response(),
             Err(err) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -189,6 +229,53 @@ pub async fn scrape_handle(State(app): State<Arc<App>>, req: Request<Body>) -> R
         Err(resp) => return resp,
     };
 
+    if input.stream {
+        let stream = async_stream::stream! {
+            let _permit = permit;
+            let mut iter = urls.into_iter();
+            let mut in_flight = FuturesUnordered::new();
+            for _ in 0..6 {
+                if let Some(url) = iter.next() {
+                    in_flight.push(scrape_stream_one(
+                        app.search.page_slots.clone(),
+                        url,
+                        options.clone(),
+                        deadline,
+                    ));
+                }
+            }
+            while let Some((url, result)) = in_flight.next().await {
+                match result {
+                    Ok(page) => {
+                        yield Ok::<Event, Infallible>(
+                            Event::default().data(json!({ "type": "page", "data": page }).to_string())
+                        );
+                    }
+                    Err(err) => {
+                        yield Ok::<Event, Infallible>(
+                            Event::default().data(
+                                json!({ "type": "error", "data": ScrapeErrorEntry { url, error: err.code() } }).to_string()
+                            )
+                        );
+                    }
+                }
+                if let Some(url) = iter.next() {
+                    in_flight.push(scrape_stream_one(
+                        app.search.page_slots.clone(),
+                        url,
+                        options.clone(),
+                        deadline,
+                    ));
+                }
+            }
+            yield Ok::<Event, Infallible>(Event::default().data(json!({ "type": "done" }).to_string()));
+        };
+        return Sse::new(stream)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
+            .into_response();
+    }
+
+    let _permit = permit;
     let (data, errors) = scrape_many(&app, urls, &options, deadline).await;
     let (status, error) = if data.is_empty() {
         (

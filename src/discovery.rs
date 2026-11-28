@@ -18,15 +18,19 @@ pub use providers::configure_engines;
 #[cfg(test)]
 use providers::{
     HtmlEngine as Kind, ddg_locale, parse_arxiv_xml, parse_github_json, parse_hackernews_json,
-    parse_search_html, parse_stackexchange_json, site_filter_allows,
+    parse_search_html, parse_searxng_json, parse_stackexchange_json, query_has_academic_intent,
+    query_has_repo_intent, query_has_tech_intent, site_filter_allows,
 };
 
 pub const RESULTS_PER_QUERY: usize = 20;
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const CACHE_ENTRIES: usize = 512;
-/// Once at least one engine returns hits in parallel fuse mode, give slower
+/// Once a primary web engine returns hits in parallel fuse mode, give slower
 /// engines a short grace window to contribute consensus votes before fusing.
-const FUSE_GRACE_WINDOW: Duration = Duration::from_millis(750);
+const FUSE_GRACE_WINDOW: Duration = Duration::from_millis(600);
+/// If only secondary/specialized engines have replied while a primary web
+/// engine is still in flight, wait a bit longer so primary results aren't cut off.
+const FUSE_PRIMARY_GRACE_WINDOW: Duration = Duration::from_millis(1400);
 /// Reciprocal Rank Fusion smoothing constant tuned for top-20 web results.
 const RRF_K: f64 = 20.0;
 
@@ -73,6 +77,12 @@ pub trait SearchEngine: Send + Sync {
     fn name(&self) -> &'static str;
     fn weight(&self) -> f64 {
         1.0
+    }
+    fn query_weight(&self, _query: &Query) -> f64 {
+        self.weight()
+    }
+    fn is_primary(&self) -> bool {
+        self.weight() >= 1.0
     }
     fn supports_query(&self, _query: &Query) -> bool {
         true
@@ -310,6 +320,7 @@ impl EnginePool {
         let mut empty = false;
         let mut unavailable = false;
         let mut limited = Duration::ZERO;
+        let mut primary_in_flight = 0usize;
         let mut in_flight = FuturesUnordered::new();
 
         for idx in eligible {
@@ -317,6 +328,9 @@ impl EnginePool {
             if let Err(DiscoveryError::RateLimited(wait)) = slot.check_cooldown() {
                 limited = limited.max(wait);
                 continue;
+            }
+            if slot.engine.is_primary() {
+                primary_in_flight += 1;
             }
             in_flight.push(async move {
                 if let Err(err) = slot.ready().await {
@@ -350,19 +364,39 @@ impl EnginePool {
                 break;
             };
             let slot = &self.slots[idx];
+            let was_primary = slot.engine.is_primary();
+            if was_primary {
+                primary_in_flight = primary_in_flight.saturating_sub(1);
+            }
             match result {
                 Ok(hits) if hits.is_empty() => empty = true,
                 Ok(hits) => {
-                    batches.push((slot.engine.weight(), hits));
-                    if grace_deadline.is_none() {
-                        grace_deadline = Some(tokio::time::Instant::now() + FUSE_GRACE_WINDOW);
-                    }
+                    batches.push((slot.engine.query_weight(query), hits));
+                    let now = tokio::time::Instant::now();
+                    let target = if primary_in_flight > 0 && !was_primary {
+                        now + FUSE_PRIMARY_GRACE_WINDOW
+                    } else {
+                        now + FUSE_GRACE_WINDOW
+                    };
+                    grace_deadline = Some(match grace_deadline {
+                        Some(existing) if was_primary || primary_in_flight == 0 => {
+                            existing.min(now + FUSE_GRACE_WINDOW)
+                        }
+                        Some(existing) => existing,
+                        None => target,
+                    });
                 }
                 Err(DiscoveryError::RateLimited(wait)) => {
                     slot.record_rate_limit(wait);
                     limited = limited.max(wait);
                 }
                 Err(_) => unavailable = true,
+            }
+            // If all remaining primary engines failed/finished after a secondary
+            // already supplied hits, tighten the grace window immediately.
+            if primary_in_flight == 0 && !batches.is_empty() {
+                let tight = tokio::time::Instant::now() + FUSE_GRACE_WINDOW;
+                grace_deadline = Some(grace_deadline.map_or(tight, |d| d.min(tight)));
             }
         }
 

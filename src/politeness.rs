@@ -81,6 +81,9 @@ struct HostState {
     cooldown_until: Mutex<Option<Instant>>,
     crawl_delay: Mutex<Option<Duration>>,
     preferred_tier: Mutex<Option<(Instant, FetchTier)>>,
+    consecutive_failures: Mutex<u32>,
+    circuit_open_until: Mutex<Option<Instant>>,
+    ewma_latency_ms: Mutex<Option<f64>>,
     last_used: Mutex<Instant>,
 }
 
@@ -92,6 +95,9 @@ impl HostState {
             cooldown_until: Mutex::new(None),
             crawl_delay: Mutex::new(None),
             preferred_tier: Mutex::new(None),
+            consecutive_failures: Mutex::new(0),
+            circuit_open_until: Mutex::new(None),
+            ewma_latency_ms: Mutex::new(None),
             last_used: Mutex::new(Instant::now()),
         }
     }
@@ -247,6 +253,101 @@ impl Politeness {
         }
     }
 
+    pub fn record_host_success(&self, host: &str, elapsed: Duration) {
+        let state = self.host_state(host);
+        if let Ok(mut fails) = state.consecutive_failures.lock() {
+            *fails = 0;
+        }
+        if let Ok(mut open) = state.circuit_open_until.lock() {
+            *open = None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let sample_ms = elapsed.as_millis() as f64;
+        if let Ok(mut ewma) = state.ewma_latency_ms.lock() {
+            *ewma = Some(match *ewma {
+                Some(prev) => prev * 0.65 + sample_ms * 0.35,
+                None => sample_ms,
+            });
+        }
+    }
+
+    pub fn record_host_failure(&self, host: &str) {
+        let state = self.host_state(host);
+        let count = if let Ok(mut fails) = state.consecutive_failures.lock() {
+            *fails = fails.saturating_add(1);
+            *fails
+        } else {
+            1
+        };
+        if count >= 2 {
+            let cooldown = if count >= 4 {
+                Duration::from_secs(300)
+            } else {
+                Duration::from_secs(120)
+            };
+            if let Ok(mut open) = state.circuit_open_until.lock() {
+                *open = Some(Instant::now() + cooldown);
+            }
+        }
+    }
+
+    pub fn is_circuit_open(&self, host: &str) -> bool {
+        let key = host.to_ascii_lowercase();
+        let state = {
+            let Ok(map) = self.hosts.lock() else {
+                return false;
+            };
+            let Some(s) = map.get(&key) else {
+                return false;
+            };
+            Arc::clone(s)
+        };
+        state
+            .circuit_open_until
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .is_some_and(|until| until > Instant::now())
+    }
+
+    pub fn host_latency_ms(&self, host: &str) -> Option<u64> {
+        let key = host.to_ascii_lowercase();
+        let state = {
+            let map = self.hosts.lock().ok()?;
+            Arc::clone(map.get(&key)?)
+        };
+        let ewma = state.ewma_latency_ms.lock().ok().and_then(|g| *g)?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some(ewma.round() as u64)
+    }
+
+    /// Tightens the per-step HTTP timeout for hosts that recently failed or
+    /// exhibit chronically slow EWMA response times (>6 s).
+    pub fn host_step_budget(&self, host: &str, base: Duration) -> Duration {
+        let key = host.to_ascii_lowercase();
+        let state = {
+            let Ok(map) = self.hosts.lock() else {
+                return base;
+            };
+            let Some(s) = map.get(&key) else {
+                return base;
+            };
+            Arc::clone(s)
+        };
+        let failures = state.consecutive_failures.lock().ok().map_or(0, |g| *g);
+        let slow = state
+            .ewma_latency_ms
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .is_some_and(|ms| ms >= 6_000.0);
+        if failures >= 1 || slow {
+            base.min(Duration::from_secs(5))
+        } else {
+            base
+        }
+    }
+
     pub fn cache_get(&self, url: &Url, max_age: Duration) -> Option<CachedResponse> {
         if max_age.is_zero() {
             return None;
@@ -321,4 +422,40 @@ pub fn jitter(base: Duration) -> Duration {
         .unwrap_or(0);
     let extra_ms = u64::from(nanos % 350);
     base + Duration::from_millis(extra_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn circuit_breaker_opens_after_consecutive_failures_and_resets_on_success() {
+        let p = Politeness::new();
+        assert!(!p.is_circuit_open("slow.example.org"));
+        p.record_host_failure("slow.example.org");
+        assert!(!p.is_circuit_open("slow.example.org"));
+        // Tightens budget after first failure
+        assert!(
+            p.host_step_budget("slow.example.org", Duration::from_secs(10))
+                < Duration::from_secs(10)
+        );
+        p.record_host_failure("slow.example.org");
+        assert!(p.is_circuit_open("slow.example.org"));
+
+        p.record_host_success("slow.example.org", Duration::from_millis(250));
+        assert!(!p.is_circuit_open("slow.example.org"));
+        assert_eq!(p.host_latency_ms("slow.example.org"), Some(250));
+    }
+
+    #[test]
+    fn ewma_latency_tracks_slow_origins_and_caps_step_budget() {
+        let p = Politeness::new();
+        p.record_host_success("tarpit.example.org", Duration::from_secs(9));
+        let ewma = p.host_latency_ms("tarpit.example.org").unwrap();
+        assert!(ewma >= 8000);
+        assert!(
+            p.host_step_budget("tarpit.example.org", Duration::from_secs(10))
+                <= Duration::from_secs(6)
+        );
+    }
 }
