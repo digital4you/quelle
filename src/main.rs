@@ -2,6 +2,7 @@ mod cache;
 mod content;
 mod crawl;
 mod discovery;
+mod mcp;
 mod model;
 mod pages;
 mod politeness;
@@ -355,6 +356,22 @@ fn sidecar_endpoint(value: &str, name: &'static str) -> Result<Url, &'static str
     Ok(url)
 }
 
+fn cdp_endpoint(value: &str, name: &'static str) -> Result<Url, &'static str> {
+    let mut url = Url::parse(value).map_err(|_| name)?;
+    if url.host().is_none()
+        || !matches!(url.scheme(), "http" | "https" | "ws")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(name);
+    }
+    let path = url.path().trim_end_matches('/').to_owned();
+    url.set_path(&path);
+    Ok(url)
+}
+
 fn positive_env(
     name: &'static str,
     default: usize,
@@ -490,6 +507,14 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
         return Err("QUELLE_PROXY_URL");
     }
     pages::set_proxy(proxy);
+    let chromium_cdp = match env::var("QUELLE_CHROMIUM_CDP_URL") {
+        Ok(value) if !value.trim().is_empty() => {
+            Some(cdp_endpoint(value.trim(), "QUELLE_CHROMIUM_CDP_URL")?)
+        }
+        Ok(_) | Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err("QUELLE_CHROMIUM_CDP_URL"),
+    };
+    pages::set_chromium_cdp(chromium_cdp);
     let sidecar = match env::var("QUELLE_BROWSER_URL") {
         Ok(value) if !value.trim().is_empty() => {
             Some(sidecar_endpoint(value.trim(), "QUELLE_BROWSER_URL")?)
@@ -506,6 +531,18 @@ fn configure() -> Result<(SocketAddr, Arc<App>), &'static str> {
         Err(_) => return Err("QUELLE_OCR_URL"),
     };
     pages::set_ocr_sidecar(ocr);
+    if let Ok(value) = env::var("QUELLE_OCR_MODE")
+        && !value.trim().is_empty()
+    {
+        let mode = pages::OcrMode::parse(&value).ok_or("QUELLE_OCR_MODE")?;
+        pages::set_ocr_mode(mode);
+    }
+    if let Ok(value) = env::var("QUELLE_OCR_BACKEND")
+        && !value.trim().is_empty()
+    {
+        let backend = pages::LiteparseBackend::parse(&value).ok_or("QUELLE_OCR_BACKEND")?;
+        pages::set_liteparse_backend(backend);
+    }
     let host_concurrency = positive_env("QUELLE_HOST_CONCURRENCY", 2, 1, 16)?;
     let host_spacing_ms = positive_env("QUELLE_HOST_SPACING_MS", 250, 0, 10_000)? as u64;
     politeness::configure(host_concurrency, host_spacing_ms);
@@ -568,6 +605,9 @@ async fn shutdown() {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if env::args().nth(1).as_deref() == Some("mcp") {
+        return mcp::run_stdio().await;
+    }
     tracing_subscriber::fmt().with_target(false).init();
     let (listen, app) = match configure() {
         Ok(config) => config,
@@ -584,7 +624,13 @@ async fn main() -> ExitCode {
     if pages::detect_pdf_support() {
         tracing::info!("PDF text extraction enabled");
     } else {
-        tracing::warn!("pdftotext not found; PDF sources are skipped");
+        tracing::warn!("pdftotext not found; text-layer PDF extraction disabled");
+    }
+    if pages::detect_liteparse() {
+        tracing::info!(
+            backend = pages::liteparse_backend().as_arg(),
+            "LiteParse PDF OCR fallback enabled (OCRia-nano-1)"
+        );
     }
     if app.search.model.is_none() {
         tracing::warn!(
@@ -596,6 +642,7 @@ async fn main() -> ExitCode {
     } else {
         tracing::warn!("Lightpanda not found; script-only pages are skipped");
     }
+    app.crawls.resume_interrupted(Arc::clone(&app));
     let router = Router::new()
         .route("/api/answer", post(answer))
         .route("/api/content", post(content::handle))
@@ -604,6 +651,7 @@ async fn main() -> ExitCode {
         .route("/api/map", post(crawl::map_handle))
         .route("/api/crawl", post(crawl::start_handle))
         .route("/api/crawl/{id}", get(crawl::status_handle))
+        .route("/api/crawl/{id}/stream", get(crawl::stream_handle))
         .route("/api/crawl/{id}", delete(crawl::cancel_handle))
         .route("/healthz", get(health))
         .route("/api/providers", get(health))

@@ -59,6 +59,8 @@ struct ScrapeInput {
     wait_for: Option<u64>,
     wait_for_selector: Option<String>,
     scroll_steps: Option<u8>,
+    #[serde(default)]
+    actions: Vec<pages::PageAction>,
     max_age: Option<u64>,
     max_tokens: Option<usize>,
     chunk_tokens: Option<usize>,
@@ -89,6 +91,9 @@ impl ScrapeInput {
         if let Some(steps) = self.scroll_steps
             && steps > 10
         {
+            return false;
+        }
+        if !pages::valid_actions(&self.actions) {
             return false;
         }
         if let Some(t) = self.max_tokens
@@ -194,6 +199,7 @@ pub async fn scrape_handle(State(app): State<Arc<App>>, req: Request<Body>) -> R
             .filter(|s| !s.is_empty())
             .map(str::to_owned),
         scroll_steps: input.scroll_steps.unwrap_or(0),
+        actions: input.actions.clone(),
         cache_max_age: Duration::from_secs(input.max_age.unwrap_or(300)),
         max_tokens: input.max_tokens,
         chunk_tokens: input.chunk_tokens,
@@ -315,6 +321,10 @@ struct ExtractInput {
     #[serde(default)]
     render: RenderMode,
     wait_for: Option<u64>,
+    wait_for_selector: Option<String>,
+    scroll_steps: Option<u8>,
+    #[serde(default)]
+    actions: Vec<pages::PageAction>,
 }
 
 impl ExtractInput {
@@ -331,6 +341,19 @@ impl ExtractInput {
         if let Some(p) = &self.prompt
             && p.chars().count() > 8000
         {
+            return false;
+        }
+        if let Some(sel) = &self.wait_for_selector
+            && !pages::valid_wait_selector(sel)
+        {
+            return false;
+        }
+        if let Some(steps) = self.scroll_steps
+            && steps > 10
+        {
+            return false;
+        }
+        if !pages::valid_actions(&self.actions) {
             return false;
         }
         if let Some(u) = &self.url {
@@ -390,6 +413,14 @@ pub async fn extract_handle(State(app): State<Arc<App>>, req: Request<Body>) -> 
         },
         render: input.render,
         wait_for_ms: input.wait_for,
+        wait_for_selector: input
+            .wait_for_selector
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned),
+        scroll_steps: input.scroll_steps.unwrap_or(0),
+        actions: input.actions,
         cache_max_age: Duration::from_secs(5 * 60),
         ..ScrapeOptions::default()
     };
@@ -427,24 +458,115 @@ pub async fn extract_handle(State(app): State<Arc<App>>, req: Request<Body>) -> 
             .unwrap_or_default()
     );
     let messages = Message::exchange(system, json!({ "pages": sources_payload }));
+    let schema_check = input.schema.clone();
     let schema_arg = input.schema.map(|s| ("extraction", s));
 
-    match tokio::time::timeout_at(deadline, model.complete(&messages, 2048, schema_arg))
-        .await
-        .unwrap_or(Err(Failure::Deadline))
-    {
-        Ok(raw) => {
-            let data: Value = serde_json::from_str(&raw).unwrap_or(Value::String(raw));
-            let sources: Vec<Url> = pages_data.into_iter().map(|p| p.url).collect();
-            Json(json!({
-                "data": data,
-                "sources": sources,
-                "errors": errors,
-            }))
-            .into_response()
+    let first = tokio::time::timeout_at(
+        deadline,
+        model.complete(&messages, 2048, schema_arg.clone()),
+    )
+    .await
+    .unwrap_or(Err(Failure::Deadline));
+
+    let raw = match first {
+        Ok(raw) => raw,
+        Err(failure) => return problem(failure.status(), failure.code()),
+    };
+
+    let mut parsed_data = serde_json::from_str::<Value>(&raw);
+    if let Some(ref schema) = schema_check {
+        let validation_err = match &parsed_data {
+            Ok(val) => validate_json_schema(val, schema).err(),
+            Err(e) => Some(format!("invalid JSON: {e}")),
+        };
+        if let Some(err_msg) = validation_err
+            && Instant::now() + Duration::from_secs(3) < deadline
+        {
+            let retry_messages = Message::corrected(
+                &messages,
+                &format!(
+                    "Your previous output failed JSON schema validation ({err_msg}). \
+                     Return ONLY valid JSON strictly matching the requested schema."
+                ),
+            );
+            if let Ok(Ok(retry_raw)) =
+                tokio::time::timeout_at(deadline, model.complete(&retry_messages, 2048, schema_arg))
+                    .await
+                && let Ok(retry_val) = serde_json::from_str::<Value>(&retry_raw)
+                && validate_json_schema(&retry_val, schema).is_ok()
+            {
+                parsed_data = Ok(retry_val);
+            }
         }
-        Err(failure) => problem(failure.status(), failure.code()),
     }
+
+    let data = parsed_data.unwrap_or(Value::String(raw));
+    let sources: Vec<Url> = pages_data.into_iter().map(|p| p.url).collect();
+    Json(json!({
+        "data": data,
+        "sources": sources,
+        "errors": errors,
+    }))
+    .into_response()
+}
+
+/// Validates a JSON value against a lightweight subset of JSON Schema
+/// (`type`, `required`, `properties`, `items`, `enum`) to catch schema drift
+/// in LLM extraction outputs without external crate dependencies.
+pub(crate) fn validate_json_schema(value: &Value, schema: &Value) -> Result<(), String> {
+    let Some(obj) = schema.as_object() else {
+        return Ok(());
+    };
+    if let Some(enum_vals) = obj.get("enum").and_then(Value::as_array)
+        && !enum_vals.iter().any(|allowed| allowed == value)
+    {
+        return Err("value not in enum".to_owned());
+    }
+    if let Some(expected_type) = obj.get("type") {
+        let matches_type = |t: &str| match t {
+            "object" => value.is_object(),
+            "array" => value.is_array(),
+            "string" => value.is_string(),
+            "number" => value.is_number(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "boolean" => value.is_boolean(),
+            "null" => value.is_null(),
+            _ => true,
+        };
+        let ok = match expected_type {
+            Value::String(t) => matches_type(t),
+            Value::Array(list) => list.iter().filter_map(Value::as_str).any(matches_type),
+            _ => true,
+        };
+        if !ok {
+            return Err(format!("type mismatch: expected {expected_type}"));
+        }
+    }
+    if let Some(map) = value.as_object() {
+        if let Some(required) = obj.get("required").and_then(Value::as_array) {
+            for key in required.iter().filter_map(Value::as_str) {
+                if !map.contains_key(key) {
+                    return Err(format!("missing required property '{key}'"));
+                }
+            }
+        }
+        if let Some(props) = obj.get("properties").and_then(Value::as_object) {
+            for (k, prop_schema) in props {
+                if let Some(v) = map.get(k) {
+                    validate_json_schema(v, prop_schema)
+                        .map_err(|e| format!("property '{k}': {e}"))?;
+                }
+            }
+        }
+    }
+    if let Some(items) = value.as_array()
+        && let Some(item_schema) = obj.get("items")
+    {
+        for (idx, item) in items.iter().enumerate() {
+            validate_json_schema(item, item_schema).map_err(|e| format!("item[{idx}]: {e}"))?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -542,4 +664,46 @@ async fn scrape_many(
         }
     }
     (data, errors)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_schema_validator_checks_types_required_properties_items_and_enums() {
+        let schema = json!({
+            "type": "object",
+            "required": ["name", "tier", "prices"],
+            "properties": {
+                "name": { "type": "string" },
+                "tier": { "type": "string", "enum": ["free", "pro", "enterprise"] },
+                "seats": { "type": ["integer", "null"] },
+                "prices": {
+                    "type": "array",
+                    "items": { "type": "number" }
+                }
+            }
+        });
+
+        let ok_val = json!({
+            "name": "Acme",
+            "tier": "pro",
+            "seats": null,
+            "prices": [0, 29.5]
+        });
+        assert!(validate_json_schema(&ok_val, &schema).is_ok());
+
+        // Missing required key
+        let missing = json!({ "name": "Acme", "tier": "pro" });
+        assert!(validate_json_schema(&missing, &schema).is_err());
+
+        // Bad enum value
+        let bad_enum = json!({ "name": "Acme", "tier": "platinum", "prices": [10] });
+        assert!(validate_json_schema(&bad_enum, &schema).is_err());
+
+        // Bad array item type
+        let bad_item = json!({ "name": "Acme", "tier": "free", "prices": ["ten"] });
+        assert!(validate_json_schema(&bad_item, &schema).is_err());
+    }
 }

@@ -25,13 +25,20 @@ mod cdp;
 pub mod chunks;
 mod clean;
 pub mod markdown;
+mod ocr;
 mod quality;
 pub mod structured;
 #[cfg(test)]
 mod tests;
 
-pub use cdp::{set_cdp_pool_enabled, shutdown_pool, valid_wait_selector};
+pub use cdp::{
+    PageAction, set_cdp_pool_enabled, shutdown_pool, valid_actions, valid_wait_selector,
+};
 pub use markdown::{ExtractOptions, PageMeta};
+pub use ocr::{
+    LiteparseBackend, OcrMode, detect_liteparse, liteparse_backend, set_liteparse_backend,
+    set_ocr_mode, set_ocr_sidecar,
+};
 
 /// HTML beyond this is cut off and the prefix is parsed; long pages keep
 /// their opening content instead of failing.
@@ -73,8 +80,8 @@ fn effective_pdf_max_pages(override_pages: Option<usize>) -> usize {
         .clamp(1, MAX_PDF_MAX_PAGES)
 }
 static PROXY_URL: OnceLock<Option<String>> = OnceLock::new();
+static CHROMIUM_CDP_URL: OnceLock<Option<Url>> = OnceLock::new();
 static BROWSER_SIDECAR_URL: OnceLock<Option<Url>> = OnceLock::new();
-static OCR_SIDECAR_URL: OnceLock<Option<Url>> = OnceLock::new();
 
 /// Whole budget for one page: download, optional rendering and parsing.
 const FETCH_BUDGET: Duration = Duration::from_secs(25);
@@ -109,6 +116,14 @@ fn configured_proxy() -> Option<&'static str> {
     PROXY_URL.get().and_then(Option::as_deref)
 }
 
+pub fn set_chromium_cdp(url: Option<Url>) {
+    let _ = CHROMIUM_CDP_URL.set(url);
+}
+
+fn chromium_cdp() -> Option<&'static Url> {
+    CHROMIUM_CDP_URL.get().and_then(Option::as_ref)
+}
+
 pub fn set_browser_sidecar(url: Option<Url>) {
     let _ = BROWSER_SIDECAR_URL.set(url);
 }
@@ -117,16 +132,8 @@ fn browser_sidecar() -> Option<&'static Url> {
     BROWSER_SIDECAR_URL.get().and_then(Option::as_ref)
 }
 
-pub fn set_ocr_sidecar(url: Option<Url>) {
-    let _ = OCR_SIDECAR_URL.set(url);
-}
-
-fn ocr_sidecar() -> Option<&'static Url> {
-    OCR_SIDECAR_URL.get().and_then(Option::as_ref)
-}
-
 fn any_renderer_enabled() -> bool {
-    render_enabled() || browser_sidecar().is_some()
+    render_enabled() || chromium_cdp().is_some() || browser_sidecar().is_some()
 }
 /// Reserved ranges blocked in addition to Lightpanda's private networks.
 const BLOCKED_RANGES: &[&str] = &[
@@ -253,7 +260,7 @@ pub fn detect_pdf_support() -> bool {
 }
 
 fn pdf_enabled() -> bool {
-    PDF_SUPPORT.get().copied().unwrap_or(false)
+    PDF_SUPPORT.get().copied().unwrap_or(false) || ocr::any_ocr_enabled()
 }
 
 #[derive(Clone, Serialize)]
@@ -1200,16 +1207,17 @@ fn looks_like_markdown(bytes: &[u8]) -> bool {
     (has_frontmatter && (has_heading || has_md_syntax)) || (has_heading && has_md_syntax)
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderMode {
     #[default]
     Auto,
     Always,
+    Chromium,
     Never,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
     Markdown,
@@ -1218,6 +1226,9 @@ pub enum OutputFormat {
     Links,
     Chunks,
     Structured,
+    Screenshot,
+    #[serde(rename = "fullPageScreenshot", alias = "fullpagescreenshot")]
+    FullPageScreenshot,
 }
 
 #[derive(Clone, Debug)]
@@ -1228,6 +1239,7 @@ pub struct ScrapeOptions {
     pub wait_for_ms: Option<u64>,
     pub wait_for_selector: Option<String>,
     pub scroll_steps: u8,
+    pub actions: Vec<PageAction>,
     pub cache_max_age: Duration,
     pub max_tokens: Option<usize>,
     pub chunk_tokens: Option<usize>,
@@ -1244,6 +1256,7 @@ impl Default for ScrapeOptions {
             wait_for_ms: None,
             wait_for_selector: None,
             scroll_steps: 0,
+            actions: Vec::new(),
             cache_max_age: Duration::from_secs(5 * 60),
             max_tokens: None,
             chunk_tokens: None,
@@ -1272,6 +1285,8 @@ pub struct ScrapedPage {
     pub chunks: Option<Vec<chunks::Chunk>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub structured: Option<structured::StructuredData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1338,6 +1353,7 @@ pub async fn fetch_rich(
         wait_for_ms: None,
         wait_for_selector: None,
         scroll_steps: 0,
+        actions: Vec::new(),
         cache_max_age: Duration::from_secs(5 * 60),
         max_tokens: extras.max_tokens,
         chunk_tokens: extras.chunk_tokens,
@@ -1412,14 +1428,15 @@ async fn fetch_uncached(
         let host_key = target.host_str().unwrap_or_default().to_owned();
 
         let rendered = |url: Url, threshold| async move {
-            let (html, cut, tier, validated) =
-                render_with_fallback(&url, threshold, None, None, 0, deadline).await?;
-            let mut source = match (validated, relevance) {
+            let out =
+                render_with_fallback(&url, threshold, None, None, 0, &[], false, None, deadline)
+                    .await?;
+            let mut source = match (out.validated, relevance) {
                 (Some(source), None) => source,
                 _ => {
                     parse(
                         url,
-                        html,
+                        out.html,
                         Some("text/html; charset=utf-8".to_owned()),
                         relevance,
                         true,
@@ -1427,12 +1444,9 @@ async fn fetch_uncached(
                     .await?
                 }
             };
-            source.metadata.retrieval = Some(match tier {
-                politeness::FetchTier::Sidecar => "sidecar",
-                _ => "rendered",
-            });
-            source.mark_truncated(cut);
-            Ok::<_, PageError>((source, tier))
+            source.metadata.retrieval = Some(out.retrieval);
+            source.mark_truncated(out.truncated);
+            Ok::<_, PageError>((source, out.tier))
         };
 
         let downloaded = match download(target.clone(), deadline, Duration::from_secs(5 * 60)).await
@@ -1539,6 +1553,13 @@ pub async fn scrape(
         let want_links = options.formats.contains(&OutputFormat::Links);
         let want_chunks = options.formats.contains(&OutputFormat::Chunks);
         let want_structured = options.formats.contains(&OutputFormat::Structured);
+        let capture_screenshot = if options.formats.contains(&OutputFormat::FullPageScreenshot) {
+            Some(true)
+        } else if options.formats.contains(&OutputFormat::Screenshot) {
+            Some(false)
+        } else {
+            None
+        };
 
         let finalize_non_html = |url: Url,
                                  requested: Url,
@@ -1586,6 +1607,7 @@ pub async fn scrape(
                 links,
                 chunks: out_chunks,
                 structured: None,
+                screenshot: None,
                 content_hash: None,
                 change_status: None,
                 diff: None,
@@ -1602,27 +1624,27 @@ pub async fn scrape(
             let req = requested.clone();
             let opts = options.clone();
             async move {
-                let (html_bytes, cut, tier, _) = render_with_fallback(
+                let out = render_with_fallback(
                     &u,
                     threshold,
                     opts.wait_for_ms,
                     opts.wait_for_selector.as_deref(),
                     opts.scroll_steps,
+                    &opts.actions,
+                    opts.render == RenderMode::Chromium,
+                    capture_screenshot,
                     deadline,
                 )
                 .await?;
-                let retrieval = match tier {
-                    politeness::FetchTier::Sidecar => Some("sidecar"),
-                    _ => Some("rendered"),
-                };
                 let page = build_scraped_html(
                     u,
                     req,
                     200,
                     Some("text/html; charset=utf-8".to_owned()),
-                    html_bytes,
-                    cut,
-                    retrieval,
+                    out.html,
+                    out.truncated,
+                    Some(out.retrieval),
+                    out.screenshot,
                     &opts,
                     want_md,
                     want_text,
@@ -1632,20 +1654,30 @@ pub async fn scrape(
                     want_structured,
                 )
                 .await?;
-                Ok::<_, PageError>((page, tier))
+                Ok::<_, PageError>((page, out.tier))
             }
         };
+
+        if capture_screenshot.is_some() || options.render == RenderMode::Chromium {
+            if options.render == RenderMode::Never || chromium_cdp().is_none() {
+                return Err(PageError::Unsupported);
+            }
+            let clean_target = public_url(requested.clone())?;
+            let (page, _) = render_to_page(clean_target, 300).await?;
+            return Ok(page);
+        }
 
         if options.render == RenderMode::Always
             || options.wait_for_selector.is_some()
             || options.scroll_steps > 0
+            || !options.actions.is_empty()
         {
             if options.render != RenderMode::Never && any_renderer_enabled() {
                 let clean_target = public_url(requested.clone())?;
                 let (page, _) = render_to_page(clean_target, 300).await?;
                 return Ok(page);
             }
-            if options.render == RenderMode::Always {
+            if options.render == RenderMode::Always || !options.actions.is_empty() {
                 return Err(PageError::NeedsJs);
             }
         }
@@ -1811,6 +1843,7 @@ pub async fn scrape(
             bytes,
             cut,
             None,
+            None,
             &options,
             want_md,
             want_text,
@@ -1877,6 +1910,7 @@ async fn build_scraped_html(
     bytes: Vec<u8>,
     cut: bool,
     retrieval: Option<&'static str>,
+    screenshot: Option<String>,
     options: &ScrapeOptions,
     want_md: bool,
     want_text: bool,
@@ -1889,7 +1923,7 @@ async fn build_scraped_html(
     let max_tokens = options.max_tokens;
     let chunk_tokens = options.chunk_tokens;
     let focus_query = options.focus_query.clone();
-    let rendered = retrieval == Some("rendered");
+    let rendered = matches!(retrieval, Some("rendered" | "chromium" | "sidecar"));
     tokio::task::spawn_blocking(move || {
         let decoded = decode_bytes(&bytes, content_type.as_deref());
         let document = Html::parse_document(&decoded);
@@ -1985,6 +2019,7 @@ async fn build_scraped_html(
             || html.as_deref().is_some_and(|s| !s.trim().is_empty())
             || links.as_ref().is_some_and(|l| !l.is_empty())
             || out_chunks.as_ref().is_some_and(|c| !c.is_empty())
+            || screenshot.is_some()
             || structured_data.as_ref().is_some_and(|s| {
                 !s.outline.is_empty() || !s.tables.is_empty() || !s.json_ld.is_empty()
             });
@@ -2002,6 +2037,7 @@ async fn build_scraped_html(
             links,
             chunks: out_chunks,
             structured: structured_data,
+            screenshot,
             content_hash: None,
             change_status: None,
             diff: None,
@@ -2061,24 +2097,40 @@ async fn parse(
     .map_err(|_| PageError::Unreadable)?
 }
 
-/// Escalates from Tier 2 (Lightpanda) to Tier 3 (optional Playwright/Chromium
-/// sidecar configured via `QUELLE_BROWSER_URL`).
+struct RenderedPage {
+    html: Vec<u8>,
+    truncated: bool,
+    tier: politeness::FetchTier,
+    validated: Option<Source>,
+    screenshot: Option<String>,
+    retrieval: &'static str,
+}
+
+/// Escalates from Tier 2 (Lightpanda) to optional Tier 3 Chromium CDP
+/// (`QUELLE_CHROMIUM_CDP_URL`) or external Playwright/Chromium sidecar
+/// (`QUELLE_BROWSER_URL`).
+#[allow(clippy::too_many_arguments)]
 async fn render_with_fallback(
     url: &Url,
     threshold: usize,
     wait_for_ms: Option<u64>,
     wait_for_selector: Option<&str>,
     scroll_steps: u8,
+    actions: &[PageAction],
+    prefer_chromium: bool,
+    capture_screenshot: Option<bool>,
     deadline: Instant,
-) -> Result<(Vec<u8>, bool, politeness::FetchTier, Option<Source>), PageError> {
+) -> Result<RenderedPage, PageError> {
+    let has_fallback = chromium_cdp().is_some() || browser_sidecar().is_some();
     let host_key = url.host_str().unwrap_or_default();
-    let skip_lightpanda = politeness::global().preferred_tier(host_key)
-        == Some(politeness::FetchTier::Sidecar)
-        && browser_sidecar().is_some();
+    let skip_lightpanda = prefer_chromium
+        || capture_screenshot.is_some()
+        || (politeness::global().preferred_tier(host_key) == Some(politeness::FetchTier::Sidecar)
+            && has_fallback);
 
     if !skip_lightpanda && render_enabled() {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let reserve = if browser_sidecar().is_some() {
+        let reserve = if has_fallback {
             remaining.min(Duration::from_secs(6))
         } else {
             Duration::ZERO
@@ -2092,6 +2144,7 @@ async fn render_with_fallback(
                 wait_for_ms,
                 wait_for_selector,
                 scroll_steps,
+                actions,
                 stop,
             ),
         )
@@ -2109,7 +2162,14 @@ async fn render_with_fallback(
                 .await
                 {
                     Ok(source) => {
-                        return Ok((html, cut, politeness::FetchTier::Rendered, Some(source)));
+                        return Ok(RenderedPage {
+                            html,
+                            truncated: cut,
+                            tier: politeness::FetchTier::Rendered,
+                            validated: Some(source),
+                            screenshot: None,
+                            retrieval: "rendered",
+                        });
                     }
                     Err(
                         error @ (PageError::NotFound
@@ -2117,22 +2177,80 @@ async fn render_with_fallback(
                         | PageError::RateLimited
                         | PageError::Upstream),
                     ) => return Err(error),
-                    Err(error) if browser_sidecar().is_none() => return Err(error),
+                    Err(error) if !has_fallback => return Err(error),
                     Err(_) => {
                         tracing::info!(stage = "escalate_browser_quality", host = url.host_str())
                     }
                 }
             }
-            Err(err) if browser_sidecar().is_none() => return Err(err),
+            Err(err) if !has_fallback => return Err(err),
             Err(_) => {
                 tracing::info!(stage = "escalate_browser_sidecar", host = url.host_str());
             }
         }
     }
 
+    if let Some(endpoint) = chromium_cdp() {
+        let _slot = render_slots()
+            .acquire()
+            .await
+            .map_err(|_| PageError::NeedsJs)?;
+        let started = Instant::now();
+        let step_deadline = deadline.min(Instant::now() + RENDER_TIMEOUT);
+        match cdp::render_chromium_cdp(
+            endpoint,
+            url,
+            threshold,
+            wait_for_ms,
+            wait_for_selector,
+            scroll_steps,
+            actions,
+            capture_screenshot,
+            step_deadline,
+        )
+        .await
+        {
+            Ok(out) => {
+                tracing::info!(
+                    stage = "render_chromium_cdp",
+                    host = url.host_str(),
+                    screenshot = out.screenshot.is_some(),
+                    elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ok = true
+                );
+                return Ok(RenderedPage {
+                    html: out.html,
+                    truncated: out.truncated,
+                    tier: politeness::FetchTier::Sidecar,
+                    validated: None,
+                    screenshot: out.screenshot,
+                    retrieval: "chromium",
+                });
+            }
+            Err(err)
+                if prefer_chromium
+                    || capture_screenshot.is_some()
+                    || browser_sidecar().is_none() =>
+            {
+                if matches!(err, PageError::Blocked | PageError::Timeout) {
+                    politeness::global().record_host_failure(host_key);
+                }
+                return Err(err);
+            }
+            Err(_) => {}
+        }
+    }
+
     if let Some(sidecar) = browser_sidecar() {
         let (html, cut) = render_sidecar(sidecar, url, wait_for_ms, deadline).await?;
-        return Ok((html, cut, politeness::FetchTier::Sidecar, None));
+        return Ok(RenderedPage {
+            html,
+            truncated: cut,
+            tier: politeness::FetchTier::Sidecar,
+            validated: None,
+            screenshot: None,
+            retrieval: "sidecar",
+        });
     }
 
     Err(PageError::NeedsJs)
@@ -2228,6 +2346,7 @@ async fn render(
     wait_for_ms: Option<u64>,
     wait_for_selector: Option<&str>,
     scroll_steps: u8,
+    actions: &[PageAction],
     deadline: Instant,
 ) -> Result<(Vec<u8>, bool), PageError> {
     let url = public_url(url.clone())?;
@@ -2253,6 +2372,7 @@ async fn render(
             wait_for_ms,
             wait_for_selector,
             scroll_steps,
+            actions,
             step_deadline,
         )
         .await
@@ -2609,8 +2729,8 @@ fn table_passages(rows: &[Vec<String>], context: &str) -> Vec<String> {
 
 /// Extracts PDF text via `pdftotext` first (switching automatically to
 /// `-layout` when multi-column/tabular fragmentation is detected); when the PDF
-/// has no embedded text layer or a garbled CID/replacement text layer and
-/// `QUELLE_OCR_URL` is configured, escalates to OCR automatically.
+/// has no embedded text layer or a garbled CID/replacement text layer, escalates
+/// automatically to LlamaIndex OCRia-nano-1 via LiteParse (`lit`) or `QUELLE_OCR_URL`.
 async fn pdf_or_ocr(
     url: Url,
     bytes: &[u8],
@@ -2618,72 +2738,18 @@ async fn pdf_or_ocr(
     max_pages: Option<usize>,
     deadline: Instant,
 ) -> Result<Source, PageError> {
-    match pdf(url.clone(), bytes, relevance, max_pages, deadline).await {
-        Ok(src) => Ok(src),
-        Err(PageError::NoTextLayer) if ocr_sidecar().is_some() => {
-            ocr_pdf(url, bytes, relevance, deadline).await
+    if PDF_SUPPORT.get().copied().unwrap_or(false) {
+        match pdf(url.clone(), bytes, relevance, max_pages, deadline).await {
+            Ok(src) => return Ok(src),
+            Err(PageError::NoTextLayer) if ocr::any_ocr_enabled() => {}
+            Err(err) => return Err(err),
         }
-        Err(err) => Err(err),
+    } else if !ocr::any_ocr_enabled() {
+        return Err(PageError::Unsupported);
     }
-}
-
-async fn ocr_pdf(
-    url: Url,
-    bytes: &[u8],
-    relevance: Option<&Relevance>,
-    deadline: Instant,
-) -> Result<Source, PageError> {
-    let Some(endpoint) = ocr_sidecar() else {
-        return Err(PageError::NoTextLayer);
-    };
-    let _slot = DOCUMENT_SLOTS
-        .acquire()
-        .await
-        .map_err(|_| PageError::Unreadable)?;
-    let started = Instant::now();
-    let client = crate::client_builder()
-        .build()
-        .map_err(|_| PageError::Transport)?;
-    let step_deadline = deadline.min(Instant::now() + Duration::from_secs(45));
-    let response = tokio::time::timeout_at(
-        step_deadline,
-        client
-            .post(endpoint.clone())
-            .header(header::CONTENT_TYPE, "application/pdf")
-            .body(bytes.to_vec())
-            .send(),
-    )
-    .await
-    .map_err(|_| PageError::Timeout)?
-    .map_err(|_| PageError::Transport)?;
-    if !response.status().is_success() {
-        return Err(PageError::NoTextLayer);
-    }
-    #[derive(Deserialize)]
-    struct OcrResponse {
-        markdown: Option<String>,
-        text: Option<String>,
-        pages: Option<usize>,
-    }
-    let body = tokio::time::timeout_at(step_deadline, read_body(response, PDF_TEXT_BYTES))
-        .await
-        .map_err(|_| PageError::Timeout)?
-        .map_err(|_| PageError::Unreadable)?;
-    let parsed: OcrResponse = serde_json::from_slice(&body).map_err(|_| PageError::Unreadable)?;
-    let text = parsed
-        .markdown
-        .or(parsed.text)
-        .filter(|t| !t.trim().is_empty())
-        .ok_or(PageError::NoTextLayer)?;
-    tracing::info!(
-        stage = "pdf_ocr",
-        host = url.host_str(),
-        pages = parsed.pages.unwrap_or(0),
-        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        ok = true
-    );
-    let mut src = text_source(url, text, "pdf-ocr", relevance)?;
-    src.metadata.pages_read = parsed.pages;
+    let out = ocr::run_pdf_ocr(&url, bytes, max_pages, deadline).await?;
+    let mut src = text_source(url, out.markdown, out.retrieval, relevance)?;
+    src.metadata.pages_read = out.pages_read;
     Ok(src)
 }
 

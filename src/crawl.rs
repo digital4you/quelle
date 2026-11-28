@@ -7,6 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
+    convert::Infallible,
     hash::{Hash, Hasher},
     sync::{
         Arc, Mutex,
@@ -20,13 +21,19 @@ use axum::{
     body::Body,
     extract::{Path, State},
     http::{Request, StatusCode, header},
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
 };
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subtle::ConstantTimeEq;
-use tokio::{sync::Semaphore, time::Instant};
+use tokio::{
+    sync::{Semaphore, broadcast},
+    time::Instant,
+};
 use url::Url;
 
 use crate::{
@@ -55,7 +62,7 @@ static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 // Crawl Job Store
 // ---------------------------------------------------------------------------
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CrawlStatus {
     Running,
@@ -70,12 +77,35 @@ pub struct CrawlErrorEntry {
     pub error: &'static str,
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ChangeSummary {
     pub added: usize,
     pub updated: usize,
     pub unchanged: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+enum CrawlStreamEvent {
+    Page {
+        data: Box<ScrapedPage>,
+        completed: usize,
+        total: usize,
+    },
+    Error {
+        data: CrawlErrorEntry,
+        failed: usize,
+        total: usize,
+    },
+    Done {
+        status: CrawlStatus,
+        completed: usize,
+        failed: usize,
+        total: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        changes: Option<ChangeSummary>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -99,6 +129,156 @@ struct StoredPageSnapshot {
     markdown: Option<String>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct CrawlCheckpointConfig {
+    seeds: Vec<Url>,
+    max_depth: usize,
+    limit: usize,
+    include_paths: Vec<String>,
+    exclude_paths: Vec<String>,
+    allow_subdomains: bool,
+    allow_external_links: bool,
+    use_sitemap: bool,
+    respect_robots: bool,
+    formats: Vec<OutputFormat>,
+    only_main_content: bool,
+    include_tags: Vec<String>,
+    exclude_tags: Vec<String>,
+    render: RenderMode,
+    wait_for_ms: Option<u64>,
+    wait_for_selector: Option<String>,
+    scroll_steps: u8,
+    #[serde(default)]
+    actions: Vec<pages::PageAction>,
+    cache_max_age_secs: u64,
+    max_tokens: Option<usize>,
+    chunk_tokens: Option<usize>,
+    focus_query: Option<String>,
+    max_pages: Option<usize>,
+    keep_links_in_output: bool,
+    concurrency: usize,
+    incremental: bool,
+    omit_unchanged_content: bool,
+}
+
+impl CrawlCheckpointConfig {
+    fn from_crawl_config(cfg: &CrawlConfig) -> Self {
+        Self {
+            seeds: cfg.seeds.clone(),
+            max_depth: cfg.max_depth,
+            limit: cfg.limit,
+            include_paths: cfg.include_paths.clone(),
+            exclude_paths: cfg.exclude_paths.clone(),
+            allow_subdomains: cfg.allow_subdomains,
+            allow_external_links: cfg.allow_external_links,
+            use_sitemap: cfg.use_sitemap,
+            respect_robots: cfg.respect_robots,
+            formats: cfg.scrape_options.formats.clone(),
+            only_main_content: cfg.scrape_options.extract.only_main_content,
+            include_tags: cfg.scrape_options.extract.include_tags.clone(),
+            exclude_tags: cfg.scrape_options.extract.exclude_tags.clone(),
+            render: cfg.scrape_options.render,
+            wait_for_ms: cfg.scrape_options.wait_for_ms,
+            wait_for_selector: cfg.scrape_options.wait_for_selector.clone(),
+            scroll_steps: cfg.scrape_options.scroll_steps,
+            actions: cfg.scrape_options.actions.clone(),
+            cache_max_age_secs: cfg.scrape_options.cache_max_age.as_secs(),
+            max_tokens: cfg.scrape_options.max_tokens,
+            chunk_tokens: cfg.scrape_options.chunk_tokens,
+            focus_query: cfg.scrape_options.focus_query.clone(),
+            max_pages: cfg.scrape_options.max_pages,
+            keep_links_in_output: cfg.keep_links_in_output,
+            concurrency: cfg.concurrency,
+            incremental: cfg.incremental,
+            omit_unchanged_content: cfg.omit_unchanged_content,
+        }
+    }
+
+    fn into_crawl_config(self) -> CrawlConfig {
+        CrawlConfig {
+            seeds: self.seeds,
+            max_depth: self.max_depth,
+            limit: self.limit,
+            include_paths: self.include_paths,
+            exclude_paths: self.exclude_paths,
+            allow_subdomains: self.allow_subdomains,
+            allow_external_links: self.allow_external_links,
+            use_sitemap: self.use_sitemap,
+            respect_robots: self.respect_robots,
+            scrape_options: ScrapeOptions {
+                formats: self.formats,
+                extract: ExtractOptions {
+                    only_main_content: self.only_main_content,
+                    include_tags: self.include_tags,
+                    exclude_tags: self.exclude_tags,
+                },
+                render: self.render,
+                wait_for_ms: self.wait_for_ms,
+                wait_for_selector: self.wait_for_selector,
+                scroll_steps: self.scroll_steps,
+                actions: self.actions,
+                cache_max_age: Duration::from_secs(self.cache_max_age_secs),
+                max_tokens: self.max_tokens,
+                chunk_tokens: self.chunk_tokens,
+                focus_query: self.focus_query,
+                max_pages: self.max_pages,
+            },
+            keep_links_in_output: self.keep_links_in_output,
+            concurrency: self.concurrency,
+            timeout: ASYNC_CRAWL_TIMEOUT,
+            incremental: self.incremental,
+            omit_unchanged_content: self.omit_unchanged_content,
+            previous: HashMap::new(),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(seeds: Vec<Url>) -> Self {
+        Self {
+            seeds,
+            max_depth: 1,
+            limit: 10,
+            include_paths: Vec::new(),
+            exclude_paths: Vec::new(),
+            allow_subdomains: false,
+            allow_external_links: false,
+            use_sitemap: false,
+            respect_robots: true,
+            formats: vec![OutputFormat::Markdown, OutputFormat::Links],
+            only_main_content: true,
+            include_tags: Vec::new(),
+            exclude_tags: Vec::new(),
+            render: RenderMode::Auto,
+            wait_for_ms: None,
+            wait_for_selector: None,
+            scroll_steps: 0,
+            actions: Vec::new(),
+            cache_max_age_secs: 300,
+            max_tokens: None,
+            chunk_tokens: None,
+            focus_query: None,
+            max_pages: None,
+            keep_links_in_output: false,
+            concurrency: 2,
+            incremental: false,
+            omit_unchanged_content: false,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CrawlCheckpoint {
+    id: String,
+    status: CrawlStatus,
+    frontier: Vec<(Url, usize)>,
+    seen: Vec<Url>,
+    completed: usize,
+    failed: usize,
+    changes: Option<ChangeSummary>,
+    page_snapshots: HashMap<String, StoredPageSnapshot>,
+    config: CrawlCheckpointConfig,
+}
+
 struct CrawlJobState {
     id: String,
     status: CrawlStatus,
@@ -112,6 +292,7 @@ struct CrawlJobState {
     data: Vec<ScrapedPage>,
     errors: Vec<CrawlErrorEntry>,
     cancel: Arc<AtomicBool>,
+    events: broadcast::Sender<CrawlStreamEvent>,
 }
 
 impl CrawlJobState {
@@ -212,6 +393,114 @@ impl CrawlManager {
         let path = dir.join(format!("{id}.json"));
         let bytes = std::fs::read(path).ok()?;
         serde_json::from_slice(&bytes).ok()
+    }
+
+    fn persist_checkpoint(&self, checkpoint: &CrawlCheckpoint) {
+        let Some(ref dir) = self.state_dir else {
+            return;
+        };
+        if !valid_crawl_id(&checkpoint.id) {
+            return;
+        }
+        let Ok(bytes) = serde_json::to_vec(checkpoint) else {
+            return;
+        };
+        let target = dir.join(format!("{}.checkpoint.json", checkpoint.id));
+        let tmp = dir.join(format!("{}.checkpoint.json.tmp", checkpoint.id));
+        if std::fs::write(&tmp, &bytes).is_ok() {
+            let _ = std::fs::rename(&tmp, &target);
+        }
+    }
+
+    fn remove_checkpoint(&self, id: &str) {
+        let Some(ref dir) = self.state_dir else {
+            return;
+        };
+        if !valid_crawl_id(id) {
+            return;
+        }
+        let _ = std::fs::remove_file(dir.join(format!("{id}.checkpoint.json")));
+    }
+
+    fn list_interrupted_checkpoints(&self) -> Vec<CrawlCheckpoint> {
+        let Some(ref dir) = self.state_dir else {
+            return Vec::new();
+        };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for entry in entries.filter_map(Result::ok) {
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(id) = name.strip_suffix(".checkpoint.json") else {
+                continue;
+            };
+            if !valid_crawl_id(id) {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(cp) = serde_json::from_slice::<CrawlCheckpoint>(&bytes) else {
+                continue;
+            };
+            if cp.id == id && cp.status == CrawlStatus::Running {
+                out.push(cp);
+            }
+        }
+        out
+    }
+
+    /// Resumes any interrupted crawls persisted in `QUELLE_STATE_DIR` on startup.
+    pub fn resume_interrupted(&self, app: Arc<App>) {
+        let checkpoints = self.list_interrupted_checkpoints();
+        for cp in checkpoints.into_iter().take(MAX_CONCURRENT_CRAWLS) {
+            let Ok(crawl_permit) = self.slots.clone().try_acquire_owned() else {
+                break;
+            };
+            let (tx, _) = broadcast::channel(256);
+            let job = Arc::new(Mutex::new(CrawlJobState {
+                id: cp.id.clone(),
+                status: CrawlStatus::Running,
+                started: StdInstant::now(),
+                finished_elapsed_ms: None,
+                total: cp.seen.len().max(cp.completed + cp.frontier.len()),
+                completed: cp.completed,
+                failed: cp.failed,
+                changes: cp.changes,
+                page_snapshots: cp.page_snapshots.clone(),
+                data: Vec::new(),
+                errors: Vec::new(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                events: tx,
+            }));
+            self.insert(Arc::clone(&job));
+            let app_bg = Arc::clone(&app);
+            let job_id = cp.id.clone();
+            tracing::info!(
+                stage = "crawl_resumed",
+                id = %job_id,
+                completed = cp.completed,
+                remaining = cp.frontier.len()
+            );
+            tokio::spawn(async move {
+                let _crawl_permit = crawl_permit;
+                let config = cp.config.into_crawl_config();
+                run_crawl_inner(
+                    app_bg,
+                    job,
+                    config,
+                    Some(ResumedState {
+                        frontier: cp.frontier,
+                        seen: cp.seen,
+                        finished: cp.completed + cp.failed,
+                    }),
+                )
+                .await;
+            });
+        }
     }
 
     #[cfg(test)]
@@ -470,6 +759,8 @@ struct CrawlInput {
     wait_for: Option<u64>,
     wait_for_selector: Option<String>,
     scroll_steps: Option<u8>,
+    #[serde(default)]
+    actions: Vec<pages::PageAction>,
     max_age: Option<u64>,
     concurrency: Option<usize>,
     #[serde(default)]
@@ -559,6 +850,9 @@ impl CrawlInput {
         if let Some(steps) = self.scroll_steps
             && steps > 10
         {
+            return false;
+        }
+        if !pages::valid_actions(&self.actions) {
             return false;
         }
         true
@@ -673,6 +967,7 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned),
             scroll_steps: input.scroll_steps.unwrap_or(0),
+            actions: input.actions,
             cache_max_age,
             max_tokens: input.max_tokens,
             chunk_tokens: input.chunk_tokens,
@@ -697,6 +992,7 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
     };
 
     let id = CrawlManager::next_id();
+    let (tx, _) = broadcast::channel(256);
     let job = Arc::new(Mutex::new(CrawlJobState {
         id: id.clone(),
         status: CrawlStatus::Running,
@@ -710,6 +1006,7 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
         data: Vec::new(),
         errors: Vec::new(),
         cancel: Arc::new(AtomicBool::new(false)),
+        events: tx,
     }));
     app.crawls.insert(Arc::clone(&job));
 
@@ -737,8 +1034,81 @@ pub async fn start_handle(State(app): State<Arc<App>>, req: Request<Body>) -> Re
             "id": id,
             "status": "running",
             "url": format!("/api/crawl/{id}"),
+            "streamUrl": format!("/api/crawl/{id}/stream"),
         })),
     )
+        .into_response()
+}
+
+pub async fn stream_handle(
+    State(app): State<Arc<App>>,
+    Path(id): Path<String>,
+    req: Request<Body>,
+) -> Response {
+    if !authorized(&app, &req) {
+        return problem(StatusCode::UNAUTHORIZED, "backend_authentication_required");
+    }
+    let Some(job) = app.crawls.get(&id) else {
+        return problem(StatusCode::NOT_FOUND, "crawl_not_found");
+    };
+    // Subscribe BEFORE taking the initial snapshot so no live events are missed
+    // between replay and subscription.
+    let (mut rx, snapshot) = {
+        let guard = job.lock().expect("job lock");
+        (guard.events.subscribe(), guard.snapshot())
+    };
+    let stream = async_stream::stream! {
+        for (idx, page) in snapshot.data.into_iter().enumerate() {
+            let ev = CrawlStreamEvent::Page {
+                data: Box::new(page),
+                completed: idx + 1,
+                total: snapshot.total,
+            };
+            if let Ok(payload) = serde_json::to_string(&ev) {
+                yield Ok::<Event, Infallible>(Event::default().data(payload));
+            }
+        }
+        for (idx, err) in snapshot.errors.into_iter().enumerate() {
+            let ev = CrawlStreamEvent::Error {
+                data: err,
+                failed: idx + 1,
+                total: snapshot.total,
+            };
+            if let Ok(payload) = serde_json::to_string(&ev) {
+                yield Ok::<Event, Infallible>(Event::default().data(payload));
+            }
+        }
+        if snapshot.status != CrawlStatus::Running {
+            let done = CrawlStreamEvent::Done {
+                status: snapshot.status,
+                completed: snapshot.completed,
+                failed: snapshot.failed,
+                total: snapshot.total,
+                changes: snapshot.changes,
+            };
+            if let Ok(payload) = serde_json::to_string(&done) {
+                yield Ok::<Event, Infallible>(Event::default().data(payload));
+            }
+            return;
+        }
+        loop {
+            match rx.recv().await {
+                Ok(ev) => {
+                    let is_done = matches!(ev, CrawlStreamEvent::Done { .. });
+                    if let Ok(payload) = serde_json::to_string(&ev) {
+                        yield Ok::<Event, Infallible>(Event::default().data(payload));
+                    }
+                    if is_done {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    };
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(10)))
         .into_response()
 }
 
@@ -786,72 +1156,98 @@ fn authorized(app: &App, req: &Request<Body>) -> bool {
         .is_some_and(|value| bool::from(value.as_bytes().ct_eq(expected)))
 }
 
+struct ResumedState {
+    frontier: Vec<(Url, usize)>,
+    seen: Vec<Url>,
+    finished: usize,
+}
+
 async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlConfig) {
+    run_crawl_inner(app, job, config, None).await;
+}
+
+async fn run_crawl_inner(
+    app: Arc<App>,
+    job: Arc<Mutex<CrawlJobState>>,
+    config: CrawlConfig,
+    resumed: Option<ResumedState>,
+) {
     let deadline = Instant::now() + config.timeout;
-    let cancel = job.lock().expect("job lock").cancel.clone();
+    let (cancel, job_id) = {
+        let g = job.lock().expect("job lock");
+        (g.cancel.clone(), g.id.clone())
+    };
+    let checkpoint_cfg = CrawlCheckpointConfig::from_crawl_config(&config);
     let allowed_hosts = seed_hosts(&config.seeds);
 
     let mut frontier: VecDeque<(Url, usize)> = VecDeque::new();
     let mut seen: HashSet<Url> = HashSet::new();
     let mut seen_content_hashes: HashSet<u64> = HashSet::new();
     let mut robots_by_origin: HashMap<String, robots::RobotsPolicy> = HashMap::new();
+    let mut finished_count = 0usize;
 
-    // Seed initial URLs at depth 0
-    for seed in &config.seeds {
-        if seen.len() >= config.limit {
-            break;
-        }
-        if seen.insert(seed.clone()) {
-            frontier.push_back((seed.clone(), 0));
-        }
-    }
-
-    // Fetch robots.txt & optional sitemaps for seed origins
-    for seed in &config.seeds {
-        if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
-            break;
-        }
-        let origin = origin_key(seed);
-        if robots_by_origin.contains_key(&origin) {
-            continue;
-        }
-        let policy = if config.respect_robots || config.use_sitemap {
-            robots::fetch_robots(seed, deadline).await
-        } else {
-            robots::RobotsPolicy::default()
-        };
-        if config.use_sitemap && config.max_depth > 0 && seen.len() < config.limit {
-            let sm_urls = robots::discover_sitemap_urls(
-                seed,
-                &policy,
-                config.limit.saturating_sub(seen.len()),
-                deadline,
-            )
-            .await;
-            for u in sm_urls {
-                if seen.len() >= config.limit {
-                    break;
-                }
-                if !host_matches(
-                    &u,
-                    &allowed_hosts,
-                    config.allow_subdomains,
-                    config.allow_external_links,
-                ) {
-                    continue;
-                }
-                if !path_matches(u.path(), &config.include_paths, &config.exclude_paths) {
-                    continue;
-                }
-                if config.respect_robots && !policy.is_allowed(&u) {
-                    continue;
-                }
-                if seen.insert(u.clone()) {
-                    frontier.push_back((u, 1));
-                }
+    if let Some(saved) = resumed {
+        frontier.extend(saved.frontier);
+        seen.extend(saved.seen);
+        finished_count = saved.finished;
+    } else {
+        // Seed initial URLs at depth 0
+        for seed in &config.seeds {
+            if seen.len() >= config.limit {
+                break;
+            }
+            if seen.insert(seed.clone()) {
+                frontier.push_back((seed.clone(), 0));
             }
         }
-        robots_by_origin.insert(origin, policy);
+
+        // Fetch robots.txt & optional sitemaps for seed origins
+        for seed in &config.seeds {
+            if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
+                break;
+            }
+            let origin = origin_key(seed);
+            if robots_by_origin.contains_key(&origin) {
+                continue;
+            }
+            let policy = if config.respect_robots || config.use_sitemap {
+                robots::fetch_robots(seed, deadline).await
+            } else {
+                robots::RobotsPolicy::default()
+            };
+            if config.use_sitemap && config.max_depth > 0 && seen.len() < config.limit {
+                let sm_urls = robots::discover_sitemap_urls(
+                    seed,
+                    &policy,
+                    config.limit.saturating_sub(seen.len()),
+                    deadline,
+                )
+                .await;
+                for u in sm_urls {
+                    if seen.len() >= config.limit {
+                        break;
+                    }
+                    if !host_matches(
+                        &u,
+                        &allowed_hosts,
+                        config.allow_subdomains,
+                        config.allow_external_links,
+                    ) {
+                        continue;
+                    }
+                    if !path_matches(u.path(), &config.include_paths, &config.exclude_paths) {
+                        continue;
+                    }
+                    if config.respect_robots && !policy.is_allowed(&u) {
+                        continue;
+                    }
+                    if seen.insert(u.clone()) {
+                        frontier.push_back((u, 1));
+                    }
+                }
+            }
+            robots_by_origin.insert(origin, policy);
+        }
     }
 
     if let Ok(mut g) = job.lock() {
@@ -859,7 +1255,6 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
     }
 
     let mut in_flight: FuturesUnordered<_> = FuturesUnordered::new();
-    let mut finished_count = 0usize;
 
     loop {
         if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
@@ -1019,6 +1414,11 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
                             markdown: snapshot_md,
                         },
                     );
+                    let _ = g.events.send(CrawlStreamEvent::Page {
+                        data: Box::new(page.clone()),
+                        completed: g.completed,
+                        total: g.total,
+                    });
                     g.data.push(page);
                 }
             }
@@ -1026,12 +1426,38 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
                 if let Ok(mut g) = job.lock() {
                     g.failed += 1;
                     g.total = seen.len();
-                    g.errors.push(CrawlErrorEntry {
+                    let entry = CrawlErrorEntry {
                         url,
                         error: err.code(),
+                    };
+                    let _ = g.events.send(CrawlStreamEvent::Error {
+                        data: entry.clone(),
+                        failed: g.failed,
+                        total: g.total,
                     });
+                    g.errors.push(entry);
                 }
             }
+        }
+
+        // Persist periodic mid-crawl checkpoints when QUELLE_STATE_DIR is configured
+        // so interrupted crawls can resume cleanly on restart.
+        if (finished_count == 1 || finished_count.is_multiple_of(3))
+            && let Ok(g) = job.lock()
+        {
+            let cp = CrawlCheckpoint {
+                id: job_id.clone(),
+                status: g.status,
+                frontier: frontier.iter().cloned().collect(),
+                seen: seen.iter().cloned().collect(),
+                completed: g.completed,
+                failed: g.failed,
+                changes: g.changes,
+                page_snapshots: g.page_snapshots.clone(),
+                config: checkpoint_cfg.clone(),
+            };
+            drop(g);
+            app.crawls.persist_checkpoint(&cp);
         }
     }
 
@@ -1047,10 +1473,18 @@ async fn run_crawl(app: Arc<App>, job: Arc<Mutex<CrawlJobState>>, config: CrawlC
         }
         g.finished_elapsed_ms =
             Some(u64::try_from(g.started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        let _ = g.events.send(CrawlStreamEvent::Done {
+            status: g.status,
+            completed: g.completed,
+            failed: g.failed,
+            total: g.total,
+            changes: g.changes,
+        });
         (!g.page_snapshots.is_empty()).then(|| (g.id.clone(), g.page_snapshots.clone()))
     } else {
         None
     };
+    app.crawls.remove_checkpoint(&job_id);
     if let Some((job_id, snapshots)) = persist_data {
         app.crawls.persist_snapshots(&job_id, &snapshots);
     }
@@ -1435,6 +1869,53 @@ Pass previousHashes or sinceCrawlId.";
         );
         // Path traversal IDs must never load anything.
         assert!(m2.load_persisted_snapshots("../etc/passwd").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mid_crawl_checkpoint_roundtrips_frontier_and_clears_on_completion() {
+        let dir = std::env::temp_dir().join(format!(
+            "quelle-crawl-checkpoint-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let m1 = CrawlManager::with_state_dir(Some(dir.clone()));
+
+        let seed = Url::parse("https://example.org/docs").unwrap();
+        let next = Url::parse("https://example.org/docs/api").unwrap();
+        let mut snaps = HashMap::new();
+        snaps.insert(
+            "https://example.org/docs".to_owned(),
+            StoredPageSnapshot {
+                hash: "sha256:111".to_owned(),
+                markdown: Some("# Docs".to_owned()),
+            },
+        );
+        let checkpoint = CrawlCheckpoint {
+            id: "crawl-abcdef-0007".to_owned(),
+            status: CrawlStatus::Running,
+            frontier: vec![(next.clone(), 1)],
+            seen: vec![seed.clone(), next.clone()],
+            completed: 1,
+            failed: 0,
+            changes: None,
+            page_snapshots: snaps,
+            config: CrawlCheckpointConfig::for_test(vec![seed]),
+        };
+        m1.persist_checkpoint(&checkpoint);
+
+        // Simulated restart loads interrupted checkpoint with frontier intact.
+        let m2 = CrawlManager::with_state_dir(Some(dir.clone()));
+        let interrupted = m2.list_interrupted_checkpoints();
+        assert_eq!(interrupted.len(), 1);
+        assert_eq!(interrupted[0].id, "crawl-abcdef-0007");
+        assert_eq!(interrupted[0].frontier.len(), 1);
+        assert_eq!(interrupted[0].frontier[0].0, next);
+        assert_eq!(interrupted[0].completed, 1);
+
+        // Removing checkpoint on completion clears it.
+        m2.remove_checkpoint("crawl-abcdef-0007");
+        assert!(m2.list_interrupted_checkpoints().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

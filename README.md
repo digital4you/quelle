@@ -8,8 +8,9 @@ Quelle is a Rust service that retrieves web pages for agents. It can answer a qu
 | Content | `POST /api/content` | Page text in document order for the caller's exact search query or supplied URLs | No |
 | Scrape | `POST /api/scrape` | Clean Markdown, text, HTML, links, and metadata for a `url`, batch `urls`, or search `query` | No |
 | Map | `POST /api/map` | Fast site URL discovery from `robots.txt`, `sitemap.xml`, and page links | No |
-| Crawl | `POST /api/crawl` (`GET`/`DELETE /api/crawl/{id}`) | Async or sync recursive crawl starting from a single `url` or a set of `urls` | No |
-| Extract | `POST /api/extract` | Structured JSON extracted from `url`, `urls`, or `query` using a prompt/schema | Yes |
+| Crawl | `POST /api/crawl` (`GET`/`DELETE /api/crawl/{id}`, `GET /api/crawl/{id}/stream`) | Async, live-streamed SSE, or sync recursive crawl with mid-crawl resume checkpoints | No |
+| Extract | `POST /api/extract` | Structured JSON extracted from `url`, `urls`, or `query` with schema validation and corrective retry | Yes |
+| MCP | `quelle mcp` (stdio JSON-RPC 2.0) | Built-in Model Context Protocol server exposing `quelle_search`, `quelle_scrape`, `quelle_extract`, `quelle_map`, and `quelle_crawl` | No |
 
 ## Quick start
 
@@ -128,7 +129,7 @@ curl -sS http://127.0.0.1:3000/api/scrape \
   --data '{"url":"https://example.org","formats":["markdown","links"],"onlyMainContent":true}'
 ```
 
-Optional fields: `formats` (`["markdown","text","html","links","chunks","structured"]`, default `["markdown"]`), `onlyMainContent` (default `true`), `includeTags` / `excludeTags` (CSS selectors), `render` (`"auto"`, `"always"`, `"never"`), `waitFor` (ms), `waitForSelector` (CSS selector awaited in CDP), `scrollSteps` (0–10 smooth viewport scrolls for lazy-loaded pages), `maxAge` (cache TTL in seconds, default `300`; set `0` to bypass cache), `maxTokens` (token-budgeted distillation), `chunkTokens` (default `512`), `focusQuery` (query-focused chunk scoring), `maxPages` (PDF page cap, 1–1,000), `stream` (SSE streaming for batch `urls`/`query`), `limit`, `language`.
+Optional fields: `formats` (`["markdown","text","html","links","chunks","structured","screenshot","fullPageScreenshot"]`, default `["markdown"]`; screenshots require `QUELLE_CHROMIUM_CDP_URL`), `onlyMainContent` (default `true`), `includeTags` / `excludeTags` (CSS selectors), `render` (`"auto"`, `"always"`, `"chromium"`, `"never"`), `waitFor` (ms), `waitForSelector` (CSS selector awaited in CDP), `scrollSteps` (0–10 smooth viewport scrolls for lazy-loaded pages), `actions` (up to 16 safe scoped actions: `click`, `wait`, `waitForSelector`, `scroll`, `press` — no arbitrary JavaScript execution), `maxAge` (cache TTL in seconds, default `300`; set `0` to bypass cache), `maxTokens` (token-budgeted distillation), `chunkTokens` (default `512`), `focusQuery` (query-focused chunk scoring), `maxPages` (PDF page cap, 1–1,000), `stream` (SSE streaming for batch `urls`/`query`), `limit`, `language`.
 
 ### Map mode · `POST /api/map`
 
@@ -144,7 +145,7 @@ Optional fields: `urls` (multiple seeds), `search` (URL substring filter), `incl
 
 ### Crawl mode · `POST /api/crawl`
 
-Recursively crawl starting from a single `url` **or** a list of `urls` (1–100 seeds). By default returns HTTP 202 with `{"id":"...","status":"running","url":"/api/crawl/<id>"}`; poll `GET /api/crawl/{id}` for progress and results or cancel with `DELETE /api/crawl/{id}`. Set `"sync": true` for small crawls that should return results directly in one request.
+Recursively crawl starting from a single `url` **or** a list of `urls` (1–100 seeds). By default returns HTTP 202 with `{"id":"...","status":"running","url":"/api/crawl/<id>","streamUrl":"/api/crawl/<id>/stream"}`; poll `GET /api/crawl/{id}`, subscribe to live SSE events at `GET /api/crawl/{id}/stream`, or cancel with `DELETE /api/crawl/{id}`. When `QUELLE_STATE_DIR` is configured, periodic checkpoints allow interrupted crawls to resume automatically on restart. Set `"sync": true` for small crawls that should return results directly in one request.
 
 ```sh
 curl -sS http://127.0.0.1:3000/api/crawl \
@@ -152,11 +153,11 @@ curl -sS http://127.0.0.1:3000/api/crawl \
   --data '{"urls":["https://example.org/docs","https://example.org/blog"],"maxDepth":2,"limit":30,"formats":["markdown"]}'
 ```
 
-Optional fields: `maxDepth` (0–10, default 2), `limit` (1–1000, default 50), `includePaths` / `excludePaths` (prefix or `*` globs), `allowSubdomains`, `allowExternalLinks`, `useSitemap` (default `true`), `respectRobots` (default `true`), `formats`, `onlyMainContent`, `includeTags`, `excludeTags`, `render`, `waitFor`, `waitForSelector`, `scrollSteps` (0–10), `maxAge`, `maxTokens`, `chunkTokens`, `focusQuery`, `maxPages`, `concurrency` (1–16, default 4; per-host politeness is always enforced), `sync` (default `false`), `incremental` (emit deterministic `sha256:` `contentHash`, `changeStatus`, and crawl `changes` summary; defaults `maxAge` to `0` for conditional HTTP revalidation), `sinceCrawlId` (compare against a prior crawl job — persisted across restarts when `QUELLE_STATE_DIR` is set — and attach heading-level `diff`s for updated pages), `previousHashes` (stateless `{url: contentHash}` map), `omitUnchangedContent` (omit page bodies when `changeStatus == "unchanged"`).
+Optional fields: `maxDepth` (0–10, default 2), `limit` (1–1000, default 50), `includePaths` / `excludePaths` (prefix or `*` globs), `allowSubdomains`, `allowExternalLinks`, `useSitemap` (default `true`), `respectRobots` (default `true`), `formats`, `onlyMainContent`, `includeTags`, `excludeTags`, `render`, `waitFor`, `waitForSelector`, `scrollSteps` (0–10), `actions`, `maxAge`, `maxTokens`, `chunkTokens`, `focusQuery`, `maxPages`, `concurrency` (1–16, default 4; per-host politeness is always enforced), `sync` (default `false`), `incremental` (emit deterministic `sha256:` `contentHash`, `changeStatus`, and crawl `changes` summary; defaults `maxAge` to `0` for conditional HTTP revalidation), `sinceCrawlId` (compare against a prior crawl job — persisted across restarts when `QUELLE_STATE_DIR` is set — and attach heading-level `diff`s for updated pages), `previousHashes` (stateless `{url: contentHash}` map), `omitUnchangedContent` (omit page bodies when `changeStatus == "unchanged"`).
 
 ### Extract mode · `POST /api/extract`
 
-Scrape `url`, `urls` (1–20), or a search `query` and extract structured JSON matching `prompt` and/or JSON `schema` using the configured model.
+Scrape `url`, `urls` (1–20), or a search `query` (with optional `render`, `waitFor`, `waitForSelector`, `scrollSteps`, and `actions`) and extract structured JSON matching `prompt` and/or JSON `schema` using the configured model, with automatic schema validation and 1-shot corrective retry.
 
 ```sh
 curl -sS http://127.0.0.1:3000/api/extract \
@@ -164,11 +165,32 @@ curl -sS http://127.0.0.1:3000/api/extract \
   --data '{"url":"https://example.org","prompt":"Extract the page title and main topics"}'
 ```
 
+### Built-in MCP Server & Thin Clients
+
+Run `quelle mcp` to expose Quelle over Model Context Protocol stdio JSON-RPC 2.0 (`QUELLE_URL` + `QUELLE_TOKEN` / `QUELLE_API_KEY`):
+
+```json
+{
+  "mcpServers": {
+    "quelle": {
+      "command": "quelle",
+      "args": ["mcp"],
+      "env": {
+        "QUELLE_URL": "http://127.0.0.1:3000",
+        "QUELLE_TOKEN": "<your-token>"
+      }
+    }
+  }
+}
+```
+
+Zero-dependency clients are included in `clients/python/quelle.py` (stdlib `urllib`) and `clients/typescript/quelle.ts` (`fetch` + SSE async generators).
+
 ### Page extraction
 
 - **HTML.** `/api/content` emits clean structured Markdown in document order, including headings, lists, fenced code blocks with preserved indentation, Markdown data tables with captions and expanded row/column spans, flattened layout tables, link destinations with section anchors, collapsed ARIA accordion and tab-panel content, repeated values and footer contacts. It prefers a substantial main/article region and supplements public contact targets outside it. Both extraction APIs share charset decoding, invisible-character cleanup and document-quality checks. It leaves out site navigation, non-semantic sidebars and menus, search forms, the site banner, consent dialogs, language switchers and skip links. A static page that consists only of navigation keeps it. It extracts `mailto:` and `tel:` targets from direct links, simple JavaScript contact functions and links in the rendered page. A handler that needs a click or a follow-up API request may yield only its visible label.
 - **JavaScript.** When static HTML looks like a script shell or an unrendered template, Quelle renders via a supervised persistent Lightpanda CDP pool over a private 0600 Unix socket (`QUELLE_CDP_POOL=true` by default, with automatic restart and one-shot `lightpanda fetch` fallback). Non-content assets (images, fonts, audio/video streams, ad/analytics beacons) are blocked at the browser layer. Readiness timing starts after navigation finishes so slow origin TTFB does not starve hydration; the browser waits for populated content and tables, followed by 350 ms of main-content stability (or 80 ms when the activity observer reports a fully loaded synchronous page with no pending timers or async network work). When one-shot timers, in-flight requests, or DOM mutations are still active past the 7 s base wait, adaptive wait extends up to 13 s so delayed JS apps complete cleanly while idle pages stop immediately at 7 s. If the page needs rendering and the browser is unavailable, its error code is `needs_js`.
-- **Documents.** Plain text retains line breaks. PDFs return their embedded text layer up to `QUELLE_PDF_MAX_PAGES` (default 150, configurable per request via `maxPages` up to 1,000). Fragmented multi-column/table PDF output automatically retries with `pdftotext -layout` and formats aligned columns as Markdown tables (`retrieval: "pdf-layout"`); garbled CID/replacement text layers escalate automatically to `QUELLE_OCR_URL` when configured. Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files are converted to Markdown with [anydoc](https://github.com/firecrawl/anydoc).
+- **Documents.** Plain text retains line breaks. PDFs return their embedded text layer up to `QUELLE_PDF_MAX_PAGES` (default 150, configurable per request via `maxPages` up to 1,000). Fragmented multi-column/table PDF output automatically retries with `pdftotext -layout` and formats aligned columns as Markdown tables (`retrieval: "pdf-layout"`); scanned or garbled PDFs without a usable text layer escalate automatically to LlamaIndex [OCRia-nano-1](https://huggingface.co/llamaindex/OCRia-nano-1) via LiteParse (`lit`, `retrieval: "pdf-ocria"`) when installed, or to `QUELLE_OCR_URL` when configured. Word, Excel, PowerPoint, OpenDocument, RTF, EPUB and CSV files are converted to Markdown with [anydoc](https://github.com/firecrawl/anydoc).
 
 The output limit for `/api/content` is 2 MiB of UTF-8 text per source. `metadata.truncated` flags a byte or PDF page limit reached during extraction. A site can still require scrolling, pagination or a click to reveal additional content.
 
