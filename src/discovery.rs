@@ -17,9 +17,11 @@ mod providers;
 pub use providers::configure_engines;
 #[cfg(test)]
 use providers::{
-    HtmlEngine as Kind, ddg_locale, parse_arxiv_xml, parse_github_json, parse_hackernews_json,
-    parse_mdn_json, parse_openalex_json, parse_search_html, parse_searxng_json,
-    parse_stackexchange_json, query_has_academic_intent, query_has_repo_intent,
+    HtmlEngine as Kind, ddg_locale, extract_rfc_number, parse_arxiv_xml, parse_crossref_json,
+    parse_gdelt_json, parse_github_json, parse_hackernews_json, parse_ietf_json, parse_mdn_json,
+    parse_openalex_json, parse_pubmed_esearch_json, parse_pubmed_esummary_json, parse_search_html,
+    parse_searxng_json, parse_stackexchange_json, query_has_academic_intent,
+    query_has_biomed_intent, query_has_ietf_intent, query_has_news_intent, query_has_repo_intent,
     query_has_tech_intent, query_has_web_intent, site_filter_allows,
 };
 

@@ -485,3 +485,97 @@ fn parses_yahoo_jp_seznam_mdn_and_openalex_free_providers() {
     assert_eq!(oa_hits[1].url.as_str(), "https://doi.org/10.1000/example");
     assert!(oa_hits[0].description.contains("2021"));
 }
+
+#[test]
+fn parses_marginalia_naver_gdelt_crossref_pubmed_and_ietf_providers() {
+    let marginalia_html = r#"
+    <main>
+      <section class="card">
+        <h2><a href="https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/">Redis Persistence</a></h2>
+        <p class="description">RDB snapshots and AOF durability trade-offs.</p>
+      </section>
+      <section class="card">
+        <h2><a href="https://search.marginalia.nu/about">Marginalia About</a></h2>
+      </section>
+    </main>"#;
+    let m_hits = parse_search_html(Kind::Marginalia, marginalia_html, 5).unwrap();
+    assert_eq!(m_hits.len(), 1);
+    assert_eq!(
+        m_hits[0].url.as_str(),
+        "https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/"
+    );
+    assert_eq!(m_hits[0].title, "Redis Persistence");
+    assert!(m_hits[0].description.contains("RDB snapshots"));
+
+    let naver_html = r#"
+    <div>
+      <a href="https://redis.io/tutorials/operate/redis-at-scale/persistence-and-durability/" data-heatmap-target=".link">
+        <span class="sds-comps-text sds-comps-text-type-headline1">Redis Persistence: RDB vs AOF</span>
+      </a>
+      <a href="https://search.naver.com/internal" data-heatmap-target=".link">
+        <span class="sds-comps-text sds-comps-text-type-headline1">Naver Internal</span>
+      </a>
+    </div>"#;
+    let n_hits = parse_search_html(Kind::Naver, naver_html, 5).unwrap();
+    assert_eq!(n_hits.len(), 1);
+    assert_eq!(
+        n_hits[0].url.as_str(),
+        "https://redis.io/tutorials/operate/redis-at-scale/persistence-and-durability/"
+    );
+    assert_eq!(n_hits[0].title, "Redis Persistence: RDB vs AOF");
+
+    let gdelt = br#"{"articles":[{"url":"https://www.reuters.com/markets/ecb-cuts-rates","title":"ECB cuts deposit rate","domain":"reuters.com","seendate":"20261128T120000Z","sourcecountry":"Switzerland"}]}"#;
+    let g_hits = parse_gdelt_json(gdelt, 5).unwrap();
+    assert_eq!(g_hits.len(), 1);
+    assert_eq!(
+        g_hits[0].url.as_str(),
+        "https://www.reuters.com/markets/ecb-cuts-rates"
+    );
+    assert!(g_hits[0].description.contains("reuters.com"));
+    assert!(query_has_news_intent("latest ECB rate decision news 2026"));
+    assert!(!query_has_news_intent("SQLite WAL mode checkpoint"));
+
+    let crossref = br#"{"message":{"items":[{"DOI":"10.1007/978-3-031-84300-6_13","title":["Is Attention All You Need?"],"URL":"https://doi.org/10.1007/978-3-031-84300-6_13","published":{"date-parts":[[2025]]},"container-title":["Computational Attention"]}]}}"#;
+    let cr_hits = parse_crossref_json(crossref, 5).unwrap();
+    assert_eq!(cr_hits.len(), 1);
+    assert_eq!(
+        cr_hits[0].url.as_str(),
+        "https://doi.org/10.1007/978-3-031-84300-6_13"
+    );
+    assert_eq!(cr_hits[0].title, "Is Attention All You Need?");
+    assert!(cr_hits[0].description.contains("2025"));
+
+    let pm_ids = parse_pubmed_esearch_json(
+        br#"{"esearchresult":{"idlist":["43081785","43053936"]}}"#,
+        5,
+    )
+    .unwrap();
+    assert_eq!(pm_ids, vec!["43081785", "43053936"]);
+    let pm_sum = br#"{"result":{"uids":["43081785"],"43081785":{"uid":"43081785","title":"mRNA Vaccine Efficacy Trial.","source":"N Engl J Med","pubdate":"2026 Nov"}}}"#;
+    let pm_hits = parse_pubmed_esummary_json(pm_sum, 5).unwrap();
+    assert_eq!(pm_hits.len(), 1);
+    assert_eq!(
+        pm_hits[0].url.as_str(),
+        "https://pubmed.ncbi.nlm.nih.gov/43081785/"
+    );
+    assert!(pm_hits[0].description.contains("N Engl J Med"));
+    assert!(query_has_biomed_intent(
+        "mRNA vaccine clinical trial efficacy"
+    ));
+    assert!(!query_has_biomed_intent("Rust borrow checker lifetime"));
+
+    let ietf = br#"{"objects":[{"name":"rfc9110","rfc_number":9110,"title":"HTTP Semantics","abstract":"The Hypertext Transfer Protocol (HTTP) is a stateless protocol."}]}"#;
+    let ie_hits = parse_ietf_json(ietf, 5).unwrap();
+    assert_eq!(ie_hits.len(), 1);
+    assert_eq!(
+        ie_hits[0].url.as_str(),
+        "https://www.rfc-editor.org/rfc/rfc9110.html"
+    );
+    assert!(ie_hits[0].title.contains("RFC 9110"));
+    assert_eq!(
+        extract_rfc_number("RFC 9110 HTTP 429"),
+        Some("rfc9110".to_owned())
+    );
+    assert!(query_has_ietf_intent("RFC 9114 HTTP/3 QUIC transport"));
+    assert!(!query_has_ietf_intent("Schweiz MWST Steuersätze 2024"));
+}

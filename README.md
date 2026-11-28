@@ -14,7 +14,7 @@ Quelle is a Rust service that retrieves web pages for agents. It can answer a qu
 
 ## Quick start
 
-Copy [.env.example](.env.example) to `.env` and set `QUELLE_TOKEN` to a token of at least 32 characters. You can generate one with `openssl rand -hex 32`. This enables `/api/content` out of the box with zero-key parallel meta-search (`duckduckgo`, `yahoo_jp`, `seznam`, `mwmbl`, `wikipedia`, `mdn`, `stackexchange`, `hackernews`). Set `QUELLE_SEARCH_ENGINES` to choose other engines. To enable `/api/answer`, also fill in the three model variables before starting Quelle.
+Copy [.env.example](.env.example) to `.env` and set `QUELLE_TOKEN` to a token of at least 32 characters. You can generate one with `openssl rand -hex 32`. This enables `/api/content` out of the box with zero-key parallel meta-search across 6 general-web engines (`duckduckgo`, `yahoo_jp`, `seznam`, `marginalia`, `naver`, `mwmbl`) plus 8 intent-routed official APIs (`wikipedia`, `mdn`, `ietf`, `crossref`, `pubmed`, `gdelt`, `stackexchange`, `hackernews`). Set `QUELLE_SEARCH_ENGINES` to choose other engines. To enable `/api/answer`, also fill in the three model variables before starting Quelle.
 
 ```sh
 docker run -d --name quelle --env-file .env \
